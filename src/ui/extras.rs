@@ -1,0 +1,731 @@
+use super::*;
+use sdir::utility::Utility;
+#[derive(Clone)]
+pub(super) struct ContextMenu {
+    pub pane: usize,
+    pub paths: Vec<NativePath>,
+    pub x: f64,
+    pub y: f64,
+    pub background: bool,
+    pub tab: Option<usize>,
+}
+pub(super) fn open_context(
+    mut model: Signal<AppModel>,
+    pane: usize,
+    path: Option<NativePath>,
+    x: f64,
+    y: f64,
+) {
+    let mut s = model.write();
+    if s.job.is_some() || s.dialog.is_some() || s.copy_destination.is_some() {
+        return;
+    }
+    s.active = pane;
+    s.interaction += 1;
+    s.pending_focus = None;
+    let background = path.is_none();
+    if let Some(p) = path {
+        if !s.panes[pane].tab().selection.contains(&p) {
+            s.panes[pane].select(p, false, false);
+        }
+    }
+    let paths = if background {
+        vec![s.panes[pane].tab().path.clone()]
+    } else {
+        s.selected()
+    };
+    s.context = Some(ContextMenu {
+        pane,
+        paths,
+        x,
+        y,
+        background,
+        tab: None,
+    });
+    s.dirty();
+}
+pub(super) fn open_selected_context(mut model: Signal<AppModel>, pane: usize) {
+    let paths = model.read().selected();
+    if paths.is_empty() {
+        open_context(model, pane, None, 220., 180.);
+    } else {
+        model.write().context = Some(ContextMenu {
+            pane,
+            paths,
+            x: 220.,
+            y: 180.,
+            background: false,
+            tab: None,
+        });
+    }
+}
+pub(super) fn open_tab_context(
+    mut model: Signal<AppModel>,
+    pane: usize,
+    tab: usize,
+    x: f64,
+    y: f64,
+) {
+    let mut s = model.write();
+    if s.modal_open() {
+        return;
+    }
+    s.active = pane;
+    s.interaction += 1;
+    s.context = Some(ContextMenu {
+        pane,
+        tab: Some(tab),
+        paths: vec![s.panes[pane].tabs[tab].path.clone()],
+        x,
+        y,
+        background: false,
+    });
+}
+pub(super) fn close_context(mut model: Signal<AppModel>) {
+    let pane = model.write().context.take().map(|c| c.pane);
+    if let Some(p) = pane {
+        focus_list_after_render(model, p);
+    }
+}
+fn context_command(mut model: Signal<AppModel>, bridge: &Bridge, command: &str) {
+    let Some(c) = model.write().context.take() else {
+        return;
+    };
+    model.write().active = c.pane;
+    if let Some(tab) = c.tab {
+        match command {
+            "tabopen" => change_tab(model, bridge, c.pane, TabCommand::Select(tab), true),
+            "tabpin" => {
+                let mut s = model.write();
+                s.panes[c.pane].toggle_pin(tab);
+                s.dirty();
+            }
+            "tableft" | "tabright" => {
+                let mut s = model.write();
+                s.panes[c.pane].move_tab(tab, command == "tabright");
+                s.dirty();
+            }
+            "tabclose" => change_tab(model, bridge, c.pane, TabCommand::Close(tab), true),
+            "paths" => {
+                if let Err(e) = bridge.utility(Utility::CopyPaths(c.paths)) {
+                    model.write().notice = e;
+                }
+            }
+            _ => {}
+        }
+        let _ = document::eval(&format!(
+            "document.querySelector('[data-pane=\"{}\"] .tab.selected')?.focus({{preventScroll:true}})",
+            c.pane
+        ));
+        return;
+    }
+    let path = c
+        .paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| model.read().path());
+    let result = match command {
+        "open" => {
+            let entry = model.read().panes[c.pane]
+                .tab()
+                .entries
+                .iter()
+                .find(|e| e.path == path)
+                .cloned();
+            if c.background || entry.is_some_and(|e| e.is_dir) {
+                navigate(model, bridge, c.pane, path);
+                Ok(())
+            } else {
+                bridge.job(Request::Open { path })
+            }
+        }
+        "with" => {
+            use dioxus::desktop::tao::platform::windows::WindowExtWindows;
+            bridge.utility(Utility::OpenWith(
+                path,
+                dioxus::desktop::window().window.hwnd() as u64,
+            ))
+        }
+        "paths" => bridge.utility(Utility::CopyPaths(c.paths)),
+        "terminal" => bridge.utility(Utility::Terminal(
+            model.read().panes[c.pane].tab().path.clone(),
+        )),
+        "explorer" => bridge.utility(Utility::Explorer(path)),
+        "properties" => bridge.properties(path),
+        "copy" => {
+            copy(model, bridge, false);
+            Ok(())
+        }
+        "cut" => {
+            copy(model, bridge, true);
+            Ok(())
+        }
+        "paste" => {
+            paste(model, bridge);
+            Ok(())
+        }
+        "rename" => {
+            dialog(model, "rename");
+            Ok(())
+        }
+        "batch" => {
+            open_batch(model);
+            Ok(())
+        }
+        "delete" => {
+            dialog(model, "recycle");
+            Ok(())
+        }
+        "new" => {
+            dialog(model, "new");
+            Ok(())
+        }
+        "refresh" => {
+            let state = model.read().panes[c.pane].tab().snapshot();
+            model.write().panes[c.pane].tab_mut().resume_from(&state);
+            load(model, bridge, c.pane);
+            focus_list_after_render(model, c.pane);
+            Ok(())
+        }
+        _ => Ok(()),
+    };
+    if let Err(e) = result {
+        model.write().notice = e;
+    }
+    if !model.read().modal_open() {
+        focus_list_after_render(model, c.pane);
+    }
+}
+#[component]
+pub(super) fn ContextMenuView(mut model: Signal<AppModel>) -> Element {
+    let bridge = use_context::<Arc<Bridge>>();
+    let Some(c) = model.read().context.clone() else {
+        return rsx! {};
+    };
+    let count = c.paths.len();
+    let pinned = c
+        .tab
+        .is_some_and(|i| model.read().panes[c.pane].tabs[i].pinned);
+    let tab_count = model.read().panes[c.pane].tabs.len();
+    let entries: Vec<_> = if c.tab.is_some() {
+        vec![
+            ("탭 열기", "tabopen"),
+            ("고정/고정 해제", "tabpin"),
+            ("왼쪽으로 이동", "tableft"),
+            ("오른쪽으로 이동", "tabright"),
+            ("탭 닫기", "tabclose"),
+            ("탭 경로 복사", "paths"),
+        ]
+    } else if c.background {
+        vec![
+            ("새 폴더", "new"),
+            ("붙여넣기", "paste"),
+            ("새로고침", "refresh"),
+            ("폴더 경로 복사", "paths"),
+            ("여기서 터미널 열기", "terminal"),
+            ("탐색기에서 표시", "explorer"),
+            ("폴더 속성", "properties"),
+        ]
+    } else {
+        vec![
+            ("열기", "open"),
+            ("연결 프로그램 직접 선택…", "with"),
+            ("복사", "copy"),
+            ("잘라내기", "cut"),
+            ("이름 변경", "rename"),
+            ("이름 일괄 변경", "batch"),
+            ("휴지통으로 이동", "delete"),
+            ("전체 경로 복사", "paths"),
+            ("여기서 터미널 열기", "terminal"),
+            ("탐색기에서 표시", "explorer"),
+            ("속성", "properties"),
+        ]
+    };
+    rsx! {div{class:"context-dismiss",onclick:move |_|close_context(model),onkeydown:move|e:KeyboardEvent|context_keys(e,model),
+    div{class:"file-context-menu",onmounted:move |_|{let _=document::eval("document.querySelector('.file-context-menu button:not(:disabled)')?.focus()");},role:"menu","aria-label":"파일 메뉴",style:"left:min({c.x}px,calc(100vw - 240px));top:min({c.y}px,calc(100vh - 440px))",onclick:move|e:MouseEvent|e.stop_propagation(),
+     for (name,cmd) in entries { {let b=bridge.clone();rsx!{button{role:"menuitem","data-command":cmd,disabled:(count!=1&&["open","with","rename","properties"].contains(&cmd))||(cmd=="tabclose"&&(pinned||tab_count==1))||(cmd=="tableft"&&c.tab==Some(0))||(cmd=="tabright"&&c.tab==Some(tab_count-1)),onclick:move |_|context_command(model,&b,cmd),"{name}"}}}}
+    }}}
+}
+
+pub(super) fn tree_follow_tick(mut model: Signal<AppModel>, bridge: &Bridge) {
+    {
+        let s = model.read();
+        let follow = s.tree_follow && s.tree_seen.as_ref() != Some(&s.path());
+        if !s.tree.open || (!follow && (s.tree.pending.is_some() || s.tree_tasks.is_empty())) {
+            return;
+        }
+    }
+    let next = {
+        let mut s = model.write();
+        if !s.tree.open {
+            return;
+        }
+        let current = s.path();
+        if s.tree_follow && s.tree_seen.as_ref() != Some(&current) {
+            if s.tree_pending_auto && s.tree.pending.is_some() {
+                bridge.tree.cancel();
+                s.tree.pending = None;
+            }
+            s.tree_seen = Some(current.clone());
+            s.tree_cursor = Some(current.clone());
+            s.tree_tasks.push_front((current, false));
+            while s.tree_tasks.len() > 65 {
+                s.tree_tasks.pop_back();
+            }
+        }
+        if s.tree.pending.is_some() {
+            return;
+        }
+        let Some((path, expand)) = s.tree_tasks.front().cloned() else {
+            return;
+        };
+        let (next, done) = s.tree.follow_step(&path, expand);
+        if done {
+            s.tree_tasks.pop_front();
+            s.dirty();
+            let rows = s.tree.rows();
+            if let Some(index) = rows
+                .iter()
+                .position(|r| r.path == path && r.message.is_none())
+            {
+                let indent = rows[index].depth.min(16) * 13;
+                let _ = document::eval(&format!(
+                    "requestAnimationFrame(()=>{{const t=document.querySelector('.drive-tree');if(t){{t.scrollTop=Math.max(0,{index}*28-t.clientHeight/2);t.scrollLeft={indent};}}}})"
+                ));
+            }
+        }
+        next.map(|path| {
+            let id = s.tree.begin(&path).unwrap();
+            s.tree_pending_auto = true;
+            s.dirty();
+            Request::Tree {
+                id,
+                path,
+                hidden: s.show_hidden,
+            }
+        })
+    };
+    if let Some(request) = next {
+        bridge.tree.replace(request);
+    }
+}
+
+#[component]
+pub(super) fn AppearanceDialog(mut model: Signal<AppModel>, pane: usize) -> Element {
+    let mut columns = use_signal(|| model.read().panes[pane].columns.clone());
+    let mut size = use_signal(|| model.read().panes[pane].icon_size);
+    let values = columns.read().clone();
+    let current = *size.read();
+    rsx! {div{class:"modal-backdrop",onkeydown:move|e:KeyboardEvent|{e.stop_propagation();if e.key()==Key::Escape{close_appearance(model,pane);}},div{class:"modal appearance-dialog",role:"dialog","aria-modal":"true","aria-label":"패널 보기 설정",
+    h2{"패널 {pane+1} 보기 설정"}p{"자세히 보기의 열과 아이콘 보기의 크기를 설정합니다. 너비는 이름 120~800, 나머지 50~800px입니다."}
+    div{class:"column-settings",for (index,label) in ["이름","크기","종류","수정 날짜"].iter().enumerate(){label{span{"{label}"}input{r#type:"checkbox","aria-label":"{label} 표시",disabled:index==0,checked:values.visible[index],onchange:move|e:FormEvent|{let mut c=columns.write();c.custom=true;c.visible[index]=e.checked();}}input{r#type:"number",min:if index==0{"120"}else{"50"},max:"800","aria-label":"{label} 너비",value:"{values.widths[index]}",oninput:move|e:FormEvent|{if let Ok(w)=e.value().parse::<u16>(){let mut c=columns.write();c.custom=true;c.widths[index]=w;}}}}}}
+    label{class:"icon-size-setting",span{"아이콘 타일 크기 · {current}px"}input{r#type:"range",min:"80",max:"192",step:"16",value:"{current}",oninput:move|e:FormEvent|{if let Ok(v)=e.value().parse::<u16>(){size.set(v.clamp(80,192));}}}}
+    div{class:"modal-actions",button{onclick:move |_|{columns.set(Default::default());size.set(112);},"기본값"}button{onclick:move |_|close_appearance(model,pane),"취소"}button{class:"primary appearance-apply",onclick:move |_|{let mut c=columns.read().clone();c.normalize();let view={let mut s=model.write();let p=&mut s.panes[pane];p.columns=c;p.icon_size=(*size.read()).clamp(80,192);let v=p.view;s.appearance=None;s.dirty();v};set_view(model,pane,view.value());},"적용"}}
+    }}}
+}
+
+#[derive(Clone)]
+pub(super) struct BatchDialog {
+    paths: Vec<NativePath>,
+    pattern: sdir::batch::Pattern,
+    pub(super) id: u64,
+    due: Option<Instant>,
+    pub(super) result: Option<Result<Vec<sdir::batch::RenamePair>, String>>,
+    pane: usize,
+}
+pub(super) fn open_batch(mut model: Signal<AppModel>) {
+    let mut s = model.write();
+    if s.job.is_some() {
+        return;
+    }
+    let paths = s.selected();
+    if paths.is_empty() || paths.len() > 500 {
+        s.notice = "1~500개 항목을 선택하세요.".into();
+        return;
+    }
+    let id = s.id();
+    s.batch = Some(BatchDialog {
+        paths,
+        pattern: Default::default(),
+        id,
+        due: Some(Instant::now()),
+        result: None,
+        pane: s.active,
+    });
+}
+pub(super) fn close_batch(mut model: Signal<AppModel>, bridge: &Bridge) {
+    bridge.preview.cancel();
+    let pane = model.write().batch.take().map(|b| b.pane);
+    if let Some(p) = pane {
+        focus_list_after_render(model, p);
+    }
+}
+fn change_pattern(mut model: Signal<AppModel>, field: usize, value: String) {
+    let mut s = model.write();
+    let id = s.id();
+    if let Some(b) = s.batch.as_mut() {
+        match field {
+            0 => b.pattern.find = value,
+            1 => b.pattern.replace = value,
+            2 => b.pattern.prefix = value,
+            3 => b.pattern.suffix = value,
+            _ => b.pattern.start = value.parse().ok(),
+        }
+        b.id = id;
+        b.result = None;
+        b.due = Some(Instant::now() + Duration::from_millis(250));
+    }
+}
+pub(super) fn batch_tick(mut model: Signal<AppModel>, bridge: &Bridge) {
+    if !model
+        .read()
+        .batch
+        .as_ref()
+        .is_some_and(|b| b.due.is_some_and(|t| t <= Instant::now()))
+    {
+        return;
+    }
+    let request = {
+        let mut s = model.write();
+        let Some(b) = s.batch.as_mut() else { return };
+        if !b.due.is_some_and(|t| t <= Instant::now()) {
+            return;
+        }
+        b.due = None;
+        Request::Preview {
+            id: b.id,
+            paths: b.paths.clone(),
+            pattern: b.pattern.clone(),
+        }
+    };
+    bridge.preview.replace(request);
+}
+#[component]
+pub(super) fn BatchRenameDialog(mut model: Signal<AppModel>) -> Element {
+    let bridge = use_context::<Arc<Bridge>>();
+    let b = model.read().batch.clone().unwrap();
+    let pattern = b.pattern.clone();
+    let values = [
+        pattern.find,
+        pattern.replace,
+        pattern.prefix,
+        pattern.suffix,
+        pattern.start.map(|n| n.to_string()).unwrap_or_default(),
+    ];
+    let ready = b.result.as_ref().is_some_and(|r| {
+        r.as_ref()
+            .is_ok_and(|pairs| pairs.iter().any(|p| p.source.name() != p.name))
+    });
+    let cancel = bridge.clone();
+    let apply = bridge.clone();
+    rsx! {div{class:"modal-backdrop",onkeydown:move|e:KeyboardEvent|{e.stop_propagation();if e.key()==Key::Escape{close_batch(model,&bridge);}},div{class:"modal batch-dialog",role:"dialog","aria-modal":"true","aria-label":"이름 일괄 변경",
+    h2{"이름 일괄 변경 · {b.paths.len()}개"}p{"확장자는 유지됩니다. 바뀔 이름을 미리 확인한 뒤 적용하세요. 충돌이 있으면 실행하지 않습니다."}
+    div{class:"batch-fields",for (i,label) in ["찾을 글자","바꿀 글자","앞에 추가","뒤에 추가","시작 번호 (선택)"].iter().enumerate(){label{span{"{label}"}input{class:"batch-field","data-field":i,value:"{values[i]}",maxlength:200,oninput:move|e:FormEvent|change_pattern(model,i,e.value())}}}}
+    div{class:"batch-preview",match b.result{Some(Ok(pairs))=>rsx!{for pair in pairs{div{class:"rename-preview",span{"{pair.source.name()}"}span{"→"}strong{"{pair.name}"}}}},Some(Err(e))=>rsx!{p{class:"batch-error","{e}"}},None=>rsx!{p{"미리보기 확인 중…"}}}}
+    div{class:"modal-actions",button{class:"batch-cancel",onclick:move |_|close_batch(model,&cancel),"취소"}button{class:"primary batch-apply",disabled:!ready,onclick:move |_|{let pairs=model.read().batch.as_ref().and_then(|b|b.result.as_ref()).and_then(|r|r.as_ref().ok()).cloned();if let Some(pairs)=pairs{let pairs=pairs.into_iter().filter(|p|p.source.name()!=p.name).collect();model.write().batch=None;submit(model,&apply,FileAction::BatchRename{pairs});}},"적용"}}
+    }}}
+}
+#[component]
+pub(super) fn JournalDialog(mut model: Signal<AppModel>) -> Element {
+    let bridge = use_context::<Arc<Bridge>>();
+    let s = model.read();
+    let entries = s.journal.clone();
+    let busy = s.job.is_some();
+    drop(s);
+    rsx! {
+        div { class:"modal-backdrop", onkeydown:move|e:KeyboardEvent|{e.stop_propagation();if e.key()==Key::Escape{close_journal(model);}},
+            div { class:"modal journal-dialog", role:"dialog", "aria-modal":"true", "aria-label":"작업 기록",
+                h2 { "작업 기록" }
+                p { "이번 실행의 최근 32건, 항목별 표시는 최대 500개입니다. 큰 작업은 전체 경로를 보존하지 않아 재시도가 제한됩니다. 재시도는 미완료로 확인된 선택 항목만 처리합니다. 폴더는 폴더 단위로 다시 확인하며 Windows가 중복 여부를 묻습니다." }
+                div { class:"journal-list",
+                    if entries.is_empty() { p { "아직 파일 작업 기록이 없습니다." } }
+                    for (i,entry) in entries.into_iter().enumerate().rev() {
+                        {
+                            let retry=entry.retry(); let b=bridge.clone();
+                            let destination=entry.destination.as_ref().map(|p|p.display()).unwrap_or_default();
+                            rsx! {
+                                section { class:"journal-entry", "data-job-index":i,
+                                    h3 { "{entry.time} · {entry.label}" }
+                                    p { class:"job-message", "{entry.message}" }
+                                    if !destination.is_empty() { p { class:"job-destination", title:"{destination}", "대상: {destination}" } }
+                                    if entry.cancelled { p { "사용자가 취소한 작업 · 일부 처리 결과를 확인하세요." } }
+                                    details {
+                                        summary { "항목별 결과 · {entry.outcomes.len()}개" }
+                                        for item in &entry.outcomes { p { class:if item.ok{"job-success"}else{"job-failed"}, title:"{item.source.display()}", "{item.source.display()} · {item.message}" } }
+                                        for dest in &entry.destinations { p { class:"job-result-path", "결과: {dest.display()}" } }
+                                    }
+                                    button { class:"job-retry", disabled:busy||retry.is_none(), onclick:move |_|{if let Some(action)=retry.clone(){close_journal(model);submit(model,&b,action);if model.read().job.is_some(){let mut s=model.write();if let Some(entry)=s.journal.get_mut(i){entry.retried=true;}if let Some(c)=s.job_context.as_mut(){c.reveal=None;}}}}, "미완료 항목 재시도" }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class:"modal-actions", button { onclick:move |_|close_journal(model), "닫기" } }
+            }
+        }
+    }
+}
+
+pub(super) fn start_drag(
+    mut model: Signal<AppModel>,
+    bridge: &Bridge,
+    pane: usize,
+    path: NativePath,
+) {
+    let paths = {
+        let mut s = model.write();
+        if s.modal_open() || s.job.is_some() {
+            return;
+        }
+        s.active = pane;
+        s.interaction += 1;
+        if !s.panes[pane].tab().selection.contains(&path) {
+            s.panes[pane].select(path, false, false);
+        }
+        s.selected()
+    };
+    use dioxus::desktop::tao::platform::windows::WindowExtWindows;
+    focus_list(pane);
+    match bridge.utility(Utility::Drag(
+        paths,
+        dioxus::desktop::window().window.hwnd() as u64,
+    )) {
+        Err(e) => model.write().notice = e,
+        Ok(()) => {
+            model.write().notice =
+                "파일을 복사할 대상에 놓으세요. Esc로 끌기를 취소할 수 있습니다.".into()
+        }
+    }
+}
+
+pub(super) fn tree_key(
+    e: KeyboardEvent,
+    mut model: Signal<AppModel>,
+    bridge: &Bridge,
+    path: NativePath,
+    expanded: bool,
+) {
+    e.stop_propagation();
+    if model.read().modal_open() {
+        return;
+    }
+    if pane_shortcut(&e, model, active_pane(model), bridge) {
+        return;
+    }
+    let key = e.key();
+    if key == Key::Enter {
+        e.prevent_default();
+        tree_navigate(model, bridge, path);
+        return;
+    }
+    if !matches!(
+        key,
+        Key::ArrowDown | Key::ArrowUp | Key::ArrowLeft | Key::ArrowRight | Key::Home | Key::End
+    ) {
+        return;
+    }
+    e.prevent_default();
+    model.write().tree_cursor = Some(path.clone());
+    let _ = document::eval("document.querySelector('.drive-tree')?.focus({preventScroll:true})");
+    if key == Key::ArrowRight && !expanded {
+        tree_toggle(model, bridge, path, false);
+        return;
+    }
+    if key == Key::ArrowLeft && expanded {
+        tree_toggle(model, bridge, path, false);
+        return;
+    }
+    let target = {
+        let s = model.read();
+        let rows: Vec<_> = s
+            .tree
+            .rows()
+            .into_iter()
+            .filter(|r| r.message.is_none())
+            .map(|r| r.path)
+            .collect();
+        let i = rows.iter().position(|p| p == &path).unwrap_or(0);
+        match key {
+            Key::ArrowUp => rows.get(i.saturating_sub(1)).cloned(),
+            Key::ArrowDown => rows.get((i + 1).min(rows.len().saturating_sub(1))).cloned(),
+            Key::Home => rows.first().cloned(),
+            Key::End => rows.last().cloned(),
+            Key::ArrowLeft => path.parent(),
+            Key::ArrowRight => s
+                .tree
+                .nodes
+                .get(&path)
+                .and_then(|n| n.children.first())
+                .cloned(),
+            _ => None,
+        }
+    };
+    if let Some(target) = target {
+        let row = model
+            .read()
+            .tree
+            .rows()
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.path == target && r.message.is_none())
+            .map(|(i, r)| (i, r.depth));
+        if let Some((index, depth)) = row {
+            model.write().tree_cursor = Some(target);
+            let indent = depth.min(16) * 13;
+            let _ = document::eval(&format!(
+                "{{const tree=document.querySelector('.drive-tree');if(tree){{tree.scrollTop=Math.max(0,{index}*28-tree.clientHeight/2);tree.scrollLeft={indent};tree.focus({{preventScroll:true}});}}}}"
+            ));
+        }
+    }
+}
+
+pub(super) struct BackgroundRefresh {
+    pub(super) id: u64,
+    generation: u64,
+    pub(super) entries: Vec<sdir::model::FileEntry>,
+    renames: Vec<sdir::watch::Rename>,
+}
+pub(super) fn start_background(mut model: Signal<AppModel>, bridge: &Bridge, pane: usize) {
+    let request = {
+        let mut s = model.write();
+        s.watch_due[pane] = None;
+        let renames = std::mem::take(&mut s.watch_renames[pane]);
+        let hidden = s.show_hidden;
+        let id = s.id().max(s.panes[pane].generation + 1);
+        s.next_id = id + 1;
+        let p = &mut s.panes[pane];
+        p.loading = true;
+        let generation = p.generation;
+        let path = p.tab().path.clone();
+        s.refreshes[pane] = Some(BackgroundRefresh {
+            id,
+            generation,
+            entries: vec![],
+            renames,
+        });
+        Request::List {
+            pane,
+            id,
+            path,
+            hidden,
+        }
+    };
+    bridge.panes[pane].replace(request);
+}
+pub(super) fn finish_background(
+    mut model: Signal<AppModel>,
+    pane: usize,
+    id: u64,
+    error: Option<String>,
+) -> bool {
+    let mut s = model.write();
+    if !s.refreshes[pane].as_ref().is_some_and(|r| r.id == id) {
+        return false;
+    }
+    let r = s.refreshes[pane].take().unwrap();
+    if s.panes[pane].generation != r.generation {
+        return true;
+    }
+    let p = &mut s.panes[pane];
+    if let Some(e) = error {
+        p.finish(
+            r.generation,
+            Some(format!("갱신 실패 · 이전 목록 유지: {e}")),
+        );
+        return true;
+    }
+    let t = p.tab_mut();
+    t.entries = Arc::new(r.entries);
+    for rename in r.renames {
+        if t.selection.remove(&rename.from) {
+            t.selection.insert(rename.to.clone());
+        }
+        if t.cursor.as_ref() == Some(&rename.from) {
+            t.cursor = Some(rename.to.clone());
+        }
+        if t.anchor.as_ref() == Some(&rename.from) {
+            t.anchor = Some(rename.to);
+        }
+    }
+    p.finish(r.generation, None);
+    let t = p.tab_mut();
+    let visible: BTreeSet<_> = t
+        .visible
+        .iter()
+        .map(|i| t.entries[*i].path.clone())
+        .collect();
+    t.selection.retain(|p| visible.contains(p));
+    t.cursor = t.cursor.take().filter(|p| visible.contains(p));
+    t.anchor = t.anchor.take().filter(|p| visible.contains(p));
+
+    s.dirty();
+    true
+}
+
+pub(super) fn dismiss_modal(mut model: Signal<AppModel>, bridge: &Bridge) {
+    if model.read().context.is_some() {
+        close_context(model);
+        return;
+    }
+    if model.read().batch.is_some() {
+        close_batch(model, bridge);
+        return;
+    }
+    if model.read().copy_destination.is_some() {
+        close_copy_destination(model);
+        return;
+    }
+    let pane = {
+        let mut s = model.write();
+        s.appearance = None;
+        s.journal_open = false;
+        s.dialog = None;
+        s.preferences_open = false;
+        s.workspaces_open = false;
+        s.active
+    };
+    focus_list_after_render(model, pane);
+}
+fn context_keys(e: KeyboardEvent, model: Signal<AppModel>) {
+    e.stop_propagation();
+    if e.key() == Key::Escape {
+        e.prevent_default();
+        close_context(model);
+        return;
+    }
+    let delta = match e.key() {
+        Key::ArrowDown => 1,
+        Key::ArrowUp => -1,
+        Key::Tab => {
+            if e.modifiers().shift() {
+                -1
+            } else {
+                1
+            }
+        }
+        Key::Home => -1000,
+        Key::End => 1000,
+        _ => return,
+    };
+    e.prevent_default();
+    let _ = document::eval(&format!(
+        "{{const a=[...document.querySelectorAll('.file-context-menu button:not(:disabled)')],i=a.indexOf(document.activeElement);if(a.length)a[({delta}===1000?a.length-1:{delta}===-1000?0:(i+{delta}+a.length)%a.length)]?.focus();}}"
+    ));
+}
+
+pub(super) fn tree_navigate(mut model: Signal<AppModel>, bridge: &Bridge, path: NativePath) {
+    model.write().tree_cursor = Some(path.clone());
+    navigate(model, bridge, active_pane(model), path);
+    model.write().pending_focus = None;
+    let _ = document::eval("document.querySelector('.drive-tree')?.focus({preventScroll:true})");
+}
+
+fn close_journal(mut model: Signal<AppModel>) {
+    model.write().journal_open = false;
+    let pane = model.read().active;
+    focus_list_after_render(model, pane);
+}
+fn close_appearance(mut model: Signal<AppModel>, pane: usize) {
+    model.write().appearance = None;
+    focus_list_after_render(model, pane);
+}

@@ -1,0 +1,50 @@
+[package]
+name = "sdir"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "A responsive multi-pane Windows file manager with built-in scoped search"
+license = "MIT"
+
+[workspace]
+
+[features]
+default = []
+desktop = ["dep:dioxus"]
+
+[dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+goz-core = { git = "https://github.com/mustafaahci/goz", rev = "78ca353b8c0b227e47217c33c25d37fcff025e33" }
+
+[target.'cfg(windows)'.dependencies]
+goz-winfs = { git = "https://github.com/mustafaahci/goz", rev = "78ca353b8c0b227e47217c33c25d37fcff025e33" }
+dioxus = { version = "=0.7.10", optional = true, default-features = false, features = ["desktop", "macro", "html", "signals", "hooks", "document", "launch"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_Storage_FileSystem"] }
+windows-core = "0.62"
+clipboard-win = { version = "5.4", features = ["std"] }
+tokio = { version = "1", features = ["rt", "time"] }
+
+[build-dependencies]
+embed-resource = "=3.0.11"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Debug symbols and incremental copies dominated disposable development storage.
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+

@@ -1,0 +1,126 @@
+{
+  "schemaVersion": 1,
+  "description": "Stable dist payload for the per-user Windows installer. Source paths are fixed and hashes are checked before staging.",
+  "appSha256": "766bf2aaf832eba9812b0d97f7dd207c0278ae9bd8c332de054548cbf6719740",
+  "portableSha256": "6aa32159140ce9ed0ff1bb06a486651290cb0e74df7e7dd37104ae720fcea4d5",
+  "files": [
+    {
+      "source": "dist/README.md",
+      "destination": "README-portable-reference.md",
+      "bytes": 22921,
+      "sha256": "f513f94dd833538994ad165e3201523fbdb12690cb2744b2fbc0c9477be0d123"
+    },
+    {
+      "source": "dist/THIRD_PARTY_NOTICES.md",
+      "destination": "THIRD_PARTY_NOTICES.md",
+      "bytes": 1675,
+      "sha256": "ccdbe84b58802cf532aa1f8844df19bf0c1cbe6905cdcebd6aff395df9f7fc63"
+    },
+    {
+      "source": "dist/THIRD_PARTY_LICENSES.txt",
+      "destination": "THIRD_PARTY_LICENSES.txt",
+      "bytes": 2612238,
+      "sha256": "b5f0b9d6723249b08d9d0c4798a77e14762dec8c37115b7e853e0ad7f961affc"
+    },
+    {
+      "source": "dist/Cargo.lock",
+      "destination": "Cargo.lock",
+      "bytes": 137694,
+      "sha256": "a4841303c058743ce6b486d9795d2c05934fabc203cf6a6401a85df1965fcac9"
+    },
+    {
+      "source": "dist/check-runtime.ps1",
+      "destination": "check-runtime.ps1",
+      "bytes": 1194,
+      "sha256": "50c8ea83a2edcce2e81a945ffd9723368e03cad12a8e703b6bf435bd164030a0"
+    },
+    {
+      "source": "dist/Start-SDIR.cmd",
+      "destination": "Start-SDIR.cmd",
+      "bytes": 141,
+      "sha256": "3098fd93692a71ccf2023b86e9170bdebc518bcaca1aacc8308b957a80c0414a"
+    },
+    {
+      "source": "dist/docs/user-journeys.md",
+      "destination": "docs/user-journeys.md",
+      "bytes": 25634,
+      "sha256": "a94ecc05edf86878c67f3552dcf593884aa0555eca0228956f9695a2ea3cc4a1"
+    },
+    {
+      "source": "dist/docs/verification.md",
+      "destination": "docs/verification.md",
+      "bytes": 51086,
+      "sha256": "63bb15ddec3e2eda16af42f1edac9d2e6e748e84f09dd1a3f842ef8ace378a29"
+    },
+    {
+      "source": "dist/docs/reference-features.md",
+      "destination": "docs/reference-features.md",
+      "bytes": 4325,
+      "sha256": "ef32f3d5872227397ab2e37ca22a1cbcc800f891a533203a7ecda1e6e547e62d"
+    },
+    {
+      "source": "dist/docs/distribution.md",
+      "destination": "docs/distribution-portable-reference.md",
+      "bytes": 2706,
+      "sha256": "f269aa65fd39f1d0e0da8b9a02c552acfa17c429d88cc8aafbeef9466d68fb63"
+    },
+    {
+      "source": "dist/docs/shortcuts.md",
+      "destination": "docs/shortcuts.md",
+      "bytes": 2909,
+      "sha256": "5f390ec19837bc0e33f44a52d22a48219fda959c14c2590646c228ffc9a924f1"
+    },
+    {
+      "source": "dist/docs/remaining-features.md",
+      "destination": "docs/remaining-features.md",
+      "bytes": 3335,
+      "sha256": "abf733ac81732ea8299e35f097f793202b6d2d65b5ef1d3572fbc07fc48a1313"
+    },
+    {
+      "source": "dist/docs/test-summary.md",
+      "destination": "docs/test-summary.md",
+      "bytes": 5124,
+      "sha256": "67d8ffa2be2ff6e9541989e9dad9067208bf99daf357e2f5b979b7e32dd52e49"
+    },
+    {
+      "source": "dist/docs/performance-improvement.md",
+      "destination": "docs/performance-improvement.md",
+      "bytes": 3811,
+      "sha256": "c4b36975f2e6f06bd278e7b1190b24eba8f88840b543b6780dd9621103e5c21b"
+    },
+    {
+      "source": "dist/docs/performance-comparison.md",
+      "destination": "docs/performance-comparison.md",
+      "bytes": 8758,
+      "sha256": "e5e196c1116526a01f8afe261e43dc4344185805e05b7b9733f0acf0acd055ba"
+    },
+    {
+      "source": "dist/docs/development-storage.md",
+      "destination": "docs/development-storage.md",
+      "bytes": 1967,
+      "sha256": "b938c69c9c7b57262af71102634fa6f501c8a7365c43428e7da3bdef564a7eae"
+    },
+    {
+      "source": "dist/docs/everything-analysis.md",
+      "destination": "docs/everything-analysis.md",
+      "bytes": 4993,
+      "sha256": "01dc312ee8d444352272bbda5c0d3a404928d7b5efd59a101c7e62c98fb6e808"
+    },
+    {
+      "source": "dist/SDIR.exe",
+      "destination": "SDIR.exe",
+      "bytes": 9326592,
+      "sha256": "766bf2aaf832eba9812b0d97f7dd207c0278ae9bd8c332de054548cbf6719740"
+    }
+  ],
+  "excluded": [
+    "portable.flag",
+    "data/**",
+    "webview/**",
+    "dist/SDIR-windows-x64-portable.zip",
+    "dist/SDIR-new.exe",
+    "dist/docs/artifact.json",
+    "docs/search-settings.md",
+    "docs/task-id/search-preferences/SDIR-search-settings-final.exe"
+  ]
+}
