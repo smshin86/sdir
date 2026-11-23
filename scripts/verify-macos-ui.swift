@@ -102,6 +102,33 @@ func inputSourceID(_ source: TISInputSource) -> String {
     return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
 }
 
+struct IMEUnavailable: Error, CustomStringConvertible {
+    let description: String
+    init(_ detail: String) { description = detail }
+}
+
+func inputString(_ source: TISInputSource, _ property: CFString) -> String {
+    guard let raw = TISGetInputSourceProperty(source, property) else { return "" }
+    return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
+}
+
+func inputFlag(_ source: TISInputSource, _ property: CFString) -> Bool {
+    guard let raw = TISGetInputSourceProperty(source, property) else { return false }
+    return CFBooleanGetValue(Unmanaged<CFBoolean>.fromOpaque(raw).takeUnretainedValue())
+}
+
+func inputSources(includeInstalled: Bool) -> [TISInputSource] {
+    guard let array = TISCreateInputSourceList(nil, includeInstalled)?.takeRetainedValue() else { return [] }
+    return (0..<CFArrayGetCount(array)).compactMap { index in
+        guard let raw = CFArrayGetValueAtIndex(array, index) else { return nil }
+        return Unmanaged<TISInputSource>.fromOpaque(raw).takeUnretainedValue()
+    }
+}
+
+func currentSourceID() -> String {
+    TISCopyCurrentKeyboardInputSource().map { inputSourceID($0.takeRetainedValue()) } ?? ""
+}
+
 func role(_ element: AXUIElement) -> String {
     attribute(element, kAXRoleAttribute) as? String ?? ""
 }
@@ -153,29 +180,54 @@ func testIME(_ app: NSRunningApplication, _ ax: AXUIElement) throws {
     }
     guard let field, let fieldFrame = frame(field) else { throw JourneyFailure("Could not locate the global search field after opening the panel") }
     click(fieldFrame)
-    guard let original = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-          let sources = TISCreateInputSourceList(nil, true)?.takeRetainedValue() else {
-        throw JourneyFailure("macOS input sources are unavailable")
+    guard let original = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else {
+        throw IMEUnavailable("macOS input sources are unavailable")
     }
-    var korean: TISInputSource?
-    for index in 0..<CFArrayGetCount(sources) {
-        guard let address = CFArrayGetValueAtIndex(sources, index) else { continue }
-        let source = Unmanaged<TISInputSource>.fromOpaque(address).takeUnretainedValue()
-        if inputSourceID(source) == "com.apple.inputmethod.Korean.2SetKorean" { korean = source; break }
+    let koreanID = "com.apple.inputmethod.Korean.2SetKorean"
+    let available = inputSources(includeInstalled: true)
+    guard let korean = available.first(where: { inputSourceID($0) == koreanID }) else {
+        throw IMEUnavailable("Korean 2-set input source is unavailable")
     }
-    guard let korean else { throw JourneyFailure("Korean 2-set input source is unavailable") }
-    defer { TISSelectInputSource(original) }
+    let bundle = inputString(korean, kTISPropertyBundleID)
+    let method = available.first { source in
+        inputString(source, kTISPropertyInputSourceType) == kTISTypeKeyboardInputMethodModeEnabled as String &&
+            (inputSourceID(source) == "com.apple.inputmethod.Korean" || (!bundle.isEmpty && inputString(source, kTISPropertyBundleID) == bundle))
+    }
+    let modeWasEnabled = inputFlag(korean, kTISPropertyInputSourceIsEnabled)
+    let parentWasEnabled = method.map { inputFlag($0, kTISPropertyInputSourceIsEnabled) } ?? false
+    defer {
+        TISSelectInputSource(original)
+        if !modeWasEnabled { TISDisableInputSource(korean) }
+        if let method, !parentWasEnabled { TISDisableInputSource(method) }
+    }
     key(18)
     key(19)
     guard waitFor(4, { (attribute(field, kAXValueAttribute) as? String) == "12" ? true : nil }) == true else {
         throw JourneyFailure("The search field did not receive the baseline physical number keys")
     }
     key(123)
-    let enabled = TISEnableInputSource(korean)
-    let selected = TISSelectInputSource(korean)
-    guard selected == noErr, waitFor(5, {
-        TISCopyCurrentKeyboardInputSource().map { inputSourceID($0.takeRetainedValue()) == inputSourceID(korean) } == true ? true : nil
-    }) == true else { throw JourneyFailure("Korean input source could not be selected (enable \(enabled), select \(selected))") }
+    let parentResult = method.map { parentWasEnabled ? noErr : TISEnableInputSource($0) }
+    let mode = inputSources(includeInstalled: true).first { inputSourceID($0) == koreanID } ?? korean
+    let enableResult = inputFlag(mode, kTISPropertyInputSourceIsEnabled) ? noErr : TISEnableInputSource(mode)
+    guard let selectable = waitFor(6, {
+        inputSources(includeInstalled: false).first {
+            inputSourceID($0) == koreanID && inputFlag($0, kTISPropertyInputSourceIsEnabled) && inputFlag($0, kTISPropertyInputSourceIsSelectCapable)
+        }
+    }) else {
+        let parent = method.map(inputSourceID) ?? "unavailable"
+        let parentStatus = parentResult.map { String($0) } ?? "unavailable"
+        throw IMEUnavailable("Runner did not register a selectable Korean mode (parent \(parent), parent status \(parentStatus), mode status \(enableResult))")
+    }
+    let selected = TISSelectInputSource(selectable)
+    if waitFor(3, { currentSourceID() == koreanID ? true : nil }) != true {
+        guard attribute(field, kAXFocusedAttribute) as? Bool == true else {
+            throw JourneyFailure("The Spotlight field lost focus before the input-source shortcut")
+        }
+        key(49, flags: [.maskControl])
+    }
+    guard waitFor(5, { currentSourceID() == koreanID ? true : nil }) == true else {
+        throw IMEUnavailable("Runner did not switch to Korean 2-set via TIS or Control-Space (select status \(selected), current ID \(currentSourceID()))")
+    }
     let koreanKeys: [CGKeyCode] = [5, 40, 1, 15, 46, 3]
     for code in koreanKeys { key(code) }
     key(49)
@@ -263,6 +315,8 @@ guard trusted && post else {
 }
 
 let ax = AXUIElementCreateApplication(pid)
-do { try testIME(app, ax) } catch { emit("korean_ime", "failed", String(describing: error)) }
+do { try testIME(app, ax) }
+catch let reason as IMEUnavailable { emit("korean_ime", "blocked", reason.description) }
+catch { emit("korean_ime", "failed", String(describing: error)) }
 do { try testFinderDrop(app, ax, source, destination) } catch { emit("finder_drop", "failed", String(describing: error)) }
 if activate(app) { key(12, flags: [.maskCommand]) }
