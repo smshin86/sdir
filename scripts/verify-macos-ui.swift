@@ -102,17 +102,57 @@ func inputSourceID(_ source: TISInputSource) -> String {
     return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
 }
 
+func role(_ element: AXUIElement) -> String {
+    attribute(element, kAXRoleAttribute) as? String ?? ""
+}
+
+func searchField(_ ax: AXUIElement) -> AXUIElement? {
+    guard let appWindow = window(ax), let close = searchAX(appWindow, matches: { hasText($0, "검색 닫기") }), let closeFrame = frame(close) else { return nil }
+    return searchAX(appWindow) { element in
+        guard role(element) == kAXTextFieldRole || role(element) == "AXTextArea" else { return false }
+        if attribute(element, "AXDOMIdentifier") as? String == "global-query" { return true }
+        if let placeholder = attribute(element, "AXPlaceholderValue") as? String,
+           placeholder.contains("파일명") || placeholder.contains("Enter로 검색") { return true }
+        guard let rect = frame(element) else { return false }
+        return rect.minY >= closeFrame.maxY - 4 && rect.minY <= closeFrame.maxY + 80 && rect.maxX >= closeFrame.maxX - 95
+    }
+}
+
+func describeFocus(_ ax: AXUIElement) -> String {
+    guard let element = asElement(attribute(ax, kAXFocusedUIElementAttribute)) else { return "no focused accessibility element" }
+    let placeholder = attribute(element, "AXPlaceholderValue") as? String ?? ""
+    return "role=\(role(element)), placeholder=\(placeholder)"
+}
+
+func click(_ rect: CGRect) {
+    let point = CGPoint(x: rect.midX, y: rect.midY)
+    mouse(.mouseMoved, point)
+    mouse(.leftMouseDown, point)
+    Thread.sleep(forTimeInterval: 0.09)
+    mouse(.leftMouseUp, point)
+}
+
 func testIME(_ app: NSRunningApplication, _ ax: AXUIElement) throws {
     guard activate(app) else { throw JourneyFailure("Could not make SDIR the foreground application") }
+    guard let toggle = waitFor(12, {
+        window(ax).flatMap { appWindow in
+            searchAX(appWindow, matches: { role($0) == kAXButtonRole && hasText($0, "통합 검색") })
+        }
+    }) else { throw JourneyFailure("The native window did not expose the rendered search button") }
     key(3, flags: [.maskCommand, .maskShift])
-    guard let field = waitFor(8, {
-        guard let element = asElement(attribute(ax, kAXFocusedUIElementAttribute)),
-              attribute(element, kAXRoleAttribute) as? String == kAXTextFieldRole,
-              let current = attribute(element, kAXValueAttribute) as? String, current.isEmpty else { return nil as AXUIElement? }
-        return element
-    }), let appWindow = window(ax), searchAX(appWindow, matches: { hasText($0, "Spotlight 파일 검색") }) != nil else {
-        throw JourneyFailure("Command-Shift-F did not focus the empty Spotlight input")
+    var field = waitFor(4) { searchField(ax) }
+    if let mounted = field {
+        let focused = attribute(mounted, kAXFocusedAttribute) as? Bool == true
+        emit("search_shortcut", focused ? "passed" : "failed", focused ? "Command-Shift-F opened and focused the rendered search field" : "Command-Shift-F opened the search panel; \(describeFocus(ax))")
+    } else {
+        emit("search_shortcut", "failed", "No Spotlight field observed after Command-Shift-F; \(describeFocus(ax))")
+        guard let toggleFrame = frame(toggle) else { throw JourneyFailure("The search button had no clickable frame") }
+        let isOpen = window(ax).flatMap { searchAX($0, matches: { hasText($0, "검색 닫기") }) } != nil
+        if !isOpen { click(toggleFrame) }
+        field = waitFor(6) { searchField(ax) }
     }
+    guard let field, let fieldFrame = frame(field) else { throw JourneyFailure("Could not locate the global search field after opening the panel") }
+    click(fieldFrame)
     guard let original = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
           let sources = TISCreateInputSourceList(nil, true)?.takeRetainedValue() else {
         throw JourneyFailure("macOS input sources are unavailable")
@@ -198,7 +238,10 @@ func testFinderDrop(_ app: NSRunningApplication, _ ax: AXUIElement, _ source: UR
         throw JourneyFailure("Finder drag did not produce the expected file in the SDIR destination")
     }
     guard (try? Data(contentsOf: source)) == original else { throw JourneyFailure("The original file changed after Finder drop") }
-    emit("finder_drop", "passed", "Dragged a Finder file into SDIR and verified the source and copied bytes")
+    let rowVisible = waitFor(8) {
+        window(ax).flatMap { searchAX($0, matches: { hasText($0, title) }) }
+    } != nil
+    emit("finder_drop", "passed", "Dragged a Finder file into SDIR and verified the source and copied bytes; destination row visible=\(rowVisible)")
 }
 
 let args = CommandLine.arguments

@@ -65,7 +65,7 @@ def verify(image, helper, report):
                         app_exit = child.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         app_exit = None
-                    expected = {'window_launch', 'korean_ime', 'finder_drop'}
+                    expected = {'window_launch', 'search_shortcut', 'korean_ime', 'finder_drop'}
                     seen = {event['journey'] for event in events}
                     receipt = {'sha256': digest, 'helperExit': result.returncode, 'appExit': app_exit, 'journeys': events}
                     report.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
