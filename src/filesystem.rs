@@ -246,16 +246,16 @@ mod tests {
     }
     #[test]
     fn invalid_names_are_rejected() {
-        for n in [
-            "",
-            "..",
-            "../escape",
-            "a\\b",
-            "CON.txt",
-            "LPT1",
-            "trailing.",
-        ] {
-            assert!(validate_name(n).is_err(), "{n}");
+        for name in ["", ".", "..", "../escape", "a\0b"] {
+            assert!(validate_name(name).is_err(), "{name}");
+        }
+        let platform_names = ["a\\b", "CON.txt", "LPT1", "trailing."];
+        for name in platform_names {
+            assert_eq!(
+                validate_name(name).is_ok(),
+                cfg!(target_os = "macos"),
+                "{name}"
+            );
         }
         assert!(validate_name("보고서 2026.txt").is_ok());
     }

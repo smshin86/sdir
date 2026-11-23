@@ -378,6 +378,10 @@ mod tests {
     }
     #[test]
     fn folders_only_and_bounded_listing_never_reads_descendants() {
+        // Keep the parent path short enough to reach the item limit before the response size limit.
+        #[cfg(target_os = "macos")]
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(not(target_os = "macos"))]
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("file.txt"), b"file").unwrap();
         fs::create_dir(d.path().join("nested")).unwrap();
@@ -389,7 +393,7 @@ mod tests {
         }
         let l = list(&NativePath::new(d.path()), true).unwrap();
         assert_eq!(l.folders.len(), CHILD_LIMIT);
-        assert!(l.warning.is_some());
+        assert!(l.warning.is_some_and(|warning| warning.contains("1,000개")));
         let root = NativePath::new(d.path());
         let mut t = Tree::new(vec![root.clone()]);
         let id = t.begin(&root).unwrap();

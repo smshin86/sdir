@@ -1872,6 +1872,15 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
 
+    fn cache_tempdir() -> TempDir {
+        // The cache rejects symlinked ancestors. On macOS the system temporary path can start with /var.
+        #[cfg(target_os = "macos")]
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap());
+        #[cfg(not(target_os = "macos"))]
+        let dir = TempDir::new();
+        dir.unwrap()
+    }
+
     const GUID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const ROOT: u64 = NTFS_ROOT_FRN.0;
 
@@ -2333,7 +2342,7 @@ mod tests {
 
     #[test]
     fn profile_store_round_trips_and_rejects_scope_or_volume_mismatch() {
-        let profile = TempDir::new().unwrap();
+        let profile = cache_tempdir();
         let mut store = CacheStore::open_at(profile.path(), limits()).unwrap();
         let index = fixture_index();
         let metadata = fixture_metadata();
@@ -2365,7 +2374,7 @@ mod tests {
 
     #[test]
     fn profile_lock_is_exclusive_and_released_on_close() {
-        let profile = TempDir::new().unwrap();
+        let profile = cache_tempdir();
         let first = CacheStore::open_at(profile.path(), limits()).unwrap();
         assert!(matches!(
             CacheStore::open_at(profile.path(), limits()),
@@ -2377,7 +2386,7 @@ mod tests {
 
     #[test]
     fn interrupted_candidate_keeps_the_previous_commit_and_success_replaces_it() {
-        let profile = TempDir::new().unwrap();
+        let profile = cache_tempdir();
         let mut store = CacheStore::open_at(profile.path(), limits()).unwrap();
         let index = fixture_index();
         let old = fixture_metadata();
@@ -2408,7 +2417,7 @@ mod tests {
         let metadata = fixture_metadata();
         let encoded_size = encode_cache_bytes(&index, &metadata).len() as u64;
 
-        let total_profile = TempDir::new().unwrap();
+        let total_profile = cache_tempdir();
         let total_limit = encoded_size * 2 - 1;
         let total_limits = CacheLimits::new(total_limit, total_limit, 32, 100_000).unwrap();
         let mut store = CacheStore::open_at(total_profile.path(), total_limits).unwrap();
@@ -2437,7 +2446,7 @@ mod tests {
         assert_eq!(store.usage().unwrap().files, 1);
         assert_eq!(store.usage().unwrap().temps, 0);
 
-        let volume_profile = TempDir::new().unwrap();
+        let volume_profile = cache_tempdir();
         let volume_limits =
             CacheLimits::new(encoded_size * 2, encoded_size - 1, 32, 100_000).unwrap();
         let mut volume_store = CacheStore::open_at(volume_profile.path(), volume_limits).unwrap();
@@ -2450,7 +2459,7 @@ mod tests {
 
     #[test]
     fn file_limit_counts_only_committed_known_cache_files() {
-        let profile = TempDir::new().unwrap();
+        let profile = cache_tempdir();
         let index = fixture_index();
         let metadata = fixture_metadata();
         let constrained = CacheLimits::new(1024 * 1024, 1024 * 1024, 1, 100_000).unwrap();
@@ -2476,8 +2485,8 @@ mod tests {
     fn profile_and_cache_links_are_rejected_without_touching_the_target() {
         use std::os::unix::fs::symlink;
 
-        let profile = TempDir::new().unwrap();
-        let outside = TempDir::new().unwrap();
+        let profile = cache_tempdir();
+        let outside = cache_tempdir();
         let outside_file = outside.path().join("keep.bin");
         fs::write(&outside_file, b"preserve").unwrap();
         symlink(outside.path(), profile.path().join(CACHE_SUBDIR)).unwrap();
@@ -2487,7 +2496,7 @@ mod tests {
         ));
         assert_eq!(fs::read(&outside_file).unwrap(), b"preserve");
 
-        let second_profile = TempDir::new().unwrap();
+        let second_profile = cache_tempdir();
         let mut store = CacheStore::open_at(second_profile.path(), limits()).unwrap();
         let metadata = fixture_metadata();
         let link_path = store.cache_path(metadata.identity().volume_guid());
@@ -2518,7 +2527,7 @@ mod tests {
     fn profile_root_and_lock_links_are_rejected() {
         use std::os::unix::fs::symlink;
 
-        let profile = TempDir::new().unwrap();
+        let profile = cache_tempdir();
         let alias = profile.path().join("alias");
         symlink(profile.path(), &alias).unwrap();
         assert!(matches!(
@@ -2526,10 +2535,10 @@ mod tests {
             Err(CacheError::UnsafePath)
         ));
 
-        let second_profile = TempDir::new().unwrap();
+        let second_profile = cache_tempdir();
         let cache_root = second_profile.path().join(CACHE_SUBDIR);
         fs::create_dir(&cache_root).unwrap();
-        let outside = TempDir::new().unwrap();
+        let outside = cache_tempdir();
         let outside_lock = outside.path().join("external-lock");
         fs::write(&outside_lock, b"untouched").unwrap();
         symlink(&outside_lock, cache_root.join(LOCK_FILE)).unwrap();
@@ -2542,7 +2551,7 @@ mod tests {
 
     #[test]
     fn stale_owned_temporary_files_are_cleaned_and_unknown_files_are_preserved() {
-        let profile = TempDir::new().unwrap();
+        let profile = cache_tempdir();
         let metadata = fixture_metadata();
         let temporary;
         let unknown;
