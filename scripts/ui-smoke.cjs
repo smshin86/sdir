@@ -82,8 +82,9 @@ try {
  await until(()=>fs.existsSync(path.join(left,'테스트 폴더')),'native new folder');
  await waitJS(`document.querySelector('.status-message').textContent.includes('완료했습니다')`,'new folder completion');
  await input('[data-pane="0"] .pane-filter input','테스트 폴더');await waitJS(`document.querySelector('[data-pane="0"] .file-name span')?.textContent==='테스트 폴더'`,'new folder listed');
- await row('테스트 폴더');await textButton('.action-bar','이름 변경');await waitJS(`!!document.querySelector('.dialog-input')`,'rename dialog');
- await input('.dialog-input','변경된 폴더');await textButton('.modal-actions','확인');
+ await row('테스트 폴더');await textButton('.action-bar','이름 변경');await waitJS(`!!document.querySelector('.inline-rename-input')`,'inline rename editor');
+ await input('.inline-rename-input','변경된 폴더');
+ for (const type of ['keyDown','keyUp']) await cdp('Input.dispatchKeyEvent',{type,key:'Enter',code:'Enter',windowsVirtualKeyCode:13});
  await until(()=>fs.existsSync(path.join(left,'변경된 폴더')),'native rename');
  await waitJS(`document.querySelector('.status-message').textContent.includes('완료했습니다')`,'rename complete');
  report.checks.push('native create and rename');

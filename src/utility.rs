@@ -1,12 +1,82 @@
 use crate::model::NativePath;
+#[cfg(windows)]
+mod folder_menu;
+#[cfg(windows)]
+mod network;
+#[cfg(windows)]
+mod shortcuts;
 use serde::{Deserialize, Serialize};
+pub const SDIR_MENU_SELECTED: u32 = 1;
+pub const SDIR_DRAG_CANCELLED: u32 = 0;
+pub const SDIR_DRAG_EXTERNAL_HANDOFF: u32 = 1;
+pub const SDIR_DRAG_VERIFIED_MOVE: u32 = 2;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Utility {
     CopyPaths(Vec<NativePath>),
-    Drag(Vec<NativePath>, u64),
+    CreateShortcuts {
+        folder: NativePath,
+        paths: Vec<NativePath>,
+    },
+    Drag {
+        id: u64,
+        paths: Vec<NativePath>,
+        owner: u64,
+        ticket: Option<crate::drag::DragTicket>,
+    },
     OpenWith(NativePath, u64),
+    NetworkDrive {
+        drive: String,
+        remote: Option<String>,
+        remember: bool,
+    },
+    PropertiesSelection {
+        folder: NativePath,
+        entries: Vec<NativePath>,
+    },
     Terminal(NativePath),
     Explorer(NativePath),
+    FolderMenu {
+        request: u64,
+        folder: NativePath,
+        entries: Vec<NativePath>,
+        owner: u64,
+        point: Option<(i32, i32)>,
+    },
+}
+pub fn validate_network_drive(drive: &str, remote: Option<&str>) -> Result<(), String> {
+    if !matches!(drive.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic()) {
+        return Err("드라이브 문자는 Z:처럼 입력하세요.".into());
+    }
+    if let Some(remote) = remote {
+        let Some(rest) = remote.strip_prefix(r"\\") else {
+            return Err("네트워크 경로는 \\\\서버\\공유 형식이어야 합니다.".into());
+        };
+        let mut parts = rest.trim_end_matches('\\').split('\\');
+        let valid = |part: &str| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part
+                    .chars()
+                    .any(|ch| ch.is_control() || "/:?*\"<>|".contains(ch))
+        };
+        if !parts.next().is_some_and(valid)
+            || !parts.next().is_some_and(valid)
+            || !parts.all(valid)
+            || remote.encode_utf16().count() > 2048
+        {
+            return Err("네트워크 경로는 \\\\서버\\공유 형식이어야 합니다.".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn screen_cursor_position() -> Result<(i32, i32), String> {
+    use windows::{Win32::Foundation::POINT, Win32::UI::WindowsAndMessaging::GetCursorPos};
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }.map_err(|e| e.to_string())?;
+    Ok((point.x, point.y))
 }
 pub fn run(action: &Utility) -> Result<Option<u32>, String> {
     #[cfg(windows)]
@@ -21,7 +91,17 @@ pub fn run(action: &Utility) -> Result<Option<u32>, String> {
             core::{PCWSTR, PWSTR},
         };
         match action {
-            Utility::Drag(paths, owner) => crate::drag::run(paths, *owner),
+            Utility::Drag {
+                paths,
+                owner,
+                ticket: Some(ticket),
+                ..
+            } => crate::drag::run(paths, *owner, ticket),
+            Utility::Drag { ticket: None, .. } => Err("드래그 입력 정보를 받지 못했습니다.".into()),
+            Utility::CreateShortcuts { folder, paths } => {
+                shortcuts::create(folder, paths)?;
+                Ok(None)
+            }
             Utility::CopyPaths(paths) => {
                 let text = paths
                     .iter()
@@ -32,6 +112,18 @@ pub fn run(action: &Utility) -> Result<Option<u32>, String> {
                 Ok(None)
             }
             Utility::OpenWith(path, owner) => crate::open_with::run(path, *owner),
+            Utility::NetworkDrive {
+                drive,
+                remote,
+                remember,
+            } => {
+                network::change(drive, remote.as_deref(), *remember)?;
+                Ok(Some(1))
+            }
+            Utility::PropertiesSelection { folder, entries } => {
+                folder_menu::properties(folder, entries)?;
+                Ok(None)
+            }
             Utility::Terminal(path) => unsafe {
                 if !path.to_path().is_dir() {
                     return Err(
@@ -82,11 +174,39 @@ pub fn run(action: &Utility) -> Result<Option<u32>, String> {
                     .map_err(|e| e.to_string())?;
                 Ok(Some(c.id()))
             }
+            Utility::FolderMenu {
+                folder,
+                entries,
+                owner,
+                point,
+                ..
+            } => folder_menu::run(folder, entries, *owner, *point),
         }
     }
     #[cfg(not(windows))]
     {
         let _ = action;
         Err("Windows 전용 기능입니다.".into())
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::validate_network_drive;
+
+    #[test]
+    fn accepts_only_normal_drive_letters_and_unc_share_paths() {
+        assert!(validate_network_drive("Z:", Some(r"\\테스트서버\팀 자료\보고서")).is_ok());
+        assert!(validate_network_drive("X:", None).is_ok());
+        for path in [
+            r"Z:\local",
+            r"\\server",
+            r"\\?\UNC\srv\share",
+            r"\\server\share\..",
+        ] {
+            assert!(validate_network_drive("Z:", Some(path)).is_err(), "{path}");
+        }
+        assert!(validate_network_drive("1:", None).is_err());
+        assert!(validate_network_drive("ZZ", None).is_err());
     }
 }

@@ -14,6 +14,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(windows)]
+mod service_storage;
+
 const MAGIC: &[u8; 8] = b"SDIRIDX\0";
 const SCHEMA_VERSION: u32 = 1;
 const ENGINE_VERSION: u32 = 1;
@@ -376,13 +379,23 @@ struct CacheHeader {
     crc32: u32,
 }
 
+impl CacheHeader {
+    #[cfg(any(windows, test))]
+    fn file_bytes(&self) -> CacheResult<u64> {
+        FIXED_HEADER_BYTES
+            .checked_add(self.metadata.identity.policy_key.len() as u64)
+            .and_then(|bytes| bytes.checked_add(self.payload_bytes))
+            .ok_or(CacheError::Quota)
+    }
+}
+
 #[derive(Clone, Debug)]
-struct CacheRow {
+struct CacheRow<N = Vec<u8>> {
     frn: u64,
     parent_frn: u64,
     is_directory: bool,
     name_lossy: bool,
-    name: Vec<u8>,
+    name: N,
     size: Option<u64>,
     mtime: Option<i64>,
 }
@@ -436,7 +449,7 @@ pub fn encode_cache<W: Write + Seek>(
             parent_frn,
             is_directory,
             name_lossy,
-            name: name.to_vec(),
+            name,
             size,
             mtime,
         };
@@ -494,7 +507,11 @@ fn write_header<W: Write>(
     Ok(())
 }
 
-fn write_row<W: Write>(writer: &mut PayloadWriter<'_, W>, row: &CacheRow) -> CacheResult<()> {
+fn write_row<W: Write>(
+    writer: &mut PayloadWriter<'_, W>,
+    row: &CacheRow<impl AsRef<[u8]>>,
+) -> CacheResult<()> {
+    let name = row.name.as_ref();
     let mut flags = 0u8;
     if row.is_directory {
         flags |= FLAG_DIRECTORY;
@@ -508,13 +525,13 @@ fn write_row<W: Write>(writer: &mut PayloadWriter<'_, W>, row: &CacheRow) -> Cac
     if row.name_lossy {
         flags |= FLAG_LOSSY_NAME;
     }
-    let name_len = u32::try_from(row.name.len())
-        .map_err(|_| CacheError::InvalidInput("NTFS name is too long"))?;
+    let name_len =
+        u32::try_from(name.len()).map_err(|_| CacheError::InvalidInput("NTFS name is too long"))?;
     writer.write(&row.frn.to_le_bytes())?;
     writer.write(&row.parent_frn.to_le_bytes())?;
     writer.write(&[flags])?;
     writer.write(&name_len.to_le_bytes())?;
-    writer.write(&row.name)?;
+    writer.write(name)?;
     if let Some(size) = row.size {
         if row.is_directory {
             return Err(CacheError::InvalidInput("directory row has a file size"));
@@ -602,12 +619,41 @@ fn write_i64<W: Write>(writer: &mut W, value: i64) -> io::Result<()> {
 
 pub fn decode_cache<R: Read>(mut reader: R, limits: &CacheLimits) -> CacheResult<CachedVolume> {
     let header = read_header(&mut reader, limits)?;
+    decode_cache_rows(reader, header, None)
+}
+
+fn decode_cache_rows<R: Read>(
+    mut reader: R,
+    header: CacheHeader,
+    memory_budget: Option<u64>,
+) -> CacheResult<CachedVolume> {
     let mut payload = PayloadReader::new(&mut reader, header.payload_bytes);
     let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
     let mut name_keys = Vec::new();
+    if let Some(budget) = memory_budget {
+        // A row is at least 21 fixed bytes plus one byte of name.
+        if header.row_count > header.payload_bytes / 22 {
+            return Err(CacheError::Corrupt("row count cannot fit in cache payload"));
+        }
+        let keys_bytes = header.row_count.saturating_mul(size_of::<u128>() as u64);
+        if keys_bytes.saturating_add(DECODE_SCRATCH_BYTES) > budget {
+            return Err(CacheError::Quota);
+        }
+        let rows = usize::try_from(header.row_count).map_err(|_| CacheError::Quota)?;
+        name_keys
+            .try_reserve_exact(rows)
+            .map_err(|_| CacheError::Quota)?;
+        // Settle the pinned goz vectors before filling them so growth keeps
+        // their documented 1/16 headroom instead of doubling whole columns.
+        index.shrink_to_fit();
+        check_decode_room(&index, &name_keys, budget)?;
+    }
 
     for _ in 0..header.row_count {
-        let fixed = payload.read_vec(21)?;
+        if let Some(budget) = memory_budget {
+            check_decode_room(&index, &name_keys, budget)?;
+        }
+        let fixed = payload.read_array::<21>()?;
         let frn = u64::from_le_bytes(fixed[0..8].try_into().unwrap());
         let parent_frn = u64::from_le_bytes(fixed[8..16].try_into().unwrap());
         let flags = fixed[16];
@@ -704,21 +750,23 @@ pub fn decode_cache<R: Read>(mut reader: R, limits: &CacheLimits) -> CacheResult
         } else {
             index.insert_layout(&file);
         }
+        if memory_budget.is_some() && index.has_parent_cycle() {
+            return Err(CacheError::Corrupt(
+                "restored index contains a parent cycle",
+            ));
+        }
     }
 
-    if payload.remaining != 0 {
-        return Err(CacheError::Corrupt(
-            "payload length does not match row count",
-        ));
-    }
-    if payload.crc.finish() != header.crc32 {
-        return Err(CacheError::Corrupt("payload CRC32 mismatch"));
-    }
-    let mut trailing = [0u8; 1];
-    if reader.read(&mut trailing)? != 0 {
-        return Err(CacheError::Corrupt("trailing bytes after cache payload"));
-    }
+    verify_payload_end(payload, header.crc32)?;
 
+    if let Some(budget) = memory_budget {
+        let held = index.memory().total().allocated
+            + name_keys.capacity() as u64 * size_of::<u128>() as u64
+            + DECODE_SCRATCH_BYTES;
+        if held > budget {
+            return Err(CacheError::Quota);
+        }
+    }
     name_keys.sort_unstable();
     if name_keys.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(CacheError::Corrupt("duplicate name in one directory"));
@@ -742,6 +790,95 @@ pub fn decode_cache<R: Read>(mut reader: R, limits: &CacheLimits) -> CacheResult
         metadata: header.metadata,
         index,
     })
+}
+
+fn verify_payload_end<R: Read>(
+    payload: PayloadReader<'_, R>,
+    expected_crc: u32,
+) -> CacheResult<()> {
+    if payload.remaining != 0 {
+        return Err(CacheError::Corrupt(
+            "payload length does not match row count",
+        ));
+    }
+    if payload.crc.finish() != expected_crc {
+        return Err(CacheError::Corrupt("payload CRC32 mismatch"));
+    }
+    let mut trailing = [0u8; 1];
+    if payload.reader.read(&mut trailing)? != 0 {
+        return Err(CacheError::Corrupt("trailing bytes after cache payload"));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn load_bounded_cache<R: Read>(
+    mut reader: R,
+    limits: &CacheLimits,
+    expected: &CacheIdentity,
+    disk_bytes: u64,
+    memory_budget: u64,
+) -> CacheResult<Option<CachedVolume>> {
+    // read_header canonicalizes policy JSON (up to 64 KiB on disk). Leave room for
+    // its DOM, serialized copy and buffered I/O before allocating the graph.
+    if memory_budget < DECODE_SCRATCH_BYTES {
+        return Err(CacheError::Quota);
+    }
+    let header = read_header(&mut reader, limits)?;
+    if header.metadata.identity.volume_guid != expected.volume_guid {
+        return Err(CacheError::Corrupt("filename and header GUID differ"));
+    }
+    if header.file_bytes()? != disk_bytes {
+        return Err(CacheError::Corrupt(
+            "cache file length does not match its header",
+        ));
+    }
+    if header.metadata.identity != *expected {
+        return Ok(None);
+    }
+    decode_cache_rows(reader, header, Some(memory_budget)).map(Some)
+}
+
+const DECODE_SCRATCH_BYTES: u64 = 8 * 1024 * 1024;
+
+fn check_decode_room(index: &VolumeIndex, name_keys: &Vec<u128>, budget: u64) -> CacheResult<()> {
+    let memory = index.memory();
+    let allocated = memory.total().allocated;
+    let largest = [
+        memory.entries.allocated,
+        memory.arena_raw.allocated,
+        memory.arena_folded.allocated,
+        memory.frn_map.allocated,
+        memory.name_tables.allocated,
+        memory.dir_children.allocated,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    // The decoder settles entry columns and the name byte arenas up front.
+    // A row adds at most one entry plus a parent placeholder. These settled
+    // vectors grow by 1/16 or a small minimum in the pinned goz version.
+    // Allow a quarter of their capacity for consecutive appends, and allow
+    // doubling for hash tables and the unranked-name list. One old allocation
+    // can overlap its replacement. For a corrupt FRN reuse, also allow the
+    // free-list growth from reclaiming a chain of existing slots.
+    let settled = memory
+        .entries
+        .allocated
+        .saturating_add(memory.arena_raw.allocated)
+        .saturating_add(memory.arena_folded.allocated);
+    let reclaim = (index.allocated() as u64 + 2) * 3 * size_of::<u32>() as u64;
+    let peak = allocated
+        .saturating_add(settled / 4)
+        .saturating_add(allocated - settled)
+        .saturating_add(largest)
+        .saturating_add(reclaim)
+        .saturating_add(name_keys.capacity() as u64 * size_of::<u128>() as u64)
+        .saturating_add(DECODE_SCRATCH_BYTES);
+    if peak > budget {
+        return Err(CacheError::Quota);
+    }
+    Ok(())
 }
 
 fn read_header<R: Read>(reader: &mut R, limits: &CacheLimits) -> CacheResult<CacheHeader> {
@@ -938,6 +1075,8 @@ pub struct CacheStore {
     directory: PathBuf,
     _lock_file: File,
     limits: CacheLimits,
+    #[cfg(windows)]
+    service: Option<service_storage::ServiceStorage>,
 }
 
 impl CacheStore {
@@ -965,6 +1104,8 @@ impl CacheStore {
             directory,
             _lock_file: lock_file,
             limits,
+            #[cfg(windows)]
+            service: None,
         };
         store.remove_stale_temps()?;
         Ok(store)
@@ -972,7 +1113,7 @@ impl CacheStore {
 
     pub fn open_transfer(&mut self, expected: &CacheIdentity) -> CacheResult<CacheLookup> {
         let path = self.cache_path(&expected.volume_guid);
-        if !check_regular_file(&path)? {
+        if !self.check_managed_file(&path)? {
             return Ok(CacheLookup::Missing);
         }
         let mut file = OpenOptions::new().read(true).open(&path)?;
@@ -1006,7 +1147,7 @@ impl CacheStore {
 
     pub fn load(&mut self, expected: &CacheIdentity) -> CacheResult<Option<CachedVolume>> {
         let path = self.cache_path(&expected.volume_guid);
-        if !check_regular_file(&path)? {
+        if !self.check_managed_file(&path)? {
             return Ok(None);
         }
         let mut file = OpenOptions::new().read(true).open(&path)?;
@@ -1033,9 +1174,13 @@ impl CacheStore {
     }
 
     pub fn begin_candidate(&mut self, metadata: &CacheMetadata) -> CacheResult<CacheCandidate> {
+        #[cfg(windows)]
+        if self.service.is_some() {
+            return Err(CacheError::UnsafePath);
+        }
         self.remove_stale_temps()?;
         let target = self.cache_path(&metadata.identity.volume_guid);
-        let target_exists = check_regular_file(&target)?;
+        let target_exists = self.check_managed_file(&target)?;
         let usage = self.usage()?;
         if usage.files > self.limits.max_files {
             return Err(CacheError::Quota);
@@ -1084,7 +1229,7 @@ impl CacheStore {
     {
         self.remove_stale_temps()?;
         let target = self.cache_path(&metadata.identity.volume_guid);
-        let target_exists = check_regular_file(&target)?;
+        let target_exists = self.check_managed_file(&target)?;
         let usage = self.usage()?;
         if usage.files > self.limits.max_files {
             return Err(CacheError::Quota);
@@ -1108,7 +1253,7 @@ impl CacheStore {
         };
 
         let temporary = self.new_temp_path(&metadata.identity.volume_guid);
-        let mut file = create_new_file(&temporary)?;
+        let mut file = self.create_save_file(&temporary)?;
         let result = (|| {
             let stats = encode(&mut file, &staging_limits)?;
             if stats.file_bytes > candidate_limit {
@@ -1116,19 +1261,9 @@ impl CacheStore {
             }
             file.sync_all()?;
             file.seek(SeekFrom::Start(0))?;
-            let validated = decode_cache(&mut file, &staging_limits)?;
-            if validated.metadata != *metadata {
-                return Err(CacheError::Corrupt(
-                    "temporary header changed during validation",
-                ));
-            }
-            drop(validated);
+            self.verify_save_file(&mut file, &staging_limits, metadata, &stats)?;
             drop(file);
-            if check_regular_file(&target)? {
-                fs::rename(&temporary, &target)?;
-            } else {
-                fs::rename(&temporary, &target)?;
-            }
+            self.commit_save_file(&temporary, &target)?;
             sync_directory(&self.directory)?;
             let committed_usage = self.usage()?;
             if committed_usage.total_bytes > self.limits.max_total_bytes
@@ -1150,7 +1285,7 @@ impl CacheStore {
 
     pub fn purge_guid(&mut self, guid: &VolumeGuid) -> CacheResult<bool> {
         let target = self.cache_path(guid);
-        let existed = check_regular_file(&target)?;
+        let existed = self.check_managed_file(&target)?;
         if existed {
             fs::remove_file(&target)?;
         }
@@ -1172,7 +1307,7 @@ impl CacheStore {
                 .strip_suffix(&format!(".{CACHE_EXTENSION}"))
                 .ok_or(CacheError::UnsafePath)?;
             let guid = VolumeGuid::parse(stem).map_err(|_| CacheError::UnsafePath)?;
-            if guid.as_str() != stem || !check_regular_file(&entry.path())? {
+            if guid.as_str() != stem || !self.check_managed_file(&entry.path())? {
                 return Err(CacheError::UnsafePath);
             }
             guids.push(guid);
@@ -1209,6 +1344,52 @@ impl CacheStore {
         ))
     }
 
+    fn check_managed_file(&self, path: &Path) -> CacheResult<bool> {
+        #[cfg(windows)]
+        if self.service.is_some() {
+            return service_storage::check_private_file(path);
+        }
+        check_regular_file(path)
+    }
+
+    fn create_save_file(&self, path: &Path) -> CacheResult<File> {
+        #[cfg(windows)]
+        if self.service.is_some() {
+            return service_storage::create_private_file(path);
+        }
+        create_new_file(path)
+    }
+
+    fn verify_save_file(
+        &self,
+        file: &mut File,
+        limits: &CacheLimits,
+        metadata: &CacheMetadata,
+        _stats: &CacheStats,
+    ) -> CacheResult<()> {
+        #[cfg(windows)]
+        if self.service.is_some() {
+            return service_storage::verify_encoded_file(file, limits, metadata, _stats);
+        }
+        let validated = decode_cache(file, limits)?;
+        if validated.metadata != *metadata {
+            return Err(CacheError::Corrupt(
+                "temporary header changed during validation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit_save_file(&self, source: &Path, target: &Path) -> CacheResult<()> {
+        self.check_managed_file(target)?;
+        #[cfg(windows)]
+        if self.service.is_some() {
+            return service_storage::replace_file(source, target);
+        }
+        fs::rename(source, target)?;
+        Ok(())
+    }
+
     fn usage(&self) -> CacheResult<CacheUsage> {
         let mut usage = CacheUsage::default();
         for entry in fs::read_dir(&self.directory)? {
@@ -1222,6 +1403,10 @@ impl CacheStore {
             };
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
+            #[cfg(windows)]
+            if self.service.is_some() && !self.check_managed_file(&path)? {
+                return Err(CacheError::UnsafePath);
+            }
             verify_plain_metadata(&metadata)?;
             verify_owned_path(&path, &metadata)?;
             verify_private_file(&metadata)?;
@@ -1255,7 +1440,7 @@ impl CacheStore {
             };
             if let Some(ManagedName::Temp(guid)) = classify_managed_name(&name) {
                 let path = entry.path();
-                check_regular_file(&path)?;
+                self.check_managed_file(&path)?;
                 fs::remove_file(path)?;
                 let _ = guid;
             }
@@ -1274,7 +1459,7 @@ impl CacheStore {
                 && matches!(classify_managed_name(&name), Some(ManagedName::Temp(_)))
             {
                 let path = entry.path();
-                check_regular_file(&path)?;
+                self.check_managed_file(&path)?;
                 fs::remove_file(path)?;
             }
         }
@@ -1743,6 +1928,53 @@ mod tests {
                 dos_only: false,
             }],
         });
+    }
+
+    #[test]
+    fn bounded_cache_checks_budget_identity_and_payload() {
+        let index = fixture_index();
+        let policy = serde_json::json!({});
+        let metadata = metadata_for(GUID, 3, &policy, 42, 100);
+        let mut disk = Cursor::new(Vec::new());
+        let stats = encode_cache(&index, &metadata, &limits(), &mut disk).unwrap();
+        let bytes = disk.into_inner();
+        let restore = |data: &[u8], disk_bytes, expected: &CacheIdentity, budget| {
+            load_bounded_cache(data, &limits(), expected, disk_bytes, budget)
+        };
+        let budget = 16 * 1024 * 1024;
+        let loaded = restore(&bytes, stats.file_bytes, metadata.identity(), budget)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot(&loaded.index), snapshot(&index));
+        assert!(matches!(
+            restore(&bytes, stats.file_bytes, metadata.identity(), 0),
+            Err(CacheError::Quota)
+        ));
+        assert!(matches!(
+            restore(
+                &bytes,
+                stats.file_bytes,
+                metadata.identity(),
+                DECODE_SCRATCH_BYTES
+            ),
+            Err(CacheError::Quota)
+        ));
+        let mismatch = identity(GUID, 4, &policy);
+        assert!(
+            restore(&bytes, stats.file_bytes, &mismatch, budget)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            restore(&bytes, stats.file_bytes + 1, metadata.identity(), budget),
+            Err(CacheError::Corrupt(_))
+        ));
+        let mut corrupted = bytes;
+        corrupted[CRC_OFFSET] ^= 1;
+        assert!(matches!(
+            restore(&corrupted, stats.file_bytes, metadata.identity(), budget),
+            Err(CacheError::Corrupt("payload CRC32 mismatch"))
+        ));
     }
 
     fn fixture_index() -> VolumeIndex {

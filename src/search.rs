@@ -195,6 +195,18 @@ pub(crate) fn query_index_with_scope(
     scope: Option<&crate::index_policy::ScopePolicy>,
     budget: &Budget<'_>,
 ) -> Result<SearchResult, String> {
+    query_index_with_exclusion(index, root, text, complete, scope, None, budget)
+}
+
+pub(crate) fn query_index_with_exclusion(
+    index: &VolumeIndex,
+    root: &NativePath,
+    text: &str,
+    complete: bool,
+    scope: Option<&crate::index_policy::ScopePolicy>,
+    excluded: Option<&crate::index_policy::RelativePathRoot>,
+    budget: &Budget<'_>,
+) -> Result<SearchResult, String> {
     let started = Instant::now();
     validate_query_text(text)?;
     if text.trim().is_empty() {
@@ -208,45 +220,50 @@ pub(crate) fn query_index_with_scope(
 
     let scoped_policy = scope
         .filter(|policy| !policy.include_roots().is_empty() || !policy.exclude_roots().is_empty());
-    if scoped_policy.is_some() && budget.check() {
+    let filtered = scoped_policy.is_some() || excluded.is_some();
+    if filtered && budget.check() {
         return Err(search_timeout_error());
     }
 
     let mut parsed = parse_query(text).map_err(|error| error.to_string())?;
-    let mount_prefix = if let Some(policy) = scoped_policy {
-        if budget.check() {
-            return Err(search_timeout_error());
-        }
-        let mut graph_dependent = false;
-        if let Some(expression) = parsed.expr.as_ref() {
-            expression.for_each_leaf(&mut |leaf| {
-                if matches!(
-                    leaf,
-                    goz_core::query::Leaf::Related { .. }
-                        | goz_core::query::Leaf::Count { .. }
-                        | goz_core::query::Leaf::TotalChildSize(_)
-                ) {
-                    graph_dependent = true;
-                }
-            });
-        }
-        if graph_dependent {
-            return Err(
-                "범위 검색에서는 Related, Count, TotalChildSize 조건을 지원하지 않습니다.".into(),
-            );
-        }
-        let mount_prefix = scoped_mount_prefix(root);
-        let scope_expression = scoped_expression(policy, &mount_prefix);
-        parsed.expr = Some(match parsed.expr.take() {
-            Some(existing) => goz_core::query::Expr::And(vec![existing, scope_expression]),
-            None => scope_expression,
-        });
-        mount_prefix
+    let mount_prefix = if filtered {
+        scoped_mount_prefix(root)
     } else {
         root.display()
     };
-
-    if scoped_policy.is_some() && budget.check() {
+    if filtered {
+        use goz_core::query::Expr;
+        let mut terms = parsed.expr.take().into_iter().collect::<Vec<_>>();
+        if let Some(policy) = scoped_policy {
+            let mut graph_dependent = false;
+            if let Some(expression) = terms.first() {
+                expression.for_each_leaf(&mut |leaf| {
+                    if matches!(
+                        leaf,
+                        goz_core::query::Leaf::Related { .. }
+                            | goz_core::query::Leaf::Count { .. }
+                            | goz_core::query::Leaf::TotalChildSize(_)
+                    ) {
+                        graph_dependent = true;
+                    }
+                });
+            }
+            if graph_dependent {
+                return Err(
+                    "범위 검색에서는 Related, Count, TotalChildSize 조건을 지원하지 않습니다.".into(),
+                );
+            }
+            terms.push(scoped_expression(policy, &mount_prefix));
+        }
+        if let Some(excluded) = excluded {
+            terms.push(Expr::Not(Box::new(scoped_roots_expression(
+                &mount_prefix,
+                std::slice::from_ref(excluded),
+            ))));
+        }
+        parsed.expr = Some(Expr::And(terms));
+    }
+    if filtered && budget.check() {
         return Err(search_timeout_error());
     }
     let out = run_query_refs(
@@ -261,13 +278,13 @@ pub(crate) fn query_index_with_scope(
         budget,
     )
     .map_err(|_| search_timeout_error())?;
-    if scoped_policy.is_some() && budget.check() {
+    if filtered && budget.check() {
         return Err(search_timeout_error());
     }
 
     let mut hits = vec![];
     for result in out.refs {
-        if scoped_policy.is_some() && budget.check() {
+        if filtered && budget.check() {
             return Err(search_timeout_error());
         }
         let mut relative = vec![];
@@ -283,7 +300,7 @@ pub(crate) fn query_index_with_scope(
             volume_mount: None,
         });
     }
-    if scoped_policy.is_some() && budget.check() {
+    if filtered && budget.check() {
         return Err(search_timeout_error());
     }
     Ok(SearchResult {
@@ -450,6 +467,32 @@ mod tests {
             Some(policy),
             &Budget::unlimited(),
         )
+    }
+
+    #[test]
+    fn default_exclusion_filters_totals_and_pages_without_hiding_sibling_paths() {
+        let fixture = tempfile::tempdir().unwrap();
+        let hidden = fixture.path().join("Windows").join("WinSxS");
+        let shown = fixture.path().join("Windows").join("WinSxS-backup");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::create_dir_all(&shown).unwrap();
+        for number in 0..205 {
+            fs::write(hidden.join(format!("a{number:03}-component.txt")), b"x").unwrap();
+        }
+        fs::write(shown.join("z-component.txt"), b"x").unwrap();
+        let index = completed_index(fixture.path());
+        let excluded = crate::index_policy::RelativePathRoot::parse("WINDOWS/winsxs").unwrap();
+        let query = |text, scope, exclusion| {
+            query_index_with_exclusion(&index.index, &index.root, text, index.done, scope,
+                exclusion, &Budget::unlimited()).unwrap()
+        };
+        let filtered = query("component.txt", None, Some(&excluded));
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.hits[0].path.to_path(), shown.join("z-component.txt"));
+        assert_eq!(query("component.txt", None, None).total, 206);
+        let custom = make_scope(&["Windows"], &["Windows/WinSxS-backup"]);
+        assert_eq!(query("component.txt", Some(&custom), Some(&excluded)).total, 0);
+        let _ = query("parent-count:1", None, Some(&excluded));
     }
 
     #[test]

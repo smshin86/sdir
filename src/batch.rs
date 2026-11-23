@@ -12,6 +12,8 @@ pub struct Pattern {
     pub prefix: String,
     pub suffix: String,
     pub start: Option<u32>,
+    #[serde(default)]
+    pub whole_stem: Option<String>,
 }
 pub fn preview(paths: &[NativePath], p: &Pattern) -> Result<Vec<RenamePair>, String> {
     if paths.is_empty() || paths.len() > 500 {
@@ -19,6 +21,12 @@ pub fn preview(paths: &[NativePath], p: &Pattern) -> Result<Vec<RenamePair>, Str
     }
     if paths.iter().map(|p| p.0.len()).sum::<usize>() > 50000 {
         return Err("경로 데이터가 많습니다. 항목을 나눠 변경하세요.".into());
+    }
+    if p.whole_stem
+        .as_ref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err("여러 항목에 붙일 공통 이름을 입력하세요.".into());
     }
     let mut result = vec![];
     for (i, path) in paths.iter().enumerate() {
@@ -45,7 +53,11 @@ pub fn preview(paths: &[NativePath], p: &Pattern) -> Result<Vec<RenamePair>, Str
             .start
             .map(|n| format!("_{}", u64::from(n) + i as u64))
             .unwrap_or_default();
-        let mut name = format!("{}{}{}{}", p.prefix, stem, p.suffix, counter);
+        let mut name = if let Some(common) = &p.whole_stem {
+            format!("{common} ({})", i + 1)
+        } else {
+            format!("{}{}{}{}", p.prefix, stem, p.suffix, counter)
+        };
         if let Some(ext) = extension {
             if !ext.is_empty() {
                 name.push('.');

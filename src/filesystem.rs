@@ -166,7 +166,7 @@ pub fn validate_action(action: &FileAction) -> Result<(), String> {
                 }
             }
         }
-        FileAction::Recycle { sources } => {
+        FileAction::Recycle { sources } | FileAction::Delete { sources } => {
             if sources.is_empty() || sources.iter().any(|p| p.to_path().parent().is_none()) {
                 return Err("드라이브 루트는 삭제할 수 없습니다.".into());
             }

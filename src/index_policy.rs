@@ -439,6 +439,19 @@ impl VolumePolicy {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn windows_components_are_hidden_for_legacy_settings_and_opt_out_round_trips() {
+    let mut old: NtfsIndexingSettings = serde_json::from_str(r#"{"auto_fixed":false}"#).unwrap();
+    assert!(!old.show_windows_components());
+    assert!(!old.auto_fixed());
+    assert!(serde_json::to_value(&old).unwrap().get("show_windows_components").is_none());
+    old.set_show_windows_components(true).unwrap();
+    let decoded: NtfsIndexingSettings = serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
+    assert_eq!(old, decoded);
+    assert!(decoded.show_windows_components());
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VolumeDecision {
     Included { monitor: bool },
@@ -450,6 +463,7 @@ pub enum VolumeDecision {
 pub struct NtfsIndexingSettings {
     auto_fixed: bool,
     auto_removable: bool,
+    show_windows_components: bool,
     offline: OfflinePolicy,
     persistent: bool,
     volumes: Vec<VolumePolicy>,
@@ -462,6 +476,7 @@ impl Default for NtfsIndexingSettings {
         Self {
             auto_fixed: true,
             auto_removable: false,
+            show_windows_components: false,
             offline: OfflinePolicy::DropCache,
             persistent: false,
             volumes: Vec::new(),
@@ -478,6 +493,10 @@ impl NtfsIndexingSettings {
 
     pub fn auto_removable(&self) -> bool {
         self.auto_removable
+    }
+
+    pub fn show_windows_components(&self) -> bool {
+        self.show_windows_components
     }
 
     pub fn offline_policy(&self) -> OfflinePolicy {
@@ -565,6 +584,12 @@ impl NtfsIndexingSettings {
         Ok(())
     }
 
+    pub fn set_show_windows_components(&mut self, value: bool) -> Result<(), IndexPolicyError> {
+        self.ensure_valid()?;
+        self.show_windows_components = value;
+        Ok(())
+    }
+
     pub fn set_offline_policy(&mut self, value: OfflinePolicy) -> Result<(), IndexPolicyError> {
         self.ensure_valid()?;
         self.offline = value;
@@ -624,6 +649,7 @@ impl NtfsIndexingSettings {
                 Self {
                     auto_fixed,
                     auto_removable,
+                    show_windows_components: false,
                     offline,
                     persistent,
                     volumes: Vec::new(),
@@ -640,6 +666,8 @@ impl NtfsIndexingSettings {
 struct IndexingSettingsWire<'a> {
     auto_fixed: bool,
     auto_removable: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    show_windows_components: bool,
     offline: OfflinePolicy,
     persistent: bool,
     volumes: &'a [VolumePolicy],
@@ -656,6 +684,7 @@ impl Serialize for NtfsIndexingSettings {
         IndexingSettingsWire {
             auto_fixed: self.auto_fixed,
             auto_removable: self.auto_removable,
+            show_windows_components: self.show_windows_components,
             offline: self.offline,
             persistent: self.persistent,
             volumes: &self.volumes,
@@ -680,7 +709,7 @@ fn parse_valid_settings(value: &Value) -> Result<NtfsIndexingSettings, IndexPoli
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "auto_fixed" | "auto_removable" | "offline" | "persistent" | "volumes"
+            "auto_fixed" | "auto_removable" | "show_windows_components" | "offline" | "persistent" | "volumes"
         )
     }) {
         return Err(IndexPolicyError::InvalidConfiguration);
@@ -689,6 +718,7 @@ fn parse_valid_settings(value: &Value) -> Result<NtfsIndexingSettings, IndexPoli
     let auto_fixed = read_bool(object, "auto_fixed", true)?;
     let auto_removable = read_bool(object, "auto_removable", false)?;
     let persistent = read_bool(object, "persistent", false)?;
+    let show_windows_components = read_bool(object, "show_windows_components", false)?;
     let offline = match object.get("offline") {
         None => OfflinePolicy::DropCache,
         Some(Value::String(value)) if value == "drop_cache" => OfflinePolicy::DropCache,
@@ -727,6 +757,7 @@ fn parse_valid_settings(value: &Value) -> Result<NtfsIndexingSettings, IndexPoli
     Ok(NtfsIndexingSettings {
         auto_fixed,
         auto_removable,
+        show_windows_components,
         offline,
         persistent,
         volumes: normalized,

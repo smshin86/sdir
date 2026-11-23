@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -97,29 +97,123 @@ pub enum SortColumn {
 }
 
 pub fn sort_entries(entries: &mut [FileEntry], column: SortColumn, descending: bool) {
-    entries.sort_by_cached_key(|e| {
-        // Folder grouping is stable regardless of the requested direction.
-        let name = e.name.to_lowercase();
+    if column == SortColumn::Name {
+        sort_entry_names(entries);
+        if descending {
+            // Folder grouping stays first in either name direction.
+            let folders = entries.partition_point(|entry| entry.is_dir);
+            entries[..folders].reverse();
+            entries[folders..].reverse();
+        }
+        return;
+    }
+
+    entries.sort_by_cached_key(|entry| {
         let value = match column {
-            SortColumn::Name => 0,
-            SortColumn::Size => e.bytes.unwrap_or(0),
-            SortColumn::Modified => e.modified.unwrap_or(0),
+            SortColumn::Size => entry.bytes.unwrap_or(0),
+            SortColumn::Modified => entry.modified.unwrap_or(0),
+            SortColumn::Name => unreachable!(),
         };
         (
-            !e.is_dir,
-            if descending && column != SortColumn::Name {
-                u64::MAX - value
-            } else {
-                value
-            },
-            name,
+            !entry.is_dir,
+            if descending { u64::MAX - value } else { value },
+            entry.name.to_lowercase(),
         )
     });
-    if descending && column == SortColumn::Name {
-        let folders = entries.partition_point(|e| e.is_dir);
-        entries[..folders].reverse();
-        entries[folders..].reverse();
+}
+
+#[cfg(not(windows))]
+fn sort_entry_names(entries: &mut [FileEntry]) {
+    entries.sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+}
+
+#[cfg(windows)]
+fn sort_entry_names(entries: &mut [FileEntry]) {
+    use windows::Win32::UI::Shell::{REST_NOSTRCMPLOGICAL, SHRestricted};
+
+    let literal = unsafe { SHRestricted(REST_NOSTRCMPLOGICAL) != 0 };
+    sort_windows_names(entries, literal);
+}
+
+#[cfg(windows)]
+fn sort_windows_names(entries: &mut [FileEntry], literal: bool) {
+    entries.sort_by_cached_key(|entry| (!entry.is_dir, ExplorerName::new(&entry.name, literal)));
+}
+
+#[cfg(windows)]
+#[derive(PartialEq, Eq)]
+struct ExplorerName {
+    literal: bool,
+    utf16: Vec<u16>,
+}
+
+#[cfg(windows)]
+impl ExplorerName {
+    fn new(name: &str, literal: bool) -> Self {
+        Self {
+            literal,
+            utf16: name.encode_utf16().chain([0]).collect(),
+        }
     }
+}
+
+#[cfg(windows)]
+impl Ord for ExplorerName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use windows::{
+            Win32::UI::Shell::{StrCmpIW, StrCmpLogicalW},
+            core::PCWSTR,
+        };
+
+        self.literal.cmp(&other.literal).then_with(|| {
+            let left = PCWSTR(self.utf16.as_ptr());
+            let right = PCWSTR(other.utf16.as_ptr());
+            // Each key owns a terminated UTF-16 buffer for the duration of the comparison.
+            let result = unsafe {
+                if self.literal {
+                    StrCmpIW(left, right)
+                } else {
+                    StrCmpLogicalW(left, right)
+                }
+            };
+            result
+                .cmp(&0)
+                // Distinct names that collate equally still have a stable order.
+                .then_with(|| self.utf16.cmp(&other.utf16))
+        })
+    }
+}
+
+#[cfg(windows)]
+impl PartialOrd for ExplorerName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupBy {
+    #[default]
+    None,
+    Modified,
+    Kind,
+}
+impl GroupBy {
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Modified => "modified",
+            Self::Kind => "kind",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GroupHeader {
+    first_item: usize,
+    row: usize,
+    label: String,
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +223,8 @@ pub struct Tab {
     pub forward: Vec<NativePath>,
     pub entries: Arc<Vec<FileEntry>>,
     pub visible: Arc<Vec<usize>>,
+    pub group_by: GroupBy,
+    groups: Arc<Vec<GroupHeader>>,
     pub selection: BTreeSet<NativePath>,
     pub cursor: Option<NativePath>,
     pub anchor: Option<NativePath>,
@@ -146,6 +242,7 @@ pub struct Tab {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TabState {
+    pub group_by: GroupBy,
     pub path: NativePath,
     pub back: Vec<NativePath>,
     pub forward: Vec<NativePath>,
@@ -165,6 +262,8 @@ pub enum ViewMode {
     Details,
     List,
     Icons,
+    Tiles,
+    Content,
 }
 impl ViewMode {
     pub fn value(self) -> &'static str {
@@ -172,21 +271,24 @@ impl ViewMode {
             Self::Details => "details",
             Self::List => "list",
             Self::Icons => "icons",
+            Self::Tiles => "tiles",
+            Self::Content => "content",
         }
     }
     pub fn geometry(self, width: f64, height: f64, compact: bool) -> ViewGeometry {
         ViewGeometry {
-            columns: if self == Self::Icons {
-                (width / 112.).floor().clamp(1., 16.) as usize
-            } else {
-                1
+            columns: match self {
+                Self::Icons => (width / 112.).floor().clamp(1., 16.) as usize,
+                Self::Tiles => (width / 230.).floor().clamp(1., 16.) as usize,
+                _ => 1,
             },
-            row_height: if self == Self::Icons {
-                if height < 90. { 54. } else { 108. }
-            } else if compact {
-                30.
-            } else {
-                38.
+            row_height: match self {
+                Self::Icons if height < 90. => 54.,
+                Self::Icons => 108.,
+                Self::Tiles => 64.,
+                Self::Content => 44.,
+                _ if compact => 30.,
+                _ => 38.,
             },
             viewport_height: height.max(1.),
         }
@@ -238,6 +340,8 @@ impl Tab {
             forward: vec![],
             entries: Arc::new(vec![]),
             visible: Arc::new(vec![]),
+            group_by: GroupBy::None,
+            groups: Arc::default(),
             selection: BTreeSet::new(),
             cursor: None,
             anchor: None,
@@ -260,6 +364,7 @@ impl Tab {
             return saved;
         }
         TabState {
+            group_by: self.group_by,
             path: self.path.clone(),
             back: self
                 .back
@@ -322,22 +427,126 @@ impl Tab {
             .collect();
         self.filter = state.filter.chars().take(4096).collect();
         self.sort = state.sort;
+        self.group_by = state.group_by;
         self.descending = state.descending;
         let mut state = state.clone();
         state.selection = state.selection.iter().take(4096).cloned().collect();
         self.resume = Some(state);
     }
+    /// Keep the current listing in place on incremental refresh. New entries follow it.
+    pub fn replace_entries_in_current_order(
+        &mut self,
+        mut entries: Vec<FileEntry>,
+        renames: &[crate::watch::Rename],
+    ) {
+        let mut ranks: HashMap<_, _> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(rank, entry)| (&entry.path, rank))
+            .collect();
+        for rename in renames {
+            if let Some(rank) = ranks.remove(&rename.from) {
+                ranks.insert(&rename.to, rank);
+            }
+        }
+        entries.sort_by_cached_key(|entry| ranks.get(&entry.path).copied().unwrap_or(usize::MAX));
+        self.entries = Arc::new(entries);
+    }
     pub fn rebuild_visible(&mut self) {
         let needle = self.filter.to_lowercase();
-        self.visible = Arc::new(
-            self.entries
+        let mut visible: Vec<_> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| needle.is_empty() || e.name.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        let mut groups = Vec::new();
+        if self.group_by != GroupBy::None {
+            use chrono::Datelike;
+            let today = chrono::Local::now().date_naive();
+            let group = |i: usize| {
+                let entry = &self.entries[i];
+                match self.group_by {
+                    GroupBy::Kind if entry.is_dir => (0, "폴더".into()),
+                    GroupBy::Kind => {
+                        let name = std::path::Path::new(&entry.name)
+                            .extension()
+                            .and_then(|suffix| suffix.to_str())
+                            .map(|suffix| format!("{} 파일", suffix.to_uppercase()))
+                            .unwrap_or_else(|| "기타 파일".into());
+                        (1, name)
+                    }
+                    GroupBy::Modified => {
+                        let Some(date) = entry
+                            .modified
+                            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds as i64, 0))
+                            .map(|time| time.with_timezone(&chrono::Local).date_naive())
+                        else {
+                            return (7, "날짜 없음".into());
+                        };
+                        let age = (today - date).num_days();
+                        let weekday = i64::from(today.weekday().num_days_from_monday());
+                        let (rank, name) = match age {
+                            ..=-1 => (0, "이후"),
+                            0 => (1, "오늘"),
+                            1 => (2, "어제"),
+                            age if age <= weekday => (3, "이번 주"),
+                            age if age <= weekday + 7 => (4, "지난주"),
+                            _ if date.year() == today.year() && date.month() == today.month() => {
+                                (5, "이번 달")
+                            }
+                            _ => (6, "이전"),
+                        };
+                        (rank, name.into())
+                    }
+                    GroupBy::None => unreachable!(),
+                }
+            };
+            let mut grouped: Vec<_> = visible.into_iter().map(|i| (group(i), i)).collect();
+            grouped.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut previous = None;
+            visible = grouped
                 .iter()
                 .enumerate()
-                .filter(|(_, e)| needle.is_empty() || e.name.to_lowercase().contains(&needle))
-                .map(|(i, _)| i)
-                .collect(),
-        );
+                .map(|(position, (key, index))| {
+                    if previous != Some(key) {
+                        groups.push(GroupHeader {
+                            first_item: position,
+                            row: position + groups.len(),
+                            label: key.1.clone(),
+                        });
+                        previous = Some(key);
+                    }
+                    *index
+                })
+                .collect();
+        }
+        self.visible = Arc::new(visible);
+        self.groups = Arc::new(groups);
     }
+
+    pub fn render_len(&self) -> usize {
+        self.visible.len() + self.groups.len()
+    }
+
+    pub fn render_position(&self, position: usize) -> usize {
+        position
+            + self
+                .groups
+                .partition_point(|header| header.first_item <= position)
+    }
+
+    pub fn item_at_render_row(&self, row: usize) -> Result<usize, &str> {
+        let headers = self.groups.partition_point(|header| header.row < row);
+        if let Some(header) = self.groups.get(headers).filter(|header| header.row == row) {
+            Err(&header.label)
+        } else {
+            Ok(row - headers)
+        }
+    }
+
     pub fn set_filter(&mut self, filter: String) {
         self.resume = None;
         self.filter = filter;
@@ -348,6 +557,13 @@ impl Tab {
         self.type_ahead.clear();
         self.type_ahead_at = None;
         self.rebuild_visible();
+    }
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.anchor = self.cursor.clone();
+        self.resume = None;
+        self.type_ahead.clear();
+        self.type_ahead_at = None;
     }
     pub fn cursor_position(&self) -> Option<usize> {
         self.cursor.as_ref().and_then(|p| {
@@ -396,6 +612,25 @@ impl Tab {
             .filter(|p| !self.selection.contains(p))
             .collect();
     }
+    pub fn move_cursor(&mut self, position: usize) -> Option<usize> {
+        let &index = self.visible.get(position)?;
+        self.cursor = Some(self.entries[index].path.clone());
+        self.resume = None;
+        self.type_ahead.clear();
+        self.type_ahead_at = None;
+        Some(position)
+    }
+
+    pub fn toggle_position(&mut self, position: usize) -> Option<usize> {
+        self.move_cursor(position)?;
+        let path = self.cursor.clone()?;
+        if !self.selection.remove(&path) {
+            self.selection.insert(path.clone());
+        }
+        self.anchor = Some(path);
+        Some(position)
+    }
+
     pub fn select_position(&mut self, position: usize, extend: bool) -> Option<usize> {
         self.resume = None;
         let &index = self.visible.get(position)?;
@@ -501,7 +736,9 @@ impl Pane {
         let mut g = self
             .view
             .geometry(self.viewport_width, self.viewport_height, compact);
-        if self.view == ViewMode::Icons {
+        if self.tab().group_by != GroupBy::None {
+            g.columns = 1;
+        } else if self.view == ViewMode::Icons {
             g.columns = (self.viewport_width / f64::from(self.icon_size.clamp(80, 192)))
                 .floor()
                 .clamp(1., 16.) as usize;
@@ -527,7 +764,7 @@ impl Pane {
         let visible_cursor = if resized {
             let old = self.geometry(compact);
             self.tab().cursor_position().filter(|&position| {
-                let top = old.row_top(position);
+                let top = old.row_top(self.tab().render_position(position));
                 top < self.tab().scroll + old.viewport_height
                     && top + old.row_height > self.tab().scroll
             })
@@ -537,7 +774,8 @@ impl Pane {
         self.viewport_width = width;
         self.viewport_height = height;
         let next = visible_cursor.map_or(scroll, |position| {
-            self.geometry(compact).scroll_to(position, scroll)
+            self.geometry(compact)
+                .scroll_to(self.tab().render_position(position), scroll)
         });
         self.tab_mut().scroll = next;
         visible_cursor.map(|position| (position, next))
@@ -574,10 +812,13 @@ impl Pane {
         &mut self.tabs[self.active]
     }
     pub fn new_tab(&mut self) -> bool {
+        self.new_tab_at(self.tab().path.clone())
+    }
+    pub fn new_tab_at(&mut self, path: NativePath) -> bool {
         if self.tabs.len() >= 16 {
             return false;
         }
-        self.tabs.push(Tab::new(self.tab().path.clone()));
+        self.tabs.push(Tab::new(path));
         self.active = self.tabs.len() - 1;
         true
     }
@@ -628,6 +869,7 @@ impl Pane {
         let tab = self.tab_mut();
         tab.entries = Arc::new(vec![]);
         tab.visible = Arc::new(vec![]);
+        tab.groups = Arc::default();
         tab.selection.clear();
         tab.cursor = None;
         tab.anchor = None;
@@ -690,16 +932,24 @@ impl Pane {
         true
     }
     pub fn finish(&mut self, generation: u64, error: Option<String>) -> bool {
+        self.finish_listing(generation, error, true)
+    }
+    pub fn finish_preserving_order(&mut self, generation: u64, error: Option<String>) -> bool {
+        self.finish_listing(generation, error, false)
+    }
+    fn finish_listing(&mut self, generation: u64, error: Option<String>, sort: bool) -> bool {
         if generation != self.generation {
             return false;
         }
         self.loading = false;
         let tab = self.tab_mut();
-        sort_entries(
-            Arc::make_mut(&mut tab.entries).as_mut_slice(),
-            tab.sort,
-            tab.descending,
-        );
+        if sort {
+            sort_entries(
+                Arc::make_mut(&mut tab.entries).as_mut_slice(),
+                tab.sort,
+                tab.descending,
+            );
+        }
         tab.rebuild_visible();
         let resumed = tab.resume.is_some();
         if let Some(saved) = tab.resume.take() {
@@ -740,11 +990,7 @@ impl Pane {
             return;
         }
         if toggle {
-            if !tab.selection.remove(&path) {
-                tab.selection.insert(path.clone());
-            }
-            tab.cursor = Some(path.clone());
-            tab.anchor = Some(path);
+            tab.toggle_position(position);
         } else {
             tab.select_position(position, false);
         }
@@ -771,6 +1017,9 @@ pub enum FileAction {
     Recycle {
         sources: Vec<NativePath>,
     },
+    Delete {
+        sources: Vec<NativePath>,
+    },
     Rename {
         source: NativePath,
         name: String,
@@ -784,9 +1033,10 @@ pub enum FileAction {
 impl FileAction {
     pub fn sources(&self) -> Vec<NativePath> {
         match self {
-            Self::Copy { sources, .. } | Self::Move { sources, .. } | Self::Recycle { sources } => {
-                sources.clone()
-            }
+            Self::Copy { sources, .. }
+            | Self::Move { sources, .. }
+            | Self::Recycle { sources }
+            | Self::Delete { sources } => sources.clone(),
             Self::Rename { source, .. } => vec![source.clone()],
             Self::BatchRename { pairs } => pairs.iter().map(|p| p.source.clone()).collect(),
             Self::History { record } => record
@@ -802,6 +1052,7 @@ impl FileAction {
             Self::Copy { .. } => "복사",
             Self::Move { .. } => "이동",
             Self::Recycle { .. } => "휴지통",
+            Self::Delete { .. } => "영구 삭제",
             Self::Rename { .. } => "이름 변경",
             Self::BatchRename { .. } => "이름 일괄 변경",
             Self::NewFolder { .. } => "새 폴더",
@@ -885,6 +1136,7 @@ mod tests {
     fn resumed_tabs_keep_filter_sort_history_and_existing_selection() {
         let mut p = Pane::new(NativePath::new("root"));
         let state = TabState {
+            group_by: GroupBy::None,
             path: NativePath::new("root"),
             back: vec![NativePath::new("previous")],
             forward: vec![NativePath::new("next")],
@@ -1095,6 +1347,13 @@ mod tests {
             sort_entries(&mut e, SortColumn::Name, descending);
             assert!(e[0].is_dir);
         }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn explorer_name_comparison_supports_numeric_and_literal_order() {
+        assert!(ExplorerName::new("2", false) < ExplorerName::new("10", false));
+        assert!(ExplorerName::new("10", true) < ExplorerName::new("2", true));
+        assert!(ExplorerName::new("e\u{301}", false) < ExplorerName::new("é", false));
     }
     #[test]
     fn korean_paths_round_trip_json() {

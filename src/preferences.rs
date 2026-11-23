@@ -43,29 +43,53 @@ impl Default for Columns {
     }
 }
 impl Columns {
+    pub const MAX_WIDTH: u16 = 800;
+
+    pub const fn minimum_width(index: usize) -> u16 {
+        if index == 0 { 120 } else { 50 }
+    }
+
     pub fn normalize(&mut self) {
         self.visible[0] = true;
-        for (i, w) in self.widths.iter_mut().enumerate() {
-            *w = (*w).clamp(if i == 0 { 120 } else { 50 }, 800);
+        for (index, width) in self.widths.iter_mut().enumerate() {
+            *width = (*width).clamp(Self::minimum_width(index), Self::MAX_WIDTH);
         }
     }
-    pub fn template(&self) -> String {
-        self.widths
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.visible[*i])
-            .map(|(_, w)| format!("{w}px"))
-            .collect::<Vec<_>>()
-            .join(" ")
+
+    pub fn resize(&mut self, index: usize, width: u16) -> bool {
+        if index >= self.widths.len() || !self.visible[index] {
+            return false;
+        }
+        let width = width.clamp(Self::minimum_width(index), Self::MAX_WIDTH);
+        if self.widths[index] == width {
+            return false;
+        }
+        self.widths[index] = width;
+        self.custom = true;
+        true
     }
-    pub fn total(&self) -> u32 {
-        self.widths
+
+    pub fn details_style(&self) -> String {
+        let variables = self
+            .widths
             .iter()
             .enumerate()
-            .filter(|(i, _)| self.visible[*i])
-            .map(|(_, w)| u32::from(*w))
-            .sum::<u32>()
-            + 50
+            .map(|(index, width)| format!("--detail-column-{index}:{width}px;"))
+            .collect::<String>();
+        let tracks = self
+            .visible
+            .iter()
+            .enumerate()
+            .filter(|(_, visible)| **visible)
+            .map(|(index, _)| format!("var(--detail-column-{index})"))
+            .collect::<Vec<_>>();
+        // Shared by the row and header grids: 13px padding and 7px column gaps.
+        let overhead = 26 + 7 * tracks.len().saturating_sub(1);
+        format!(
+            "{variables}--detail-columns:{};--detail-width:calc({overhead}px + {});",
+            tracks.join(" "),
+            tracks.join(" + ")
+        )
     }
 }
 

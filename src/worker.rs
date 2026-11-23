@@ -19,6 +19,14 @@ use std::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    Thumbnails {
+        id: u64,
+        paths: Vec<NativePath>,
+    },
+    ReadPreview {
+        id: u64,
+        path: NativePath,
+    },
     Preview {
         id: u64,
         paths: Vec<NativePath>,
@@ -50,6 +58,8 @@ pub enum Request {
     IndexVolumes {
         id: u64,
         memory_mib: u16,
+        #[serde(default)]
+        service_only: bool,
         #[serde(default)]
         settings: Box<crate::index_policy::NtfsIndexingSettings>,
     },
@@ -98,6 +108,17 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    Thumbnails {
+        id: u64,
+        images: Vec<Option<String>>,
+    },
+    Opened {
+        path: NativePath,
+    },
+    ReadPreview {
+        id: u64,
+        result: Result<crate::file_preview::Preview, String>,
+    },
     Preview {
         id: u64,
         result: Result<Vec<crate::batch::RenamePair>, String>,
@@ -171,6 +192,10 @@ pub enum Event {
         accepted: bool,
         message: Option<String>,
     },
+    JobProgress {
+        id: u64,
+        percent: u8,
+    },
     Job {
         id: u64,
         result: JobResult,
@@ -238,6 +263,18 @@ pub fn worker_main(search: bool) -> Result<(), String> {
         parent_lifetime();
     }
     match request {
+        Request::Thumbnails { id, paths } => output(&Event::Thumbnails {
+            id,
+            images: paths
+                .iter()
+                .take(8)
+                .map(crate::file_preview::thumbnail)
+                .collect(),
+        }),
+        Request::ReadPreview { id, path } => output(&Event::ReadPreview {
+            id,
+            result: crate::file_preview::read(&path),
+        }),
         Request::Preview { id, paths, pattern } => output(&Event::Preview {
             id,
             result: crate::batch::preview(&paths, &pattern),
@@ -277,15 +314,16 @@ pub fn worker_main(search: bool) -> Result<(), String> {
             };
             output(&Event::Listed { pane, id, error });
         }
-        Request::Job { id, action } => output(&Event::Job {
-            id,
-            result: platform::run_action(&action),
-        }),
-        Request::Open { path } => {
-            if let Err(message) = platform::open_path(&path) {
-                output(&Event::Notice { message });
-            }
+        Request::Job { id, action } => {
+            let result = platform::run_action_with_progress(&action, move |percent| {
+                output(&Event::JobProgress { id, percent });
+            });
+            output(&Event::Job { id, result });
         }
+        Request::Open { path } => match platform::open_path(&path) {
+            Ok(()) => output(&Event::Opened { path }),
+            Err(message) => output(&Event::Notice { message }),
+        },
         Request::Properties { path } => {
             let result = platform::properties(&path);
             output(&Event::Notice {
@@ -345,12 +383,18 @@ fn search_main() -> Result<(), String> {
                 Request::IndexVolumes {
                     id,
                     memory_mib,
+                    service_only,
                     settings,
                 } => {
                     let queued = requests.collect::<Vec<_>>();
-                    if let Err(message) =
-                        crate::live_search::proxy(id, memory_mib, *settings, queued, rx)
-                    {
+                    if let Err(message) = crate::live_search::proxy(
+                        id,
+                        memory_mib,
+                        service_only,
+                        *settings,
+                        queued,
+                        rx,
+                    ) {
                         output(&Event::Failure {
                             lane: 4,
                             id,
@@ -442,6 +486,14 @@ fn is_query_request(request: &Request) -> bool {
 
 fn request_failure(request: Request, message: String) -> Event {
     match request {
+        Request::Thumbnails { id, .. } => Event::Thumbnails {
+            id,
+            images: Vec::new(),
+        },
+        Request::ReadPreview { id, .. } => Event::ReadPreview {
+            id,
+            result: Err(message),
+        },
         Request::Query { id, .. } => Event::Search {
             id,
             result: Err(message),
@@ -586,6 +638,9 @@ pub struct Bridge {
     pub tree: Slot,
     pub watches: Vec<Slot>,
     pub preview: Slot,
+    pub file_preview: Slot,
+    pub thumbnails: Slot,
+    pub folder_search: Slot,
     pub events: Receiver<Event>,
     jobs: Sender<Request>,
     property_events: Sender<Event>,
@@ -598,6 +653,9 @@ impl Bridge {
         let search = Slot::new(4, tx.clone(), true);
         let tree = Slot::new(5, tx.clone(), false);
         let preview = Slot::new(10, tx.clone(), false);
+        let file_preview = Slot::new(11, tx.clone(), false);
+        let thumbnails = Slot::new(13, tx.clone(), false);
+        let folder_search = Slot::new(12, tx.clone(), true);
         let watches = (0..4)
             .map(|i| Slot::new(6 + i, tx.clone(), false))
             .collect();
@@ -643,6 +701,9 @@ impl Bridge {
             tree,
             watches,
             preview,
+            file_preview,
+            thumbnails,
+            folder_search,
             events: rx,
             jobs,
             property_events,
@@ -660,15 +721,65 @@ impl Bridge {
     pub fn utility(&self, action: crate::utility::Utility) -> Result<(), String> {
         self.shell(Request::Utility { action })
     }
+    #[cfg(windows)]
+    pub fn drag(
+        &self,
+        id: u64,
+        paths: Vec<NativePath>,
+        owner: u64,
+        capture: Arc<crate::drag::GestureEvents>,
+    ) -> Result<(), String> {
+        let action = crate::utility::Utility::Drag {
+            id,
+            paths,
+            owner,
+            ticket: None,
+        };
+        self.shell_prepared(Request::Utility { action }, move |child, request| {
+            let Request::Utility {
+                action: crate::utility::Utility::Drag { ticket, .. },
+            } = request
+            else {
+                return Err("드래그 작업 요청이 올바르지 않습니다.".into());
+            };
+            *ticket = Some(capture.duplicate_for(child)?);
+            Ok(())
+        })
+    }
+
     fn shell(&self, request: Request) -> Result<(), String> {
+        self.shell_prepared(request, |_, _| Ok(()))
+    }
+
+    fn shell_prepared(
+        &self,
+        request: Request,
+        prepare: impl FnOnce(&Child, &mut Request) -> Result<(), String> + Send + 'static,
+    ) -> Result<(), String> {
         if self.property_busy.swap(true, Ordering::AcqRel) {
             return Err("열려 있는 외부 작업 창을 먼저 닫아 주세요.".into());
         }
         let events = self.property_events.clone();
         let busy = self.property_busy.clone();
         std::thread::spawn(move || {
-            if let Err(message) = run_one(request, &events) {
-                let _ = events.send(Event::Notice { message });
+            let tracked = match &request {
+                Request::Utility {
+                    action:
+                        action @ (crate::utility::Utility::FolderMenu { .. }
+                        | crate::utility::Utility::Drag { .. }),
+                } => Some(action.clone()),
+                _ => None,
+            };
+            if let Err(message) = run_one_prepared(request, &events, prepare) {
+                let event = if let Some(action) = tracked {
+                    Event::Utility {
+                        action,
+                        result: Err(message),
+                    }
+                } else {
+                    Event::Notice { message }
+                };
+                let _ = events.send(event);
             }
             busy.store(false, Ordering::Release);
         });
@@ -705,8 +816,46 @@ fn send_request(child: &mut Child, request: &Request) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 fn run_one(request: Request, events: &Sender<Event>) -> Result<(), String> {
+    run_one_prepared(request, events, |_, _| Ok(()))
+}
+fn run_one_prepared(
+    mut request: Request,
+    events: &Sender<Event>,
+    prepare: impl FnOnce(&Child, &mut Request) -> Result<(), String>,
+) -> Result<(), String> {
     let mut c = child(false)?;
-    send_request(&mut c, &request)?;
+    if let Err(error) = prepare(&c, &mut request) {
+        drop(c.stdin.take());
+        let _ = c.wait();
+        return Err(error);
+    }
+    #[cfg(windows)]
+    if let Request::Utility {
+        action: crate::utility::Utility::FolderMenu { owner, .. },
+    } = &request
+    {
+        use windows::Win32::{
+            Foundation::HWND,
+            UI::WindowsAndMessaging::{AllowSetForegroundWindow, GetForegroundWindow},
+        };
+        let owner = HWND(*owner as usize as *mut std::ffi::c_void);
+        if unsafe { GetForegroundWindow() } == owner {
+            let _ = unsafe { AllowSetForegroundWindow(c.id()) };
+        }
+    }
+    if let Err(error) = send_request(&mut c, &request) {
+        drop(c.stdin.take());
+        let _ = c.wait();
+        return Err(error);
+    }
+    let tracked = matches!(
+        &request,
+        Request::Utility {
+            action: crate::utility::Utility::FolderMenu { .. }
+                | crate::utility::Utility::Drag { .. }
+        }
+    );
+    let mut completed = false;
     let shell = matches!(
         request,
         Request::Utility { .. } | Request::Properties { .. }
@@ -719,17 +868,25 @@ fn run_one(request: Request, events: &Sender<Event>) -> Result<(), String> {
             let Ok(line) = line else { break };
             if let Ok(e) = serde_json::from_str::<Event>(&line) {
                 let terminal = shell && matches!(e, Event::Utility { .. } | Event::Notice { .. });
+                let menu_result = matches!(e, Event::Utility { .. });
                 if events.send(e).is_err() {
                     break;
                 }
                 if terminal {
+                    completed = !tracked || menu_result;
                     drop(c.stdin.take());
                     break;
                 }
             }
         }
     }
+    drop(c.stdin.take());
     let status = c.wait().map_err(|e| e.to_string())?;
+    if tracked && !completed {
+        return Err(format!(
+            "Windows 작업 프로세스가 결과 없이 종료됐습니다 ({status})."
+        ));
+    }
     if !status.success() {
         let message = format!("작업 프로세스가 종료됐습니다 ({status}). 결과를 확인하세요.");
         match request {
@@ -811,6 +968,8 @@ fn worker_request_id(request: &Request) -> u64 {
         | Request::Tree { id, .. }
         | Request::Preview { id, .. }
         | Request::Watch { id, .. }
+        | Request::ReadPreview { id, .. }
+        | Request::Thumbnails { id, .. }
         | Request::Query { id, .. } => *id,
         Request::Configure { session, .. }
         | Request::Rebuild { session, .. }
@@ -928,8 +1087,8 @@ fn manage(inner: Arc<SlotInner>, lane: usize, events: Sender<Event>, search: boo
                     stop_managed_child(&mut old.child, false);
                     let _ = events.send(Event::Failure {
                         lane,
-                        id: active_id,
-                        message: "검색 작업이 새 세션으로 교체되었습니다.".into(),
+                        id: old.id,
+                        message: "이전 작업이 새 요청으로 교체되었습니다.".into(),
                     });
                 }
             }

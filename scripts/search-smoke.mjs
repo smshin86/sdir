@@ -60,11 +60,20 @@ try{
  await mouse('.search-expand');
  await until(()=>evaluate(`document.querySelector('.search-expand')?.getAttribute('aria-pressed')==='true'&&getComputedStyle(document.querySelector('.workspace')).display==='none'&&document.querySelector('.search-panel').clientWidth>document.querySelector('.body').clientWidth-5&&document.querySelector('.search-result strong')?.textContent==='보고서.txt'`),'expanded search retains results and fills workspace');
  const nested=path.join(folder,'자료');
+ const tabPaths=()=>evaluate(`[...document.querySelectorAll('.pane')].map(pane=>[...pane.querySelectorAll('.tabs > .tab')].map(tab=>tab.title))`);
  async function reveal(pane, parent, name){
+   const expected=await tabPaths();
+   expected[pane].push(parent);
    await mouse('.search-result');
    await until(()=>evaluate(`!document.querySelector('.search-expanded')&&document.querySelector('#address-${pane}')?.value===${JSON.stringify(parent)}&&document.querySelector('[data-pane="${pane}"] .file-row.selected .file-name>span')?.textContent===${JSON.stringify(name)}&&document.activeElement===document.querySelector('[data-pane="${pane}"] .list-scroll')`),'exact result path, selection and focus in pane '+pane);
+   assert.deepEqual(await tabPaths(),expected,'only the target pane gets the new tab');
+   assert.equal(await evaluate(`document.querySelector('[data-pane="${pane}"] .tabs > .tab.selected')?.title`),parent);
  }
  await reveal(0,nested,'보고서.txt');
+ await mouse('[data-pane="0"] .tabs > .tab:first-child');
+ await until(()=>evaluate(`document.querySelector('#address-0')?.value===${JSON.stringify(folder)}`),'original tab still shows its original folder');
+ await mouse('[data-pane="0"] .tabs > .tab:nth-child(2)');
+ await until(()=>evaluate(`document.querySelector('#address-0')?.value===${JSON.stringify(nested)}`),'search tab still shows the result folder');
  assert.equal(await evaluate(`document.querySelector('#address-1').value`),other);
  assert.equal(fs.readFileSync(path.join(nested,'보고서.txt'),'utf8'),'nested');
  check('J39 pointer and keyboard change search width, expanded search wraps result details, and revealing restores the dock');
@@ -73,7 +82,7 @@ try{
  await query('NOTES',1,['notes.TXT']);await reveal(1,folder,'notes.TXT');
  await query('자료',1,['자료']);await reveal(1,folder,'자료');
  assert.equal(await evaluate(`document.querySelector('#address-0').value`),nested);
- check('J39 default and explicit search destinations keep repeated results in the selected pane and its active tab');
+ check('J39 default and explicit search destinations open new tabs and preserve existing tabs');
  await mouse('.layout-switch button[title="4분할"]');
  await until(()=>evaluate(`document.querySelectorAll('.pane').length===4&&document.querySelector('.search-target-select option[value="3"]')`),'four panels and target options');
  const expectedOtherPaths=await evaluate(`[0,1,2].map(p=>document.querySelector('#address-'+p).value)`);
@@ -87,7 +96,7 @@ try{
  await mouse('.layout-switch button[title="2분할"]');
  await until(()=>evaluate(`document.querySelectorAll('.pane').length===2&&document.querySelector('.search-target-select')?.value==='active'`),'shrinking layout resets a removed target');
  await native('resize');
- check('J39 repeated results stay in the selected fourth pane at the minimum native window size, then shrinking the layout clears the missing target');
+ check('J39 repeated results add tabs only to the fourth pane at the minimum native window size, then shrinking clears the removed target');
  await address(folder);
  fs.writeFileSync(path.join(folder,'new-after-index.txt'),'new');await query('new-after-index',0,[]);await mouse('[data-pane="0"] .file-row');await index();await until(()=>evaluate(`document.querySelector('.results-summary strong')?.textContent==='1개 결과'&&document.querySelector('.search-result strong')?.textContent==='new-after-index.txt'`),'reindex includes external creation');fs.unlinkSync(path.join(folder,'new-after-index.txt'));await index();await until(()=>evaluate(`document.querySelector('.results-summary strong')?.textContent==='0개 결과'`),'reindex removes deletion');check('J39 snapshot semantics and explicit reindex reflect actual external creation/deletion');
  const missing=path.join(root,'missing');await address(missing);await openSearchSettings();await mouse('.preferences .index-actions button.primary');await until(()=>evaluate(`!!document.querySelector('.preferences .index-error')&&!document.querySelector('.search-panel .search-error')`),'unavailable root index error in Settings');await closeSearchSettings();await address(folder);await index();await query('보고서',1,['보고서.txt']);check('J39 unavailable scope reports an index error in Settings and a valid scope can be indexed again');

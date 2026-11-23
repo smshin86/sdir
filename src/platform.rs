@@ -5,6 +5,13 @@ use crate::{
 };
 
 pub fn run_action(action: &FileAction) -> JobResult {
+    run_action_with_progress(action, |_| {})
+}
+
+pub(crate) fn run_action_with_progress<F>(action: &FileAction, progress: F) -> JobResult
+where
+    F: Fn(u8) + Send + Sync + 'static,
+{
     if let Err(message) = validate_action(action) {
         return JobResult {
             ok: false,
@@ -25,7 +32,10 @@ pub fn run_action(action: &FileAction) -> JobResult {
         };
     }
     #[cfg(windows)]
-    let (result, destinations, changes, mut outcomes) = windows_impl::perform(action);
+    let (result, destinations, changes, mut outcomes) =
+        windows_impl::perform(action, std::sync::Arc::new(progress));
+    #[cfg(not(windows))]
+    let _ = progress;
     #[cfg(not(windows))]
     let (result, destinations, changes, mut outcomes): (
         Result<bool, String>,
@@ -88,6 +98,24 @@ pub fn run_action(action: &FileAction) -> JobResult {
             failed,
             message
         );
+    }
+    if ok {
+        let completed = outcomes.iter().filter(|outcome| outcome.ok).count();
+        match action {
+            FileAction::Copy { destination, .. } => {
+                message = format!(
+                    "파일 작업을 완료했습니다. 복사 {completed}개 → {}",
+                    destination.display()
+                );
+            }
+            FileAction::Move { destination, .. } => {
+                message = format!(
+                    "파일 작업을 완료했습니다. 이동 {completed}개 → {}",
+                    destination.display()
+                );
+            }
+            _ => {}
+        }
     }
     let (undo, history_note) = match history::inverse(changes) {
         Ok(record) => (record, None),
@@ -296,10 +324,10 @@ mod windows_impl {
             UI::{
                 Shell::{
                     COPYENGINE_E_CANCELLED, COPYENGINE_E_USER_CANCELLED, FOF_ALLOWUNDO,
-                    FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING, FOFX_ADDUNDORECORD,
-                    FOFX_RECYCLEONDELETE, FileOperation, IFileOperation,
-                    IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem,
-                    SHCreateItemFromParsingName, SICHINT_CANONICAL, SIGDN_FILESYSPATH,
+                    FOF_NO_CONNECTED_ELEMENTS, FOF_NOCONFIRMATION, FOF_RENAMEONCOLLISION,
+                    FOF_WANTNUKEWARNING, FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE, FileOperation,
+                    IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl,
+                    IShellItem, SHCreateItemFromParsingName, SICHINT_CANONICAL, SIGDN_FILESYSPATH,
                     ShellExecuteW,
                 },
                 WindowsAndMessaging::SW_SHOWNORMAL,
@@ -309,6 +337,7 @@ mod windows_impl {
     };
     pub fn perform(
         action: &FileAction,
+        progress: std::sync::Arc<dyn Fn(u8) + Send + Sync>,
     ) -> (
         Result<bool, String>,
         Vec<NativePath>,
@@ -318,7 +347,13 @@ mod windows_impl {
         let paths = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
         let changes = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
         let outcomes = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
-        let result = perform_inner(action, paths.clone(), changes.clone(), outcomes.clone());
+        let result = perform_inner(
+            action,
+            paths.clone(),
+            changes.clone(),
+            outcomes.clone(),
+            progress,
+        );
         let destinations = paths.lock().unwrap().clone();
         let completed = changes.lock().unwrap().clone();
         let outcomes = outcomes.lock().unwrap().clone();
@@ -333,7 +368,7 @@ mod windows_impl {
             FileAction::BatchRename { pairs } => {
                 pairs.iter().filter_map(|p| p.source.parent()).collect()
             }
-            FileAction::Recycle { .. } => vec![],
+            FileAction::Recycle { .. } | FileAction::Delete { .. } => vec![],
             FileAction::History { record } => record
                 .items
                 .iter()
@@ -351,7 +386,8 @@ mod windows_impl {
         match action {
             FileAction::Copy { sources, .. }
             | FileAction::Move { sources, .. }
-            | FileAction::Recycle { sources } => {
+            | FileAction::Recycle { sources }
+            | FileAction::Delete { sources } => {
                 sources.iter().cloned().map(ItemSource::File).collect()
             }
             FileAction::Rename { source, .. } => vec![ItemSource::File(source.clone())],
@@ -443,6 +479,8 @@ mod windows_impl {
         sources: Vec<(ItemSource, IShellItem)>,
         existed: Vec<IShellItem>,
         outcomes: std::sync::Arc<std::sync::Mutex<Vec<crate::model::ItemOutcome>>>,
+        progress: std::sync::Arc<dyn Fn(u8) + Send + Sync>,
+        last_progress: std::sync::Mutex<Option<u8>>,
     }
     fn completed_status(result: windows::core::HRESULT) -> bool {
         matches!(
@@ -708,6 +746,22 @@ mod windows_impl {
             Ok(())
         }
         fn UpdateProgress(&self, iworktotal: u32, iworksofar: u32) -> windows::core::Result<()> {
+            if iworktotal > 0 && iworksofar > 0 && iworksofar < iworktotal {
+                let percent =
+                    ((u64::from(iworksofar) * 100) / u64::from(iworktotal)).clamp(1, 99) as u8;
+                let should_emit = {
+                    let mut last = self.last_progress.lock().unwrap();
+                    if *last == Some(percent) {
+                        false
+                    } else {
+                        *last = Some(percent);
+                        true
+                    }
+                };
+                if should_emit {
+                    (self.progress)(percent);
+                }
+            }
             Ok(())
         }
         fn ResetTimer(&self) -> windows::core::Result<()> {
@@ -733,6 +787,7 @@ mod windows_impl {
         paths: std::sync::Arc<std::sync::Mutex<Vec<NativePath>>>,
         changes: std::sync::Arc<std::sync::Mutex<Vec<Change>>>,
         outcomes: std::sync::Arc<std::sync::Mutex<Vec<crate::model::ItemOutcome>>>,
+        progress: std::sync::Arc<dyn Fn(u8) + Send + Sync>,
     ) -> Result<bool, String> {
         let copy_in_place = if let FileAction::Copy {
             sources,
@@ -767,8 +822,12 @@ mod windows_impl {
         let run = || -> windows::core::Result<bool> {
             unsafe {
                 let operation: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
-                let mut flags =
-                    FOF_ALLOWUNDO | FOF_WANTNUKEWARNING | FOFX_ADDUNDORECORD | FOFX_RECYCLEONDELETE;
+                let mut flags = if matches!(action, FileAction::Delete { .. }) {
+                    // The app's confirmation already covered these exact source items.
+                    FOF_NOCONFIRMATION | FOF_NO_CONNECTED_ELEMENTS
+                } else {
+                    FOF_ALLOWUNDO | FOF_WANTNUKEWARNING | FOFX_ADDUNDORECORD | FOFX_RECYCLEONDELETE
+                };
                 if copy_in_place || matches!(action, FileAction::History { .. }) {
                     flags |= FOF_RENAMEONCOLLISION;
                 }
@@ -777,6 +836,8 @@ mod windows_impl {
                     paths,
                     changes,
                     outcomes,
+                    progress: progress.clone(),
+                    last_progress: std::sync::Mutex::new(None),
                     existed: expected_targets(action)
                         .into_iter()
                         .filter(|p| p.to_path().exists())
@@ -848,7 +909,7 @@ mod windows_impl {
                             }
                         }
                     }
-                    FileAction::Recycle { sources } => {
+                    FileAction::Recycle { sources } | FileAction::Delete { sources } => {
                         for source in sources {
                             operation.DeleteItem(&item(source)?, none)?;
                         }

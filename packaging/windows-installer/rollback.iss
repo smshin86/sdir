@@ -68,6 +68,7 @@ type
     szExeFile: array[0..259] of WideChar;
   end;
   TInt64Array = array of Int64;
+  TReceiptSeenArray = array of Boolean;
   TRegistryStringArray = TArrayOfString;
 
 var
@@ -88,8 +89,8 @@ var
   PayloadPaths, PayloadHashes: TArrayOfString;
   AcceptedInventoryIds, AcceptedInventoryPaths, AcceptedInventoryHashes: TArrayOfString;
   PayloadBytes, AcceptedInventoryBytes: TInt64Array;
-  ReceiptPayloadSeen: array[0..127] of Boolean;
-  ReceiptPayloadHashes: array[0..127] of String;
+  ReceiptPayloadSeen: TReceiptSeenArray;
+  ReceiptPayloadHashes: TArrayOfString;
   ReceiptPayloadRecordCount: Integer;
   PayloadFilesInstalled: Integer;
   ReceiptInventoryId: String;
@@ -192,6 +193,8 @@ begin
   SetArrayLength(AcceptedInventoryPaths, InventoryRowCount);
   SetArrayLength(AcceptedInventoryHashes, InventoryRowCount);
   SetArrayLength(AcceptedInventoryBytes, InventoryRowCount);
+  SetArrayLength(ReceiptPayloadSeen, InventoryRowCount);
+  SetArrayLength(ReceiptPayloadHashes, InventoryRowCount);
 #include "payload-initialize.iss"
 end;
 
@@ -1329,7 +1332,9 @@ begin
     end;
     DataBuffer := '';
     Attempt := 0;
-    while Status = ErrorMoreData do begin
+    { A size-only query can succeed without reading any value bytes. }
+    while (Status = ErrorMoreData) or
+      ((Attempt = 0) and (Status = 0) and (DataLength > 0)) do begin
       if DataLength > MaxRegistryValueBytes then begin
         RegCloseKey(KeyHandle);
         Reason := 'An uninstall registry value exceeds the supported snapshot size: ' +

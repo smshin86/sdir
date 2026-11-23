@@ -13,22 +13,46 @@ if (!window.__sdirTextUndoInstalled) {
     }
     return state;
   };
+  const imeInput = input => textInput(input) && input.matches('#global-query, .group-name-input, .inline-rename-input, .batch-common-name, .folder-search-input');
+  const composing = new WeakSet();
+  const recordInput = input => {
+    let state = edits.get(input);
+    if (!state) {
+      state = stateFor(input);
+    } else if (!replaying.has(input) && state.current === input.value) {
+      return;
+    } else if (!replaying.has(input)) {
+      state.undo.push(state.current);
+      if (state.undo.length > 64) state.undo.shift();
+      state.redo = [];
+    }
+    state.current = input.value;
+    if (imeInput(input)) input.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  document.addEventListener('compositionstart', event => {
+    const input = event.target;
+    if (!imeInput(input)) return;
+    stateFor(input);
+    composing.add(input);
+  }, true);
+  document.addEventListener('compositionend', event => {
+    const input = event.target;
+    if (!composing.delete(input)) return;
+    queueMicrotask(() => {
+      if (input.isConnected && !composing.has(input)) recordInput(input);
+    });
+  }, true);
   document.addEventListener('focusin', event => {
     if (textInput(event.target) && event.target.closest('.app')) stateFor(event.target);
   }, true);
   document.addEventListener('input', event => {
     const input = event.target;
     if (!textInput(input) || !input.closest('.app')) return;
-    let state = edits.get(input);
-    if (!state) { stateFor(input); return; }
-    if (!replaying.has(input) && state.current !== input.value) {
-      state.undo.push(state.current);
-      if (state.undo.length > 64) state.undo.shift();
-      state.redo = [];
-    }
-    state.current = input.value;
+    if (imeInput(input) && (event.isComposing || composing.has(input))) return;
+    recordInput(input);
   }, true);
   document.addEventListener('keydown', event => {
+    if (imeInput(event.target) && (composing.has(event.target) || event.keyCode === 229)) return;
     if (event.isComposing || !event.ctrlKey || event.altKey || event.metaKey ||
       !['z', 'y'].includes(event.key.toLowerCase()) || !event.target.closest('.app')) return;
     // Must run synchronously, before Chromium executes its native editing command.

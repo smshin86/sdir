@@ -189,7 +189,9 @@ impl CacheReason {
             Self::TooOld => "저장 캐시가 7일보다 오래되어 전체 스캔을 시작합니다.",
             Self::FutureTimestamp => "저장 캐시 시각이 유효하지 않아 전체 스캔을 시작합니다.",
             Self::JournalChanged => "저장 캐시의 USN 저널이 달라 전체 스캔을 시작합니다.",
-            Self::CursorOutsideWindow => "저장 커서가 현재 USN 창 밖에 있어 전체 스캔을 시작합니다.",
+            Self::CursorOutsideWindow => {
+                "저장 커서가 현재 USN 창 밖에 있어 전체 스캔을 시작합니다."
+            }
             Self::FutureCursor => "저장 커서가 현재 저널보다 앞서 있어 전체 스캔을 시작합니다.",
             Self::Cancelled => "캐시 작업이 취소되어 기존 캐시를 유지합니다.",
             Self::ExportTimeout => "캐시 내보내기가 5초 안에 끝나지 않아 기존 캐시를 유지합니다.",
@@ -272,8 +274,16 @@ pub(super) fn encode_cache_chunk(bytes: &[u8]) -> String {
         let c = *chunk.get(2).unwrap_or(&0);
         out.push(TABLE[usize::from(a >> 2)] as char);
         out.push(TABLE[usize::from(((a & 0x03) << 4) | (b >> 4))] as char);
-        out.push(if chunk.len() > 1 { TABLE[usize::from(((b & 0x0f) << 2) | (c >> 6))] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[usize::from(c & 0x3f)] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[usize::from(((b & 0x0f) << 2) | (c >> 6))] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[usize::from(c & 0x3f)] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -298,8 +308,16 @@ pub(super) fn decode_cache_chunk(encoded: &str) -> Result<Vec<u8>, CacheReason> 
         let last = index + 1 == bytes.len() / 4;
         let a = value(block[0]).ok_or(CacheReason::Corrupt)?;
         let b = value(block[1]).ok_or(CacheReason::Corrupt)?;
-        let c = if block[2] == b'=' && last { 0 } else { value(block[2]).ok_or(CacheReason::Corrupt)? };
-        let d = if block[3] == b'=' && last { 0 } else { value(block[3]).ok_or(CacheReason::Corrupt)? };
+        let c = if block[2] == b'=' && last {
+            0
+        } else {
+            value(block[2]).ok_or(CacheReason::Corrupt)?
+        };
+        let d = if block[3] == b'=' && last {
+            0
+        } else {
+            value(block[3]).ok_or(CacheReason::Corrupt)?
+        };
         if (!last && (block[2] == b'=' || block[3] == b'='))
             || (block[2] == b'=' && block[3] != b'=')
             || (block[2] == b'=' && b & 0x0f != 0)
@@ -347,8 +365,7 @@ pub(super) fn cache_identity(
     .map_err(|_| CacheReason::Incompatible)
 }
 
-static CACHE_TRANSFER_SEQUENCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static CACHE_TRANSFER_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub(super) fn next_cache_transfer_id() -> u64 {
     CACHE_TRANSFER_SEQUENCE
@@ -389,24 +406,61 @@ impl HostCommand {
                 }
                 crate::search::validate_query_text(text)?;
             }
-            Self::CacheLoadBegin { session, transfer_id, total_bytes, .. }
-            | Self::CacheLoadEnd { session, transfer_id, total_bytes, .. } => {
+            Self::CacheLoadBegin {
+                session,
+                transfer_id,
+                total_bytes,
+                ..
+            }
+            | Self::CacheLoadEnd {
+                session,
+                transfer_id,
+                total_bytes,
+                ..
+            } => {
                 validate_cache_ids(*session, *transfer_id)?;
-                if *total_bytes == 0 || *total_bytes > crate::index_cache::CacheLimits::default().max_volume_bytes {
+                if *total_bytes == 0
+                    || *total_bytes > crate::index_cache::CacheLimits::default().max_volume_bytes
+                {
                     return Err("캐시 전송 크기가 허용 범위를 벗어났습니다.".into());
                 }
             }
-            Self::CacheLoadChunk { session, transfer_id, offset, data, .. } => {
+            Self::CacheLoadChunk {
+                session,
+                transfer_id,
+                offset,
+                data,
+                ..
+            } => {
                 validate_cache_ids(*session, *transfer_id)?;
-                let chunk = decode_cache_chunk(data).map_err(|_| "캐시 chunk가 올바르지 않습니다.")?;
-                if offset.checked_add(chunk.len() as u64).is_none_or(|end| end > crate::index_cache::CacheLimits::default().max_volume_bytes) {
+                let chunk =
+                    decode_cache_chunk(data).map_err(|_| "캐시 chunk가 올바르지 않습니다.")?;
+                if offset.checked_add(chunk.len() as u64).is_none_or(|end| {
+                    end > crate::index_cache::CacheLimits::default().max_volume_bytes
+                }) {
                     return Err("캐시 chunk 오프셋이 허용 범위를 벗어났습니다.".into());
                 }
             }
-            Self::CacheLoadUnavailable { session, transfer_id, .. }
-            | Self::CacheExportReady { session, transfer_id, .. }
-            | Self::CacheExportChunkAck { session, transfer_id, .. }
-            | Self::CacheExportResult { session, transfer_id, .. } => {
+            Self::CacheLoadUnavailable {
+                session,
+                transfer_id,
+                ..
+            }
+            | Self::CacheExportReady {
+                session,
+                transfer_id,
+                ..
+            }
+            | Self::CacheExportChunkAck {
+                session,
+                transfer_id,
+                ..
+            }
+            | Self::CacheExportResult {
+                session,
+                transfer_id,
+                ..
+            } => {
                 validate_cache_ids(*session, *transfer_id)?;
             }
         }
@@ -505,7 +559,6 @@ pub(super) fn write_command(
     writer: &mut impl std::io::Write,
     command: &HostCommand,
 ) -> Result<(), String> {
-    use std::io::Write;
     command.validate()?;
     let mut frame = serde_json::to_vec(command).map_err(|e| e.to_string())?;
     frame.push(b'\n');
@@ -548,7 +601,11 @@ impl Default for CommandInbox {
 impl CommandInbox {
     pub(super) fn enqueue(&self, command: HostCommand) -> Result<Option<HostCommand>, HostCommand> {
         if command.is_cache_reply() {
-            return self.cache_reply_tx.send(command).map(|()| None).map_err(|error| error.0);
+            return self
+                .cache_reply_tx
+                .send(command)
+                .map(|()| None)
+                .map_err(|error| error.0);
         }
         let mut pending = self.pending.lock().unwrap();
         let replaced = if command.is_query() {
@@ -700,17 +757,18 @@ fn emit(event: &Event) -> Result<(), String> {
 pub fn proxy(
     id: u64,
     memory_mib: u16,
+    service_only: bool,
     settings: crate::index_policy::NtfsIndexingSettings,
     queued: Vec<Request>,
     requests: crossbeam_channel::Receiver<Request>,
 ) -> Result<(), String> {
     #[cfg(windows)]
     {
-        windows::proxy(id, memory_mib, settings, queued, requests)
+        windows::proxy(id, memory_mib, service_only, settings, queued, requests)
     }
     #[cfg(not(windows))]
     {
-        let _ = (requests, memory_mib, settings, queued);
+        let _ = (requests, memory_mib, service_only, settings, queued);
         emit(&Event::Failure {
             lane: 4,
             id,
@@ -728,6 +786,60 @@ pub fn host(args: &[String]) -> Result<(), String> {
         let _ = args;
         Err("Windows NTFS 전용입니다.".into())
     }
+}
+
+#[path = "live_search_service.rs"]
+pub mod service;
+
+pub fn service_host(
+    pipe_id: &str,
+    parent_pid: u32,
+    parent_created_filetime: u64,
+    index_id: u64,
+    memory_mib: u16,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        windows::service_host(
+            pipe_id,
+            parent_pid,
+            parent_created_filetime,
+            index_id,
+            memory_mib,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (
+            pipe_id,
+            parent_pid,
+            parent_created_filetime,
+            index_id,
+            memory_mib,
+        );
+        Err("Windows NTFS 전용입니다.".into())
+    }
+}
+
+pub fn request_service_stop() {
+    #[cfg(windows)]
+    windows::request_service_stop();
+}
+
+pub(crate) fn service_stop_requested() -> bool {
+    #[cfg(windows)]
+    {
+        windows::service_stop_requested()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub(crate) fn reset_service_stop() {
+    #[cfg(windows)]
+    windows::reset_service_stop();
 }
 pub fn mounted_inventory() -> Result<MountedInventory, String> {
     #[cfg(windows)]

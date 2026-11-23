@@ -1,7 +1,11 @@
 // A selected virtual row must be rendered before its native viewport can be reconciled.
-window.__sdirScrollSelection = (pane, position, fallback) => {
+window.__sdirScrollSelection = (pane, position, fallback, result) => {
   const list = document.querySelector(`[data-pane="${pane}"] .list-scroll`);
-  if (!list) return;
+  if (!list || (result && list.dataset.dragGeneration !== result.generation)) return;
+  if (result && !document.activeElement?.matches('input,textarea') &&
+      !document.querySelector('.modal-backdrop,.context-dismiss')) {
+    list.focus({ preventScroll: true });
+  }
   window.__sdirScrollRequests ??= {};
   window.__sdirScrollRequests[pane]?.disconnect();
   const request = { element: list, disconnect() {
@@ -12,7 +16,7 @@ window.__sdirScrollSelection = (pane, position, fallback) => {
     if (!list.isConnected) return request.disconnect();
     if (window.__sdirScrollRequests[pane] !== request || list.clientHeight <= 0) return;
     const row = list.querySelector(`[data-row-index="${position}"]`);
-    if (row) {
+    if (row && (!result || (row.dataset.dragKey === result.path && row.classList.contains('selected')))) {
       const r = row.getBoundingClientRect(), top = list.getBoundingClientRect().top + list.clientTop;
       if (r.top < top) list.scrollTop += r.top - top;
       else if (r.bottom > top + list.clientHeight) list.scrollTop += r.bottom - top - list.clientHeight;
@@ -23,14 +27,14 @@ window.__sdirScrollSelection = (pane, position, fallback) => {
       const height = first?.getBoundingClientRect().height || Number.parseFloat(style.getPropertyValue(owner.dataset.view === 'icons' ? '--tile-height' : '--row-height'));
       const columns = Number(list.dataset.columns) || 1;
       const top = Math.floor(position / columns) * height;
-      list.scrollTop = Number.isFinite(top) ? (top < list.scrollTop ? top : Math.max(list.scrollTop, top + height - list.clientHeight)) : fallback;
+      list.scrollTop = list.dataset.grouping !== 'none' ? fallback : Number.isFinite(top) ? (top < list.scrollTop ? top : Math.max(list.scrollTop, top + height - list.clientHeight)) : fallback;
       // The previous scroll event may have captured an obsolete viewport/offset.
       list.dispatchEvent(new Event('scroll'));
     }
   };
   const observer = new MutationObserver(apply);
   window.__sdirScrollRequests[pane] = request;
-  observer.observe(list, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'data-columns'] });
+  observer.observe(list, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'data-columns', 'data-drag-key', 'class'] });
   if (!list.__sdirScrollCancellation) {
     list.__sdirScrollCancellation = true;
     const cancel = () => {

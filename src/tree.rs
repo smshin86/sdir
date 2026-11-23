@@ -2,13 +2,63 @@
 use crate::{filesystem, model::NativePath};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     time::{Duration, Instant},
 };
 
 pub const CHILD_LIMIT: usize = 1000;
 pub const NODE_LIMIT: usize = 5000;
+
+/// Return the identity key used by the directory tree without changing other path values.
+pub fn tree_key(mut path: NativePath) -> NativePath {
+    #[cfg(windows)]
+    let is_separator = |unit: u16| unit == b'\\' as u16 || unit == b'/' as u16;
+    #[cfg(not(windows))]
+    let is_separator = |unit: u16| unit == b'/' as u16;
+    if !path.0.last().is_some_and(|unit| is_separator(*unit)) {
+        return path;
+    }
+    let native = path.to_path();
+    if native.file_name().is_none() {
+        return path;
+    }
+    #[cfg(windows)]
+    if is_unc_share_root(&native) {
+        return path;
+    }
+    while path.0.last().is_some_and(|unit| is_separator(*unit)) {
+        path.0.pop();
+    }
+    path
+}
+
+#[cfg(windows)]
+fn is_unc_share_root(path: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return false;
+    };
+    if !matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..)) {
+        return false;
+    }
+    match components.next() {
+        None => true,
+        Some(Component::RootDir) => components.next().is_none(),
+        _ => false,
+    }
+}
+
+fn normalize_paths(paths: Vec<NativePath>) -> Vec<NativePath> {
+    let mut seen = BTreeSet::new();
+    paths
+        .into_iter()
+        .map(tree_key)
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Listing {
     pub folders: Vec<NativePath>,
@@ -18,6 +68,7 @@ pub fn list(path: &NativePath, hidden: bool) -> Result<Listing, String> {
     let started = Instant::now();
     let mut result = Listing::default();
     let mut wire_bytes = 0usize;
+    let mut seen = BTreeSet::new();
     for item in fs::read_dir(path.to_path()).map_err(|e| e.to_string())? {
         if started.elapsed() > Duration::from_secs(3) {
             result.warning = Some(
@@ -31,6 +82,10 @@ pub fn list(path: &NativePath, hidden: bool) -> Result<Listing, String> {
             .and_then(|e| filesystem::directory_entry(&e));
         match entry {
             Ok(e) if e.is_dir && (hidden || !e.hidden) => {
+                let path = tree_key(e.path);
+                if !seen.insert(path.clone()) {
+                    continue;
+                }
                 if result.folders.len() == CHILD_LIMIT {
                     result.warning = Some(
                         "하위 폴더 1,000개까지만 표시합니다. 폴더를 열어 전체 목록을 확인하세요."
@@ -38,13 +93,13 @@ pub fn list(path: &NativePath, hidden: bool) -> Result<Listing, String> {
                     );
                     break;
                 }
-                wire_bytes += e.path.0.len() * 6 + 128;
+                wire_bytes += path.0.len() * 6 + 128;
                 if wire_bytes > 500_000 {
                     result.warning =
                         Some("경로 표시 한도 · 폴더를 열어 전체 목록을 확인하세요.".into());
                     break;
                 }
-                result.folders.push(e.path);
+                result.folders.push(path);
             }
             Err(_) => result.warning = Some("읽지 못한 항목이 있습니다. 다시 시도하세요.".into()),
             _ => {}
@@ -78,6 +133,7 @@ pub struct Tree {
 }
 impl Tree {
     pub fn new(roots: Vec<NativePath>) -> Self {
+        let roots = normalize_paths(roots);
         let nodes = roots
             .iter()
             .cloned()
@@ -90,6 +146,26 @@ impl Tree {
             ..Self::default()
         }
     }
+    pub fn update_roots(&mut self, roots: Vec<NativePath>) {
+        let roots = normalize_paths(roots);
+        self.nodes.retain(|path, _| {
+            roots
+                .iter()
+                .any(|root| path == root || path.to_path().starts_with(root.to_path()))
+        });
+        for root in &roots {
+            self.nodes.entry(root.clone()).or_default();
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(_, path)| !self.nodes.contains_key(path))
+        {
+            self.pending = None;
+        }
+        self.roots = roots;
+    }
+
     /// Make the known current path visible without enumerating sibling subtrees.
     /// Returns the next single directory to read and whether the path is ready/blocked.
     pub fn follow_step(
@@ -97,7 +173,13 @@ impl Tree {
         target: &NativePath,
         expand_target: bool,
     ) -> (Option<NativePath>, bool) {
-        let mut chain: Vec<_> = target.to_path().ancestors().map(NativePath::new).collect();
+        let target = tree_key(target.clone());
+        let mut chain: Vec<_> = target
+            .to_path()
+            .ancestors()
+            .map(NativePath::new)
+            .map(tree_key)
+            .collect();
         chain.reverse();
         if chain.is_empty() || chain.len() > 129 {
             return (None, true);
@@ -165,16 +247,18 @@ impl Tree {
         }
     }
     pub fn collapse(&mut self, path: &NativePath) {
-        self.prune(path);
-        if self.pending.as_ref().is_some_and(|(_, p)| p == path) {
+        let path = tree_key(path.clone());
+        self.prune(&path);
+        if self.pending.as_ref().is_some_and(|(_, p)| p == &path) {
             self.pending = None;
         }
-        if let Some(node) = self.nodes.get_mut(path) {
+        if let Some(node) = self.nodes.get_mut(&path) {
             *node = Branch::default();
         }
     }
     pub fn begin(&mut self, path: &NativePath) -> Option<u64> {
-        if !self.nodes.contains_key(path) {
+        let path = tree_key(path.clone());
+        if !self.nodes.contains_key(&path) {
             return None;
         }
         if let Some((_, old)) = self.pending.take() {
@@ -182,13 +266,13 @@ impl Tree {
                 node.message = Some("읽기를 중단했습니다. 다시 시도하세요.".into());
             }
         }
-        self.prune(path);
+        self.prune(&path);
         self.serial += 1;
-        let node = self.nodes.get_mut(path).unwrap();
+        let node = self.nodes.get_mut(&path).unwrap();
         node.expanded = true;
         node.loaded = false;
         node.message = None;
-        self.pending = Some((self.serial, path.clone()));
+        self.pending = Some((self.serial, path));
         Some(self.serial)
     }
     pub fn finish(&mut self, id: u64, result: Result<Listing, String>) -> bool {
@@ -200,21 +284,20 @@ impl Tree {
         }
         let path = path.clone();
         self.pending = None;
-        let listing = match result {
-            Ok(mut l) => {
-                let remaining = NODE_LIMIT.saturating_sub(self.nodes.len());
-                if l.folders.len() > remaining {
-                    l.folders.truncate(remaining);
-                    l.warning =
-                        Some("트리 표시 한도 · 다른 가지를 접거나 폴더를 직접 여세요.".into());
-                }
-                l
-            }
+        let mut listing = match result {
+            Ok(l) => l,
             Err(e) => {
                 self.nodes.get_mut(&path).unwrap().message = Some(format!("열 수 없습니다: {e}"));
                 return true;
             }
         };
+        listing.folders = normalize_paths(listing.folders);
+        let remaining = NODE_LIMIT.saturating_sub(self.nodes.len());
+        if listing.folders.len() > remaining {
+            listing.folders.truncate(remaining);
+            listing.warning =
+                Some("트리 표시 한도 · 다른 가지를 접거나 폴더를 직접 여세요.".into());
+        }
         for p in &listing.folders {
             self.nodes.entry(p.clone()).or_default();
         }
@@ -322,5 +405,91 @@ mod tests {
         assert_eq!(t.nodes.len(), NODE_LIMIT);
         t.reset();
         assert_eq!(t.nodes.len(), 1);
+    }
+
+    #[test]
+    fn following_a_listed_directory_with_a_trailing_separator_reuses_its_node() {
+        let root = NativePath::default();
+        let folder = NativePath::new("listed");
+        let target = NativePath::new(format!("listed{}", std::path::MAIN_SEPARATOR));
+        let mut tree = Tree::new(vec![root.clone()]);
+        let id = tree.begin(&root).unwrap();
+        assert!(tree.finish(
+            id,
+            Ok(Listing {
+                folders: vec![folder.clone()],
+                warning: None,
+            }),
+        ));
+
+        let (next, done) = tree.follow_step(&target, false);
+        assert!(done);
+        assert_eq!(next, None);
+        assert_eq!(tree.nodes.len(), 2);
+        assert!(tree.nodes.contains_key(&folder));
+        assert_eq!(
+            tree.nodes.get(&root).unwrap().children,
+            vec![folder.clone()]
+        );
+        assert_eq!(
+            tree.rows()
+                .iter()
+                .filter(|row| row.path == folder && row.message.is_none())
+                .count(),
+            1
+        );
+        assert!(tree.begin(&target).is_some());
+    }
+
+    #[test]
+    fn listing_aliases_are_deduplicated_before_the_node_limit() {
+        let root = NativePath::new("root");
+        let first = NativePath::new("root/first");
+        let first_alias = NativePath::new("root/first/");
+        let second = NativePath::new("root/second");
+        let second_alias = NativePath::new("root/second/");
+        let mut tree = Tree::new(vec![root.clone()]);
+        for index in 0..(NODE_LIMIT - 3) {
+            tree.nodes
+                .insert(NativePath::new(format!("dummy-{index}")), Branch::default());
+        }
+        assert_eq!(tree.nodes.len(), NODE_LIMIT - 2);
+        let id = tree.begin(&root).unwrap();
+        assert!(tree.finish(
+            id,
+            Ok(Listing {
+                folders: vec![first.clone(), first_alias, second.clone(), second_alias],
+                warning: None,
+            })
+        ));
+        assert_eq!(tree.nodes.len(), NODE_LIMIT);
+        assert_eq!(
+            tree.nodes.get(&root).unwrap().children,
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(
+            tree.rows()
+                .iter()
+                .filter(|row| row.message.is_none())
+                .map(|row| row.path.clone())
+                .collect::<Vec<_>>(),
+            vec![root, first, second]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tree_key_preserves_drive_and_share_roots() {
+        for raw in [
+            r"C:\",
+            r"\\server\share\",
+            r"\\?\C:\",
+            r"\\?\UNC\server\share\",
+        ] {
+            let path = NativePath::new(raw);
+            assert_eq!(tree_key(path.clone()), path);
+        }
+        let child = NativePath::new(r"\\server\share\folder\");
+        assert_eq!(tree_key(child), NativePath::new(r"\\server\share\folder"));
     }
 }

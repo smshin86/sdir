@@ -1,5 +1,12 @@
 use super::*;
-use crate::search::{IndexStatus, query_index_with_scope};
+#[path = "live_search_windows/resume.rs"]
+mod resume;
+use resume::ResumeStore;
+use std::sync::Arc;
+use crate::{
+    index_policy::RelativePathRoot,
+    search::{IndexStatus, query_index_with_exclusion},
+};
 use ::windows::{
     Win32::{
         Foundation::*,
@@ -9,6 +16,7 @@ use ::windows::{
             IO::DeviceIoControl,
             Ioctl::{IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER},
             Pipes::*,
+            SystemInformation::GetSystemWindowsDirectoryW,
             Threading::*,
         },
         UI::{Shell::*, WindowsAndMessaging::SW_HIDE},
@@ -35,6 +43,23 @@ use std::{
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
+
+fn guid_text(guid: ::windows::core::GUID) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7]
+    )
+}
 const DRIVE_UNKNOWN: u32 = 0;
 const DRIVE_NO_ROOT_DIR: u32 = 1;
 const DRIVE_REMOVABLE: u32 = 2;
@@ -58,6 +83,29 @@ pub fn mounted_inventory() -> Result<super::MountedInventory, String> {
         volumes,
         network_drives,
     })
+}
+
+fn windows_components_scope() -> Option<(crate::index_policy::VolumeGuid, RelativePathRoot)> {
+    let mut directory = vec![0u16; MAX_MOUNT_UNITS];
+    let length = unsafe { GetSystemWindowsDirectoryW(Some(&mut directory)) } as usize;
+    if length == 0 || length >= directory.len() {
+        return None;
+    }
+    let components = NativePath(directory[..length].to_vec())
+        .to_path()
+        .join("WinSxS");
+    let mut absolute = NativePath::new(&components).0;
+    absolute.push(0);
+    let mut mount = vec![0u16; MAX_MOUNT_UNITS];
+    unsafe { GetVolumePathNameW(PCWSTR(absolute.as_ptr()), &mut mount) }.ok()?;
+    let mount_path = NativePath(nul_terminated(&mount).ok()?.to_vec()).to_path();
+    let relative = components.strip_prefix(&mount_path).ok()?.to_str()?;
+    let root = RelativePathRoot::parse(relative).ok()?;
+    let mut name = vec![0u16; MAX_VOLUME_NAME_UNITS];
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(mount.as_ptr()), &mut name) }.ok()?;
+    let name = String::from_utf16(nul_terminated(&name).ok()?).ok()?;
+    let guid = crate::index_policy::VolumeGuid::parse(&name).ok()?;
+    Some((guid, root))
 }
 
 pub fn result_mount_matches(guid: &crate::index_policy::VolumeGuid, mount: &NativePath) -> bool {
@@ -383,27 +431,111 @@ impl Drop for BackgroundIo {
 
 const HOST_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_STOP_MESSAGE: &str = "검색 호스트가 중지 중입니다.";
+type SharedIoThread = std::sync::Arc<std::sync::Mutex<Option<goz_winfs::ThreadIoHandle>>>;
+static SERVICE_STOP_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SERVICE_IO_THREADS: std::sync::OnceLock<std::sync::Mutex<Vec<SharedIoThread>>> =
+    std::sync::OnceLock::new();
 
-#[derive(Default)]
+fn service_io_threads() -> &'static std::sync::Mutex<Vec<SharedIoThread>> {
+    SERVICE_IO_THREADS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn register_service_io_thread(handle: SharedIoThread) {
+    {
+        let mut handles = service_io_threads().lock().unwrap();
+        if !handles
+            .iter()
+            .any(|current| std::sync::Arc::ptr_eq(current, &handle))
+        {
+            handles.push(handle.clone());
+        }
+    }
+    if SERVICE_STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+        if let Some(handle) = handle.lock().unwrap().as_ref() {
+            let _ = goz_winfs::cancel_synchronous_io(handle);
+        }
+    }
+}
+
+pub(super) fn request_service_stop() {
+    SERVICE_STOP_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    cancel_service_io();
+}
+
+fn cancel_service_io() {
+    let handles = service_io_threads().lock().unwrap().clone();
+    for shared in handles {
+        if let Some(handle) = shared.lock().unwrap().as_ref() {
+            let _ = goz_winfs::cancel_synchronous_io(handle);
+        }
+    }
+}
+
+pub(super) fn service_stop_requested() -> bool {
+    SERVICE_STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(super) fn reset_service_stop() {
+    SERVICE_STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
+    service_io_threads().lock().unwrap().clear();
+}
+
 struct HostStop {
     requested: std::sync::atomic::AtomicBool,
     worker_returned: std::sync::atomic::AtomicBool,
     normal_returned: std::sync::atomic::AtomicBool,
-    io_thread: std::sync::Mutex<Option<goz_winfs::ThreadIoHandle>>,
+    io_thread: SharedIoThread,
     cancel_requested: std::sync::atomic::AtomicBool,
     native_returned: std::sync::atomic::AtomicBool,
     native_aborted: std::sync::atomic::AtomicBool,
+    service_mode: bool,
+}
+
+impl Default for HostStop {
+    fn default() -> Self {
+        Self {
+            requested: std::sync::atomic::AtomicBool::new(false),
+            worker_returned: std::sync::atomic::AtomicBool::new(false),
+            normal_returned: std::sync::atomic::AtomicBool::new(false),
+            io_thread: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            cancel_requested: std::sync::atomic::AtomicBool::new(false),
+            native_returned: std::sync::atomic::AtomicBool::new(false),
+            native_aborted: std::sync::atomic::AtomicBool::new(false),
+            service_mode: false,
+        }
+    }
 }
 
 impl HostStop {
+    fn new(service_mode: bool) -> std::sync::Arc<Self> {
+        let stop = std::sync::Arc::new(Self {
+            service_mode,
+            ..Self::default()
+        });
+        if service_mode {
+            register_service_io_thread(stop.io_thread.clone());
+        }
+        stop
+    }
+
     fn attach_current_thread(&self) -> Result<(), String> {
         let handle = goz_winfs::current_thread_io_handle().map_err(|error| error.to_string())?;
         *self.io_thread.lock().unwrap() = Some(handle);
+        if self.service_mode {
+            if SERVICE_STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(handle) = self.io_thread.lock().unwrap().as_ref() {
+                    let _ = goz_winfs::cancel_synchronous_io(handle);
+                }
+            }
+        }
         Ok(())
     }
 
     fn is_requested(&self) -> bool {
         self.requested.load(std::sync::atomic::Ordering::Acquire)
+            || (self.service_mode
+                && SERVICE_STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire))
     }
 
     fn before_native(&self) -> Result<(), String> {
@@ -475,8 +607,10 @@ impl HostStop {
                 }
             }
             if Instant::now() >= deadline {
-                unsafe {
-                    let _ = TerminateProcess(GetCurrentProcess(), 0xE000_0001);
+                if !self.service_mode {
+                    unsafe {
+                        let _ = TerminateProcess(GetCurrentProcess(), 0xE000_0001);
+                    }
                 }
                 return;
             }
@@ -569,6 +703,22 @@ impl PipeSecurity {
             )
         }
         .map_err(|e| e.to_string())?;
+        Ok(Self(descriptor))
+    }
+
+    unsafe fn service_owner(owner_sid: &str) -> Result<Self, String> {
+        use ::windows::Win32::Security::{Authorization::*, *};
+        let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{owner_sid})"));
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                1,
+                &mut descriptor,
+                None,
+            )
+        }
+        .map_err(|error| format!("서비스 파이프 보안 설명자를 만들지 못했습니다: {error}"))?;
         Ok(Self(descriptor))
     }
 }
@@ -688,6 +838,8 @@ impl ProxyCommandWriter {
 
 struct ProxyHostOwner {
     child: Option<Process>,
+    pid: u32,
+    terminate_on_timeout: bool,
     session: u64,
     events: crossbeam_channel::Sender<Event>,
     commands: Option<File>,
@@ -700,6 +852,9 @@ impl ProxyHostOwner {
     }
 
     fn shutdown(&mut self) -> Result<(u32, bool), String> {
+        if !self.terminate_on_timeout {
+            return self.shutdown_service();
+        }
         let mut writer_done = true;
         let mut writer_error = None;
         if let Some(writer) = self.writer.as_mut() {
@@ -764,6 +919,30 @@ impl ProxyHostOwner {
             return Err(error);
         }
         Ok((exit_code, forced))
+    }
+
+    fn shutdown_service(&mut self) -> Result<(u32, bool), String> {
+        let mut writer_done = true;
+        if let Some(writer) = self.writer.as_mut() {
+            writer_done = writer
+                .stop(HOST_WRITER_STOP_TIMEOUT)
+                .map_err(|error| format!("서비스 검색 명령 정리가 실패했습니다: {error}"))?;
+        }
+        self.commands.take();
+        if !writer_done {
+            return Err(format!(
+                "SDIR 인덱스 서비스 PID {}의 명령 작성 스레드가 종료되지 않았습니다.",
+                self.pid
+            ));
+        }
+        let exit_code = wait_owned_host(self.child(), HOST_STOP_GRACE)?.ok_or_else(|| {
+            format!(
+                "SDIR 인덱스 서비스 PID {}가 파이프 EOF 뒤 6초 안에 종료되지 않았습니다.",
+                self.pid
+            )
+        })?;
+        self.child.take();
+        Ok((exit_code, false))
     }
 
     fn wait_until_exit(&mut self) -> Result<u32, String> {
@@ -885,6 +1064,50 @@ fn wait_owned_host(child: &Process, timeout: Duration) -> Result<Option<u32>, St
     }
 }
 
+struct ParentIdentity {
+    process: Process,
+    pid: u32,
+    created_filetime: u64,
+    owner_sid: Option<String>,
+}
+
+impl ParentIdentity {
+    fn validate(&self) -> Result<(), String> {
+        if unsafe { GetProcessId(self.process.0) } != self.pid {
+            return Err("검색 요청 부모 프로세스의 열린 PID가 바뀌었습니다.".into());
+        }
+        match unsafe { WaitForSingleObject(self.process.0, 0) } {
+            WAIT_TIMEOUT => {}
+            WAIT_OBJECT_0 => return Err("검색 요청 부모 프로세스가 이미 종료됐습니다.".into()),
+            WAIT_FAILED => {
+                return Err(format!(
+                    "검색 요청 부모 프로세스 상태를 확인하지 못했습니다: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            result => return Err(format!("검색 요청 부모 상태가 잘못됐습니다: {result:?}")),
+        }
+        let revalidated = crate::live_search::service::validate_parent_process(
+            self.pid,
+            self.created_filetime,
+            self.owner_sid.as_deref(),
+        )?;
+        unsafe {
+            let _ = CloseHandle(revalidated);
+        }
+        Ok(())
+    }
+}
+
+fn send_authenticated(
+    pipe: &mut File,
+    parent: &ParentIdentity,
+    event: &Event,
+) -> Result<(), String> {
+    parent.validate()?;
+    send(pipe, event)
+}
+
 fn terminate_owned_host(child: &Process) -> Result<(u32, bool), String> {
     if let Some(code) = wait_owned_host(child, Duration::ZERO)? {
         return Ok((code, false));
@@ -946,13 +1169,33 @@ enum ProxyAckPoll {
     Pending,
 }
 
+fn validate_host_event_pid(event: &Event, expected: u32) -> Result<(), String> {
+    let actual = match event {
+        Event::VolumeIndex { host_pid, .. } => Some(Some(*host_pid)),
+        Event::VolumeSearch { host_pid, .. }
+        | Event::ConfigAck { host_pid, .. }
+        | Event::RebuildAck { host_pid, .. } => Some(*host_pid),
+        _ => None,
+    };
+    if actual.is_some_and(|actual| actual != Some(expected)) {
+        return Err(format!(
+            "검색 서비스 이벤트 PID가 확인된 호스트 PID {expected}와 다릅니다."
+        ));
+    }
+    Ok(())
+}
+
 fn poll_proxy_ack(
     ack: &crossbeam_channel::Receiver<(bool, Option<String>)>,
     input_closed: &std::sync::atomic::AtomicBool,
     events_done: &std::sync::atomic::AtomicBool,
     child: &Process,
     started: Instant,
+    event_error: &std::sync::Mutex<Option<String>>,
 ) -> Result<ProxyAckPoll, String> {
+    if let Some(error) = event_error.lock().unwrap().clone() {
+        return Err(error);
+    }
     if input_closed.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(ProxyAckPoll::Stopped);
     }
@@ -981,11 +1224,11 @@ fn poll_proxy_ack(
 pub(super) fn proxy(
     id: u64,
     memory_mib: u16,
+    service_only: bool,
     settings: crate::index_policy::NtfsIndexingSettings,
     queued: Vec<Request>,
     requests: crossbeam_channel::Receiver<Request>,
 ) -> Result<(), String> {
-    let output_events = proxy_event_output();
     let input_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (request_tx, request_rx) = crossbeam_channel::unbounded::<Request>();
     let request_stop = input_closed.clone();
@@ -996,22 +1239,50 @@ pub(super) fn proxy(
         return Ok(());
     }
     if !settings.is_valid() {
-        let _ = output_events.send(Event::ConfigAck {
+        emit(&Event::ConfigAck {
             session: id,
             generation: 0,
             host_pid: None,
             accepted: false,
             message: Some("검색 설정이 올바르지 않습니다.".into()),
-        });
+        })?;
         return Ok(());
     }
 
     let memory_mib = memory_mib.clamp(128, 2048);
-    let name = format!(
-        r"\\.\pipe\SDIR-search-{:?}",
-        unsafe { CoCreateGuid() }.map_err(|e| e.to_string())?
-    );
-    let security = unsafe { PipeSecurity::current_user()? };
+    let service = match crate::live_search::service::open_for_client() {
+        Ok(Some(service)) => Some(service),
+        Ok(None) if !service_only => None,
+        Err(error) if !service_only => return Err(error),
+        outcome => {
+            let message = match outcome {
+                Err(error) => format!("색인 서비스를 사용할 수 없어 자동 복원을 대기합니다. {error}"),
+                Ok(_) => "색인 서비스가 설치되지 않아 자동 복원을 대기합니다.".into(),
+            };
+            emit(&Event::ConfigAck {
+                session: id,
+                generation: 0,
+                host_pid: None,
+                accepted: false,
+                message: Some(message),
+            })?;
+            return Ok(());
+        }
+    };
+    let output_events = proxy_event_output();
+    let service_mode = service.is_some();
+    let parent_pid = std::process::id();
+    let parent_created_filetime = crate::live_search::service::current_process_created_filetime()?;
+    let pipe_id = guid_text(unsafe { CoCreateGuid() }.map_err(|e| e.to_string())?);
+    let name = if service_mode {
+        format!(r"\\.\pipe\SDIR-index-v1-{pipe_id}")
+    } else {
+        format!(r"\\.\pipe\SDIR-search-{{{pipe_id}}}")
+    };
+    let security = match service.as_ref() {
+        Some(service) => unsafe { PipeSecurity::service_owner(service.owner_sid())? },
+        None => unsafe { PipeSecurity::current_user()? },
+    };
     let attributes = ::windows::Win32::Security::SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<::windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: security.0.0,
@@ -1021,15 +1292,23 @@ pub(super) fn proxy(
     let commands = create_server_pipe(&format!("{name}-queries"), &attributes)?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let file = wide(&exe.to_string_lossy());
-    let verb = wide("runas");
-    let args = wide(&format!(
-        "--ntfs-host --pipe \"{name}\" --parent {} --index-id {id} --memory-mib {memory_mib}",
-        std::process::id()
-    ));
     if input_closed.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
-    let child_handle = {
+    let (child, host_pid, terminate_on_timeout) = if let Some(service) = service.as_ref() {
+        let started = service.start(
+            &pipe_id,
+            parent_pid,
+            parent_created_filetime,
+            id,
+            memory_mib,
+        )?;
+        (Process(started.handle), started.pid, false)
+    } else {
+        let verb = wide("runas");
+        let args = wide(&format!(
+            "--ntfs-host --pipe \"{name}\" --parent {parent_pid} --parent-created-filetime {parent_created_filetime} --index-id {id} --memory-mib {memory_mib}"
+        ));
         struct Com;
         impl Drop for Com {
             fn drop(&mut self) {
@@ -1061,10 +1340,14 @@ pub(super) fn proxy(
                 format!("검색 프로세스를 시작하지 못했습니다: {error}")
             });
         }
-        info.hProcess
+        let process = Process(info.hProcess);
+        let pid = validate_owned_host(&process)?;
+        (process, pid, true)
     };
     let mut owner = ProxyHostOwner {
-        child: Some(Process(child_handle)),
+        child: Some(child),
+        pid: host_pid,
+        terminate_on_timeout,
         session: id,
         events: output_events.clone(),
         commands: Some(commands),
@@ -1073,6 +1356,9 @@ pub(super) fn proxy(
     let mut event_pipe = Some(events);
     let run_result = (|| -> Result<(), String> {
         let expected = validate_owned_host(owner.child())?;
+        if expected != owner.pid {
+            return Err("실행 컨트롤러 PID와 검색 호스트 PID가 다릅니다.".into());
+        }
         let child_handle = owner.child().0;
         if let Err(error) = connect_server_pipe(
             event_pipe.as_ref().unwrap(),
@@ -1106,6 +1392,9 @@ pub(super) fn proxy(
         let events_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_done = events_done.clone();
         let event_output = output_events.clone();
+        let event_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let reader_error = event_error.clone();
+        let expected_event_pid = owner.pid;
         let (ack_tx, ack_rx) = crossbeam_channel::bounded::<(bool, Option<String>)>(1);
         std::thread::spawn(move || {
             for line in BufReader::new(event_pipe.take().unwrap()).lines() {
@@ -1114,6 +1403,11 @@ pub(super) fn proxy(
                     break;
                 }
                 if let Ok(event) = serde_json::from_str::<Event>(&line) {
+                    if let Err(error) = validate_host_event_pid(&event, expected_event_pid) {
+                        *reader_error.lock().unwrap() = Some(error.clone());
+                        let _ = ack_tx.try_send((false, Some(error)));
+                        break;
+                    }
                     if let Event::ConfigAck {
                         session,
                         generation,
@@ -1150,6 +1444,10 @@ pub(super) fn proxy(
             .map_err(|_| "검색 초기 설정 명령 대기열이 가득 찼습니다.".to_string())?;
         let started = Instant::now();
         let accepted = loop {
+            if let Some(error) = event_error.lock().unwrap().clone() {
+                inbox.close();
+                return Err(error);
+            }
             if input_closed.load(std::sync::atomic::Ordering::Acquire) {
                 inbox.close();
                 return Ok(());
@@ -1168,7 +1466,14 @@ pub(super) fn proxy(
                     ));
                 }
             }
-            match poll_proxy_ack(&ack_rx, &input_closed, &events_done, owner.child(), started)? {
+            match poll_proxy_ack(
+                &ack_rx,
+                &input_closed,
+                &events_done,
+                owner.child(),
+                started,
+                &event_error,
+            )? {
                 ProxyAckPoll::Ack(accepted, message) => break (accepted, message),
                 ProxyAckPoll::Stopped => {
                     inbox.close();
@@ -1184,6 +1489,9 @@ pub(super) fn proxy(
 
         let mut queued = std::collections::VecDeque::new();
         while !input_closed.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(error) = event_error.lock().unwrap().clone() {
+                return Err(error);
+            }
             let mut progressed = false;
             for request in request_rx.try_iter() {
                 if input_closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -1251,6 +1559,25 @@ pub(super) fn proxy(
             id,
             message: failure.clone(),
         });
+        if !owner.terminate_on_timeout {
+            return match query_owned_host_exit(owner.child()) {
+                Ok(Some(exit_code)) => {
+                    owner.child.take();
+                    Err(format!(
+                        "{failure} (SDIR 인덱스 서비스 PID {}의 native exit code {exit_code})",
+                        owner.pid
+                    ))
+                }
+                Ok(None) => Err(format!(
+                    "{failure}; SDIR 인덱스 서비스 PID {}가 아직 실행 중이며 클라이언트는 강제 종료 권한을 갖지 않습니다.",
+                    owner.pid
+                )),
+                Err(error) => Err(format!(
+                    "{failure}; SDIR 인덱스 서비스 PID {}의 종료 상태를 확인하지 못했습니다: {error}",
+                    owner.pid
+                )),
+            };
+        }
         return match owner.wait_until_exit() {
             Ok(exit_code) => Err(format!(
                 "{failure} (검색 호스트 native exit code {exit_code})"
@@ -1472,7 +1799,11 @@ fn connect_server_pipe(
 }
 
 // The lower-privilege server must never acquire the elevated client's token.
-fn connect_host_pipe(name: &str, parent: u32, write_only: bool) -> Result<File, String> {
+fn connect_host_pipe(
+    name: &str,
+    parent: &ParentIdentity,
+    write_only: bool,
+) -> Result<File, String> {
     let pipe = std::fs::OpenOptions::new()
         .read(!write_only)
         .write(write_only)
@@ -1483,47 +1814,185 @@ fn connect_host_pipe(name: &str, parent: u32, write_only: bool) -> Result<File, 
         let mut server = 0;
         GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut server)
             .map_err(|e| e.to_string())?;
-        if server != parent {
+        if server != parent.pid {
             return Err("검색 부모 프로세스가 일치하지 않습니다.".into());
         }
     }
+    parent.validate()?;
     Ok(pipe)
+}
+
+fn read_first_command(
+    reader: BufReader<File>,
+    service_mode: bool,
+) -> Result<
+    (
+        BufReader<File>,
+        Result<Option<HostCommand>, HostCommandReadError>,
+    ),
+    String,
+> {
+    let (send_result, receive_result) = crossbeam_channel::bounded(1);
+    let io_thread: SharedIoThread = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let reader_io_thread = io_thread.clone();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let result = match goz_winfs::current_thread_io_handle() {
+            Ok(handle) => {
+                *reader_io_thread.lock().unwrap() = Some(handle);
+                if service_mode {
+                    register_service_io_thread(reader_io_thread.clone());
+                }
+                if service_mode && service_stop_requested() {
+                    Ok(None)
+                } else {
+                    super::read_query(&mut reader)
+                }
+            }
+            Err(error) => Err(HostCommandReadError {
+                command: None,
+                message: format!("초기 명령 읽기 스레드를 준비하지 못했습니다: {error}"),
+            }),
+        };
+        let _ = send_result.send((reader, result));
+        reader_io_thread.lock().unwrap().take();
+    });
+    if service_mode {
+        let configure_deadline = Instant::now() + Duration::from_secs(20);
+        let mut cancellation_deadline = None;
+        loop {
+            let now = Instant::now();
+            if service_stop_requested() || now >= configure_deadline {
+                let deadline = cancellation_deadline.get_or_insert(now + HOST_STOP_TIMEOUT);
+                if now >= *deadline {
+                    return Err("서비스 초기 명령 읽기를 종료하지 못했습니다.".into());
+                }
+                cancel_service_io();
+            }
+            match receive_result.recv_timeout(Duration::from_millis(25)) {
+                Ok(result) if cancellation_deadline.is_none() || service_stop_requested() => {
+                    return Ok(result);
+                }
+                Ok(_) => return Err("초기 Configure 명령의 대기 시간이 초과됐습니다.".into()),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err("서비스 초기 명령 읽기 스레드가 응답하지 않았습니다.".into());
+                }
+            }
+        }
+    }
+    match receive_result.recv_timeout(Duration::from_secs(20)) {
+        Ok(result) => Ok(result),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            if let Some(handle) = io_thread.lock().unwrap().as_ref() {
+                let _ = goz_winfs::cancel_synchronous_io(handle);
+            }
+            let _ = receive_result.recv_timeout(Duration::from_secs(2));
+            Err("초기 Configure 명령이 20초 안에 도착하지 않았습니다.".into())
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Err("초기 Configure 읽기 스레드가 응답하지 않았습니다.".into())
+        }
+    }
 }
 
 pub(super) fn host(args: &[String]) -> Result<(), String> {
     if !goz_winfs::current_process_is_elevated_admin().map_err(|e| e.to_string())? {
         return Err("검색 전용 프로세스에 관리자 권한이 필요합니다.".into());
     }
-    let option = |name: &str| {
-        args.iter()
-            .position(|s| s == name)
-            .and_then(|i| args.get(i + 1))
-            .ok_or_else(|| "잘못된 검색 프로세스 인수".to_string())
-    };
-    let name = option("--pipe")?;
+    if args.len() != 12
+        || args.get(1).map(String::as_str) != Some("--ntfs-host")
+        || args.get(2).map(String::as_str) != Some("--pipe")
+        || args.get(4).map(String::as_str) != Some("--parent")
+        || args.get(6).map(String::as_str) != Some("--parent-created-filetime")
+        || args.get(8).map(String::as_str) != Some("--index-id")
+        || args.get(10).map(String::as_str) != Some("--memory-mib")
+    {
+        return Err("검색 프로세스 인수 형식이 올바르지 않습니다.".into());
+    }
+    let name = args[3].as_str();
     if !name.starts_with(r"\\.\pipe\SDIR-search-") || name.len() > 100 {
         return Err("잘못된 검색 연결".into());
     }
-    let parent: u32 = option("--parent")?.parse().map_err(|_| "잘못된 부모")?;
-    let id: u64 = option("--index-id")?
-        .parse()
-        .map_err(|_| "잘못된 색인 ID")?;
-    let memory_mib: u16 = option("--memory-mib")?
-        .parse()
-        .map_err(|_| "잘못된 메모리 상한")?;
+    let parent: u32 = args[5].parse().map_err(|_| "잘못된 부모")?;
+    let parent_created_filetime: u64 = args[7].parse().map_err(|_| "잘못된 부모 생성 시각")?;
+    let id: u64 = args[9].parse().map_err(|_| "잘못된 색인 ID")?;
+    let memory_mib: u16 = args[11].parse().map_err(|_| "잘못된 메모리 상한")?;
+    run_host(name, parent, parent_created_filetime, id, memory_mib, None)
+}
+
+pub(super) fn service_host(
+    pipe_id: &str,
+    parent_pid: u32,
+    parent_created_filetime: u64,
+    index_id: u64,
+    memory_mib: u16,
+) -> Result<(), String> {
+    crate::live_search::service::validate_service_identity()?;
+    if pipe_id.len() != 36
+        || !pipe_id
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            })
+    {
+        return Err("서비스 pipe GUID가 올바르지 않습니다.".into());
+    }
+    let name = format!(r"\\.\pipe\SDIR-index-v1-{pipe_id}");
+    run_host(
+        &name,
+        parent_pid,
+        parent_created_filetime,
+        index_id,
+        memory_mib,
+        Some(crate::live_search::service::read_owner_sid()?),
+    )
+}
+
+fn run_host(
+    name: &str,
+    parent_pid: u32,
+    parent_created_filetime: u64,
+    id: u64,
+    memory_mib: u16,
+    owner_sid: Option<String>,
+) -> Result<(), String> {
+    if parent_pid == 0 || parent_created_filetime == 0 || id == 0 {
+        return Err("검색 요청 식별자가 올바르지 않습니다.".into());
+    }
     if !(128..=2048).contains(&memory_mib) {
         return Err("잘못된 메모리 상한".into());
     }
-    let mut pipe = connect_host_pipe(name, parent, true)?;
-    let input = connect_host_pipe(&format!("{name}-queries"), parent, false)?;
+    let parent_handle = crate::live_search::service::validate_parent_process(
+        parent_pid,
+        parent_created_filetime,
+        owner_sid.as_deref(),
+    )?;
+    let parent = ParentIdentity {
+        process: Process(parent_handle),
+        pid: parent_pid,
+        created_filetime: parent_created_filetime,
+        owner_sid,
+    };
+    let service_mode = parent.owner_sid.is_some();
+    let mut pipe = connect_host_pipe(name, &parent, true)?;
+    let input = connect_host_pipe(&format!("{name}-queries"), &parent, false)?;
     let mut reader = BufReader::new(input);
     let host_pid = std::process::id();
 
-    let first = match read_query(&mut reader) {
+    let (reader_after_first, first_result) = read_first_command(reader, service_mode)?;
+    if service_mode && service_stop_requested() {
+        return Ok(());
+    }
+    reader = reader_after_first;
+    let first = match first_result {
         Ok(Some(command)) => command,
         Ok(None) => {
-            send(
+            send_authenticated(
                 &mut pipe,
+                &parent,
                 &Event::ConfigAck {
                     session: id,
                     generation: 0,
@@ -1536,21 +2005,24 @@ pub(super) fn host(args: &[String]) -> Result<(), String> {
         }
         Err(error) => {
             if let Some(command) = error.command {
-                send(
+                send_authenticated(
                     &mut pipe,
+                    &parent,
                     &rejected_command(command, Some(host_pid), error.message),
                 )?;
             } else {
-                send(
+                send_authenticated(
                     &mut pipe,
+                    &parent,
                     &Event::Failure {
                         lane: 4,
                         id,
                         message: error.message.clone(),
                     },
                 )?;
-                send(
+                send_authenticated(
                     &mut pipe,
+                    &parent,
                     &Event::ConfigAck {
                         session: id,
                         generation: 0,
@@ -1564,7 +2036,7 @@ pub(super) fn host(args: &[String]) -> Result<(), String> {
         }
     };
 
-    let (session, generation, settings) = match first {
+    let (session, generation, mut settings) = match first {
         HostCommand::Configure {
             session,
             generation,
@@ -1576,8 +2048,9 @@ pub(super) fn host(args: &[String]) -> Result<(), String> {
             settings: _,
         } => {
             let message = "초기 설정의 검색 세션 또는 세대가 일치하지 않습니다.".to_string();
-            send(
+            send_authenticated(
                 &mut pipe,
+                &parent,
                 &Event::ConfigAck {
                     session,
                     generation,
@@ -1586,8 +2059,9 @@ pub(super) fn host(args: &[String]) -> Result<(), String> {
                     message: Some(message.clone()),
                 },
             )?;
-            send(
+            send_authenticated(
                 &mut pipe,
+                &parent,
                 &Event::ConfigAck {
                     session: id,
                     generation: 0,
@@ -1599,16 +2073,18 @@ pub(super) fn host(args: &[String]) -> Result<(), String> {
             return Ok(());
         }
         command => {
-            send(
+            send_authenticated(
                 &mut pipe,
+                &parent,
                 &rejected_command(
                     command,
                     Some(host_pid),
                     "검색 호스트의 첫 명령은 Configure여야 합니다.".into(),
                 ),
             )?;
-            send(
+            send_authenticated(
                 &mut pipe,
+                &parent,
                 &Event::ConfigAck {
                     session: id,
                     generation: 0,
@@ -1620,18 +2096,22 @@ pub(super) fn host(args: &[String]) -> Result<(), String> {
             return Ok(());
         }
     };
+    if service_mode {
+        settings = service_safe_settings(settings);
+    }
 
     let (inbox, notices) = (
         std::sync::Arc::new(CommandInbox::default()),
         crossbeam_channel::unbounded::<HostNotice>(),
     );
-    let stop = std::sync::Arc::new(HostStop::default());
+    let stop = HostStop::new(service_mode);
     let input_inbox = inbox.clone();
     let input_stop = stop.clone();
     let (notice_tx, notice_rx) = notices;
-    let mut reader_for_commands = reader;
-    send(
+    let reader_for_commands = reader;
+    send_authenticated(
         &mut pipe,
+        &parent,
         &Event::ConfigAck {
             session,
             generation,
@@ -1641,7 +2121,13 @@ pub(super) fn host(args: &[String]) -> Result<(), String> {
         },
     )?;
     let input_thread = std::thread::spawn(move || {
-        supervise_host_input(reader_for_commands, input_inbox, input_stop, notice_tx);
+        supervise_host_input(
+            reader_for_commands,
+            input_inbox,
+            input_stop,
+            notice_tx,
+            service_mode,
+        );
     });
 
     let _background_io = BackgroundIo::enter();
@@ -1653,9 +2139,25 @@ pub(super) fn host(args: &[String]) -> Result<(), String> {
         inbox,
         notice_rx,
         stop.clone(),
-        |event| send(&mut pipe, event),
+        service_mode,
+        &parent,
+        |event| send_authenticated(&mut pipe, &parent, event),
     );
-    if stop.is_requested() {
+    if service_mode {
+        stop.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        let deadline = Instant::now() + HOST_STOP_TIMEOUT;
+        while !input_thread.is_finished() {
+            if Instant::now() >= deadline {
+                return Err("서비스 명령 읽기 스레드를 제한 시간 안에 종료하지 못했습니다.".into());
+            }
+            cancel_service_io();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        input_thread
+            .join()
+            .map_err(|_| "서비스 명령 읽기 스레드가 비정상 종료했습니다.")?;
+    } else if stop.is_requested() {
         let _ = input_thread.join();
     }
     result
@@ -1666,8 +2168,28 @@ fn supervise_host_input<R: BufRead>(
     input_inbox: std::sync::Arc<CommandInbox>,
     input_stop: std::sync::Arc<HostStop>,
     notice_tx: crossbeam_channel::Sender<HostNotice>,
+    service_mode: bool,
 ) {
-    loop {
+    let io_thread: SharedIoThread = std::sync::Arc::new(std::sync::Mutex::new(None));
+    if service_mode {
+        match goz_winfs::current_thread_io_handle() {
+            Ok(handle) => {
+                *io_thread.lock().unwrap() = Some(handle);
+                register_service_io_thread(io_thread.clone());
+            }
+            Err(error) => {
+                let _ = notice_tx.send(HostNotice::Protocol(format!(
+                    "서비스 입력 스레드를 준비하지 못했습니다: {error}"
+                )));
+                input_inbox.close();
+                input_stop
+                    .requested
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return;
+            }
+        }
+    }
+    while !service_mode || !input_stop.is_requested() {
         match read_query(&mut reader) {
             // Persistence is disabled. Replies must not enter the unconsumed reply queue.
             Ok(Some(command)) if command.is_cache_reply() => {}
@@ -1699,6 +2221,7 @@ fn supervise_host_input<R: BufRead>(
     }
     input_inbox.close();
     input_stop.supervise_eof();
+    io_thread.lock().unwrap().take();
 }
 
 enum HostNotice {
@@ -1754,7 +2277,10 @@ struct Volume {
     state: Phase,
     message: Option<String>,
     handle: Option<VolumeHandle>,
-    index: Option<VolumeIndex>,
+    index: Option<Arc<VolumeIndex>>,
+    restored: bool,
+    saved_revision: Option<u64>,
+    cache_save_after: Instant,
     journal: Option<JournalInfo>,
     cursor: i64,
     high_water: Option<i64>,
@@ -1781,6 +2307,9 @@ impl Volume {
             message: info.message,
             handle: None,
             index: None,
+            restored: false,
+            saved_revision: None,
+            cache_save_after: Instant::now(),
             journal: None,
             cursor: 0,
             high_water: None,
@@ -1794,6 +2323,9 @@ impl Volume {
     fn clear_index(&mut self) {
         self.handle = None;
         self.index = None;
+        self.restored = false;
+        self.saved_revision = None;
+        self.cache_save_after = Instant::now();
         self.journal = None;
         self.cursor = 0;
         self.high_water = None;
@@ -1998,7 +2530,7 @@ impl Volume {
             self.journal = j;
             self.high_water = None;
             self.layout_started = false;
-            self.index = Some(VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse()));
+            self.index = Some(Arc::new(VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse())));
             self.handle = Some(h);
             Ok(())
         })();
@@ -2090,6 +2622,7 @@ impl Volume {
         &self,
         text: &str,
         settings: &crate::index_policy::NtfsIndexingSettings,
+        windows_components: Option<&(crate::index_policy::VolumeGuid, RelativePathRoot)>,
         budget: &Budget<'_>,
     ) -> Result<crate::search::SearchResult, String> {
         self.stop.before_native()?;
@@ -2107,12 +2640,16 @@ impl Volume {
         let scope = settings
             .volume_policy(&self.guid)
             .map(|policy| policy.scope());
-        let mut result = query_index_with_scope(
+        let excluded = windows_components
+            .filter(|(guid, _)| guid == &self.guid && !settings.show_windows_components())
+            .map(|(_, root)| root);
+        let mut result = query_index_with_exclusion(
             index,
             &self.root,
             text,
             self.state == Phase::Live,
             scope,
+            excluded,
             budget,
         )?;
         self.stop.before_native()?;
@@ -2207,7 +2744,7 @@ impl Volume {
                     for batch in bounded_batches(&files) {
                         self.stop.before_native()?;
                         let exceeded = {
-                            let index = self.index.as_mut().expect("index checked above");
+                            let index = self.index.as_mut().and_then(Arc::get_mut).expect("scheduled index is unshared");
                             for file in batch {
                                 index.insert_layout(file);
                             }
@@ -2249,7 +2786,7 @@ impl Volume {
                         JournalQuery::NotActive => {}
                     }
                     let exceeded = {
-                        let index = self.index.as_mut().expect("index checked above");
+                        let index = self.index.as_mut().and_then(Arc::get_mut).expect("scheduled index is unshared");
                         let allocated = index.memory().total().allocated;
                         if has_optimize_headroom(allocated, other_bytes, index_budget) {
                             index.optimize_storage();
@@ -2298,7 +2835,7 @@ impl Volume {
                     self.journal = Some(eof_journal);
                     self.high_water = Some(eof_journal.next_usn);
                     let exceeded = {
-                        let index = self.index.as_mut().expect("index checked above");
+                        let index = self.index.as_mut().and_then(Arc::get_mut).expect("scheduled index is unshared");
                         let allocated = index.memory().total().allocated;
                         if has_optimize_headroom(allocated, other_bytes, index_budget) {
                             index.optimize_storage();
@@ -2324,6 +2861,13 @@ impl Volume {
         }
         if !matches!(self.state, Phase::Live | Phase::CatchingUp) {
             return Ok(false);
+        }
+        if self.state == Phase::CatchingUp
+            && self
+                .high_water
+                .is_some_and(|high_water| cursor_reached_high_water(self.cursor, high_water))
+        {
+            return self.publish_caught_up();
         }
         let journal_id = self
             .journal
@@ -2373,7 +2917,7 @@ impl Volume {
         for batch in bounded_batches(&page.records) {
             self.stop.before_native()?;
             let exceeded = {
-                let index = self.index.as_mut().expect("index checked above");
+                let index = self.index.as_mut().and_then(Arc::get_mut).expect("scheduled index is unshared");
                 if volume_resources_exceeded(index, other_bytes, index_budget) {
                     true
                 } else {
@@ -2485,6 +3029,9 @@ impl Volume {
         }
         self.journal = Some(window);
         self.state = completed_phase(self.snapshot_only);
+        if self.restored {
+            self.message = Some("저장된 색인 복원 · NTFS 변경분 반영 완료".into());
+        }
         if self.snapshot_only {
             self.handle = None;
         }
@@ -2581,7 +3128,11 @@ fn storage_device_number(
     if written != size {
         return Err("볼륨 장치 정보 길이가 올바르지 않습니다.".into());
     }
-    Ok((number.DeviceType, number.DeviceNumber, number.PartitionNumber))
+    Ok((
+        number.DeviceType,
+        number.DeviceNumber,
+        number.PartitionNumber,
+    ))
 }
 
 fn confirm_volume_identity(
@@ -2855,6 +3406,13 @@ fn next_fair_volume(states: &[Phase], start: usize) -> Option<usize> {
         })
 }
 
+fn service_safe_settings(
+    mut settings: crate::index_policy::NtfsIndexingSettings,
+) -> crate::index_policy::NtfsIndexingSettings {
+    let _ = settings.set_auto_removable(false);
+    settings
+}
+
 fn run(
     session: u64,
     mut generation: u64,
@@ -2863,13 +3421,19 @@ fn run(
     inbox: std::sync::Arc<CommandInbox>,
     notices: crossbeam_channel::Receiver<HostNotice>,
     stop: std::sync::Arc<HostStop>,
+    service_mode: bool,
+    parent: &ParentIdentity,
     mut output: impl FnMut(&Event) -> Result<(), String>,
 ) -> Result<(), String> {
     stop.attach_current_thread()?;
+    if service_mode {
+        settings = service_safe_settings(settings);
+    }
     let mut returned = HostRunReturned {
         stop: stop.clone(),
         normal: false,
     };
+    let windows_components = windows_components_scope();
     let mut volumes: Vec<Volume> = vec![];
     let mut scratch = vec![0; FSCTL_SCRATCH_BYTES];
     let index_budget = memory_limit.saturating_sub(FSCTL_SCRATCH_BYTES as u64);
@@ -2884,7 +3448,13 @@ fn run(
     let mut queried_revision = 0;
     let mut query_clock = Instant::now() - Duration::from_secs(1);
     let mut rebuild_in_progress: Option<crate::index_policy::VolumeGuid> = None;
+    let mut last_parent_check = Instant::now() - Duration::from_secs(2);
+    let mut resume_store: Option<ResumeStore> = None;
     loop {
+        if last_parent_check.elapsed() >= Duration::from_secs(1) {
+            parent.validate()?;
+            last_parent_check = Instant::now();
+        }
         if stop.is_requested() {
             returned.normal = true;
             return Ok(());
@@ -2930,6 +3500,11 @@ fn run(
                         })?;
                     } else {
                         let next_settings = *next_settings;
+                        let next_settings = if service_mode {
+                            service_safe_settings(next_settings)
+                        } else {
+                            next_settings
+                        };
                         let now = Instant::now();
                         for volume in &mut volumes {
                             let old_scope = settings
@@ -3008,6 +3583,9 @@ fn run(
                             match volume.explicit_rebuild_snapshot_only(&settings) {
                                 Err(error) => Some(error),
                                 Ok(snapshot_only) => {
+                                    if let Some(resume) = &mut resume_store {
+                                        resume.skip_restore(&guid);
+                                    }
                                     volume.begin_mode(snapshot_only);
                                     if volume.state == Phase::Error {
                                         Some(volume.message.clone().unwrap_or_else(|| {
@@ -3092,10 +3670,22 @@ fn run(
             returned.normal = true;
             return Ok(());
         }
+        if settings.persistent() && resume_store.is_none() {
+            resume_store = parent.owner_sid.clone().map(ResumeStore::start);
+        }
         if discovery.elapsed() >= Duration::from_secs(5) {
             discovery = Instant::now();
             queried_revision = u64::MAX;
-            match super::mounted_inventory() {
+            let inventory_result = super::mounted_inventory().map(|mut inventory| {
+                if service_mode {
+                    inventory
+                        .volumes
+                        .retain(|volume| volume.classification == super::InventoryClass::Fixed);
+                    inventory.network_drives.clear();
+                }
+                inventory
+            });
+            match inventory_result {
                 Ok(inventory) => {
                     if inventory_error.take().is_some() {
                         dirty = true;
@@ -3120,10 +3710,18 @@ fn run(
                         .collect::<BTreeSet<_>>();
                     for volume in &mut volumes {
                         if !all_guids.contains(&volume.guid) {
-                            dirty |= volume.mark_offline();
+                            if volume.mark_offline() {
+                                dirty = true;
+                                if let Some(resume) = &mut resume_store {
+                                    resume.observe_offline(&volume.guid);
+                                }
+                            }
                         }
                     }
                     for info in selected {
+                        if let Some(resume) = &mut resume_store {
+                            resume.observe_online(&info.guid);
+                        }
                         if let Some(volume) =
                             volumes.iter_mut().find(|volume| volume.guid == info.guid)
                         {
@@ -3177,14 +3775,30 @@ fn run(
                 }
             }
         }
-        let mut bytes = volumes.iter().fold(0u64, |sum, volume| {
+        if let Some(resume) = &mut resume_store {
+            dirty |= resume.poll(&mut volumes, generation);
+            let bytes = volumes.iter().fold(resume.detached_bytes(&volumes), |sum, volume| {
+                sum.saturating_add(volume.allocated_bytes())
+            });
+            dirty |= resume.schedule(&mut volumes, &settings, generation, index_budget.saturating_sub(bytes));
+        }
+        let detached = resume_store.as_ref().map_or(0, |io| io.detached_bytes(&volumes));
+        let cache_loading = resume_store.as_ref().is_some_and(ResumeStore::loading);
+        let mut bytes = volumes.iter().fold(detached, |sum, volume| {
             sum.saturating_add(volume.allocated_bytes())
         });
         let states = volumes
             .iter()
-            .map(|volume| volume.state.clone())
+            .map(|volume| {
+                if volume.index.as_ref().is_some_and(|index| Arc::strong_count(index) > 1) {
+                    // An immutable snapshot is saving on the I/O worker. It still serves queries.
+                    Phase::Snapshot
+                } else {
+                    volume.state.clone()
+                }
+            })
             .collect::<Vec<_>>();
-        if let Some(index) = next_fair_volume(&states, next_volume) {
+        if let Some(index) = (!cache_loading).then(|| next_fair_volume(&states, next_volume)).flatten() {
             next_volume = (index + 1) % volumes.len();
             let own_bytes = volumes[index].allocated_bytes();
             let other_bytes = bytes.saturating_sub(own_bytes);
@@ -3205,12 +3819,21 @@ fn run(
                         return Ok(());
                     }
                     Err(error) => {
-                        volumes[index].fail(error);
+                        let volume = &mut volumes[index];
+                        if volume.restored && volume.state == Phase::CatchingUp {
+                            volume.begin_mode(false);
+                            if volume.state == Phase::Indexing {
+                                volume.message = Some("저장된 색인의 변경분을 적용할 수 없어 이 드라이브를 다시 색인합니다.".into());
+                            }
+                        } else {
+                            volume.fail(error);
+                        }
                         dirty = true;
                     }
                 }
             }
-            bytes = volumes.iter().fold(0u64, |sum, volume| {
+            let detached = resume_store.as_ref().map_or(0, |io| io.detached_bytes(&volumes));
+            bytes = volumes.iter().fold(detached, |sum, volume| {
                 sum.saturating_add(volume.allocated_bytes())
             });
         }
@@ -3337,7 +3960,12 @@ fn run(
                                     );
                                     break;
                                 }
-                                match volume.query(text, &settings, &budget) {
+                                match volume.query(
+                                    text,
+                                    &settings,
+                                    windows_components.as_ref(),
+                                    &budget,
+                                ) {
                                     Ok(part) => parts.push(part),
                                     Err(error) => {
                                         failure = Some(error);
@@ -3364,7 +3992,9 @@ fn run(
                 query_clock = Instant::now();
             }
         }
-        if !working {
+        if cache_loading {
+            std::thread::sleep(Duration::from_millis(12));
+        } else if !working {
             std::thread::sleep(Duration::from_millis(200));
         }
     }
@@ -3566,6 +4196,20 @@ mod replay_tests {
 
 #[cfg(test)]
 mod ipc_tests {
+    fn current_test_parent() -> ParentIdentity {
+        let pid = std::process::id();
+        let created_filetime =
+            crate::live_search::service::current_process_created_filetime().unwrap();
+        let process =
+            crate::live_search::service::validate_parent_process(pid, created_filetime, None)
+                .unwrap();
+        ParentIdentity {
+            process: Process(process),
+            pid,
+            created_filetime,
+            owner_sid: None,
+        }
+    }
     use super::*;
     use ::windows::Win32::Security::{RevertToSelf, TOKEN_QUERY};
     use std::io::Read;
@@ -3687,7 +4331,7 @@ mod ipc_tests {
             let mut server = File::from_raw_handle(h.0);
             let (release, wait) = crossbeam_channel::bounded::<()>(1);
             let client = std::thread::spawn(move || {
-                let mut p = connect_host_pipe(&name, std::process::id(), true).unwrap();
+                let mut p = connect_host_pipe(&name, &current_test_parent(), true).unwrap();
                 p.write_all(b"hello").unwrap();
                 wait.recv_timeout(Duration::from_secs(5)).unwrap();
             });
@@ -3742,10 +4386,10 @@ mod ipc_tests {
             let (started, waiting) = crossbeam_channel::bounded(1);
             let (finished, done) = crossbeam_channel::bounded(1);
             let host = std::thread::spawn(move || {
-                let mut output = connect_host_pipe(&name, std::process::id(), true).unwrap();
+                let parent = current_test_parent();
+                let mut output = connect_host_pipe(&name, &parent, true).unwrap();
                 let mut input =
-                    connect_host_pipe(&format!("{name}-queries"), std::process::id(), false)
-                        .unwrap();
+                    connect_host_pipe(&format!("{name}-queries"), &parent, false).unwrap();
                 let reader = std::thread::spawn(move || {
                     started.send(()).unwrap();
                     let mut byte = [0];
@@ -3839,6 +4483,19 @@ mod ipc_tests {
     }
 
     #[test]
+    fn system_components_are_bound_to_the_actual_windows_volume() {
+        let (guid, relative) = windows_components_scope().expect("Windows component store volume");
+        assert_eq!(relative.as_str().rsplit('/').next(), Some("WinSxS"));
+        assert!(
+            mounted_inventory()
+                .unwrap()
+                .volumes
+                .iter()
+                .any(|volume| volume.guid == guid)
+        );
+    }
+
+    #[test]
     fn stdin_eof_interrupts_initial_ack_wait_without_host_ack() {
         use std::sync::{Arc, atomic::AtomicBool};
 
@@ -3861,7 +4518,15 @@ mod ipc_tests {
         let _ack_keepalive = ack_tx;
         let events_done = AtomicBool::new(false);
         assert!(matches!(
-            poll_proxy_ack(&ack_rx, &input_closed, &events_done, &host, Instant::now()).unwrap(),
+            poll_proxy_ack(
+                &ack_rx,
+                &input_closed,
+                &events_done,
+                &host,
+                Instant::now(),
+                &std::sync::Mutex::new(None)
+            )
+            .unwrap(),
             ProxyAckPoll::Stopped
         ));
         let (exit_code, forced) = terminate_owned_host(&host).unwrap();
@@ -3896,7 +4561,7 @@ mod ipc_tests {
                 bInheritHandle: false.into(),
             };
             let server = create_server_pipe(&name, &attributes).unwrap();
-            let client = connect_host_pipe(&name, std::process::id(), false).unwrap();
+            let client = connect_host_pipe(&name, &current_test_parent(), false).unwrap();
             let input_closed = AtomicBool::new(false);
             connect_server_pipe(
                 &server,

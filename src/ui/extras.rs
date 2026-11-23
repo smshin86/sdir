@@ -3,21 +3,44 @@ use sdir::utility::Utility;
 #[derive(Clone)]
 pub(super) struct ContextMenu {
     pub pane: usize,
+    pub target_tab: usize,
     pub paths: Vec<NativePath>,
     pub x: f64,
     pub y: f64,
     pub background: bool,
+    pub keyboard: bool,
     pub tab: Option<usize>,
 }
+fn app_window_handle() -> u64 {
+    use dioxus::desktop::tao::platform::windows::WindowExtWindows;
+    dioxus::desktop::window().window.hwnd() as usize as u64
+}
+pub(super) fn selected_properties(
+    bridge: &Bridge,
+    folder: NativePath,
+    paths: Vec<NativePath>,
+) -> Result<(), String> {
+    match paths.as_slice() {
+        [] => bridge.properties(folder),
+        [path] => bridge.properties(path.clone()),
+        _ => bridge.utility(Utility::PropertiesSelection {
+            folder,
+            entries: paths,
+        }),
+    }
+}
+
 pub(super) fn open_context(
     mut model: Signal<AppModel>,
+    bridge: &Bridge,
     pane: usize,
     path: Option<NativePath>,
     x: f64,
     y: f64,
+    keyboard: bool,
 ) {
     let mut s = model.write();
-    if s.job.is_some() || s.dialog.is_some() || s.copy_destination.is_some() {
+    if s.modal_open() || s.job.is_some() || s.pending_context.is_some() {
         return;
     }
     s.active = pane;
@@ -34,30 +57,106 @@ pub(super) fn open_context(
     } else {
         s.selected()
     };
-    s.context = Some(ContextMenu {
-        pane,
-        paths,
-        x,
-        y,
-        background,
-        tab: None,
-    });
-    s.dirty();
-}
-pub(super) fn open_selected_context(mut model: Signal<AppModel>, pane: usize) {
-    let paths = model.read().selected();
-    if paths.is_empty() {
-        open_context(model, pane, None, 220., 180.);
-    } else {
-        model.write().context = Some(ContextMenu {
+    let target_tab = s.panes[pane].active;
+    let folder = s.panes[pane].tab().path.clone();
+    let request = s.interaction;
+    let action = Utility::FolderMenu {
+        request,
+        folder,
+        entries: if background {
+            Vec::new()
+        } else {
+            paths.clone()
+        },
+        owner: app_window_handle(),
+        point: if keyboard {
+            None
+        } else {
+            sdir::utility::screen_cursor_position().ok()
+        },
+    };
+    s.pending_context = Some((
+        request,
+        ContextMenu {
             pane,
+            target_tab,
             paths,
-            x: 220.,
-            y: 180.,
-            background: false,
+            x,
+            y,
+            background,
+            keyboard,
             tab: None,
-        });
+        },
+    ));
+    s.dirty();
+    drop(s);
+    if let Err(error) = bridge.utility(action.clone()) {
+        finish_context(model, &action, Err(error));
     }
+}
+
+pub(super) fn finish_context(
+    mut model: Signal<AppModel>,
+    action: &Utility,
+    result: Result<Option<u32>, String>,
+) {
+    let Utility::FolderMenu {
+        request,
+        folder,
+        owner,
+        ..
+    } = action
+    else {
+        return;
+    };
+    let mut state = model.write();
+    if !state
+        .pending_context
+        .as_ref()
+        .is_some_and(|(id, _)| id == request)
+    {
+        return;
+    }
+    let Some((_, context)) = state.pending_context.take() else {
+        return;
+    };
+    if state.interaction != *request
+        || state.active != context.pane
+        || state.modal_open()
+        || state.closing
+    {
+        return;
+    }
+    let Some(pane) = state.panes.get(context.pane) else {
+        return;
+    };
+    if pane.active != context.target_tab
+        || &pane.tab().path != folder
+        || (!context.background && state.selected() != context.paths)
+    {
+        return;
+    }
+    let active = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    if active.0 as usize as u64 != *owner {
+        return;
+    }
+    match result {
+        Ok(Some(sdir::utility::SDIR_MENU_SELECTED)) => state.context = Some(context),
+        Err(error) => {
+            state.notice = error;
+            state.context = Some(context);
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn open_selected_context(model: Signal<AppModel>, bridge: &Bridge, pane: usize) {
+    let path = model
+        .read()
+        .panes
+        .get(pane)
+        .and_then(|p| p.tab().selection.iter().next().cloned());
+    open_context(model, bridge, pane, path, 220., 180., true);
 }
 pub(super) fn open_tab_context(
     mut model: Signal<AppModel>,
@@ -74,11 +173,13 @@ pub(super) fn open_tab_context(
     s.interaction += 1;
     s.context = Some(ContextMenu {
         pane,
+        target_tab: tab,
         tab: Some(tab),
         paths: vec![s.panes[pane].tabs[tab].path.clone()],
         x,
         y,
         background: false,
+        keyboard: false,
     });
 }
 pub(super) fn close_context(mut model: Signal<AppModel>) {
@@ -92,6 +193,15 @@ fn context_command(mut model: Signal<AppModel>, bridge: &Bridge, command: &str) 
         return;
     };
     model.write().active = c.pane;
+    if c.tab.is_none() && model.read().panes[c.pane].active != c.target_tab {
+        change_tab(
+            model,
+            bridge,
+            c.pane,
+            TabCommand::Select(c.target_tab),
+            false,
+        );
+    }
     if let Some(tab) = c.tab {
         match command {
             "tabopen" => change_tab(model, bridge, c.pane, TabCommand::Select(tab), true),
@@ -123,8 +233,40 @@ fn context_command(mut model: Signal<AppModel>, bridge: &Bridge, command: &str) 
         .paths
         .first()
         .cloned()
-        .unwrap_or_else(|| model.read().path());
+        .unwrap_or_else(|| model.read().panes[c.pane].tabs[c.target_tab].path.clone());
     let result = match command {
+        "back" => {
+            history_navigation_tab(model, bridge, c.pane, c.target_tab, false);
+            Ok(())
+        }
+        "forward" => {
+            history_navigation_tab(model, bridge, c.pane, c.target_tab, true);
+            Ok(())
+        }
+        command if command.starts_with("view_") => {
+            set_view(model, c.pane, &command[5..]);
+            Ok(())
+        }
+        "sort_name" | "sort_size" | "sort_modified" => {
+            let column = match command {
+                "sort_name" => SortColumn::Name,
+                "sort_size" => SortColumn::Size,
+                _ => SortColumn::Modified,
+            };
+            let changed = model.read().panes[c.pane].tabs[c.target_tab].sort != column;
+            if changed {
+                sort_tab(model, c.pane, c.target_tab, column);
+            }
+            Ok(())
+        }
+        "sort_ascending" => {
+            sort_direction_tab(model, c.pane, c.target_tab, false);
+            Ok(())
+        }
+        "sort_descending" => {
+            sort_direction_tab(model, c.pane, c.target_tab, true);
+            Ok(())
+        }
         "open" => {
             let entry = model.read().panes[c.pane]
                 .tab()
@@ -139,19 +281,16 @@ fn context_command(mut model: Signal<AppModel>, bridge: &Bridge, command: &str) 
                 bridge.job(Request::Open { path })
             }
         }
-        "with" => {
-            use dioxus::desktop::tao::platform::windows::WindowExtWindows;
-            bridge.utility(Utility::OpenWith(
-                path,
-                dioxus::desktop::window().window.hwnd() as u64,
-            ))
-        }
+        "with" => bridge.utility(Utility::OpenWith(path, app_window_handle())),
         "paths" => bridge.utility(Utility::CopyPaths(c.paths)),
         "terminal" => bridge.utility(Utility::Terminal(
-            model.read().panes[c.pane].tab().path.clone(),
+            model.read().panes[c.pane].tabs[c.target_tab].path.clone(),
         )),
         "explorer" => bridge.utility(Utility::Explorer(path)),
-        "properties" => bridge.properties(path),
+        "properties" => {
+            let folder = model.read().panes[c.pane].tabs[c.target_tab].path.clone();
+            selected_properties(bridge, folder, c.paths)
+        }
         "copy" => {
             copy(model, bridge, false);
             Ok(())
@@ -165,7 +304,7 @@ fn context_command(mut model: Signal<AppModel>, bridge: &Bridge, command: &str) 
             Ok(())
         }
         "rename" => {
-            dialog(model, "rename");
+            start_inline_rename(model);
             Ok(())
         }
         "batch" => {
@@ -196,13 +335,71 @@ fn context_command(mut model: Signal<AppModel>, bridge: &Bridge, command: &str) 
         focus_list_after_render(model, c.pane);
     }
 }
+fn position_context_menu() {
+    let _ = document::eval(
+        r#"{
+            const menu = document.querySelector('.file-context-menu');
+            if (menu) {
+                menu.style.setProperty('--context-height', `${menu.offsetHeight}px`);
+                menu.querySelector('[data-menu-level="main"]:not(:disabled)')?.focus();
+            }
+        }"#,
+    );
+}
+fn position_context_submenu() {
+    let _ = document::eval(
+        r#"{
+            const menu = document.querySelector('.file-context-menu');
+            const panel = menu?.querySelector('.context-submenu');
+            const trigger = panel?.parentElement.querySelector(':scope > button');
+            if (trigger) {
+                const r = trigger.getBoundingClientRect();
+                const {width, height} = panel.getBoundingClientRect();
+                const left = r.right + width <= innerWidth - 8 ? r.right : r.left - width;
+                panel.style.left = Math.max(8, left) + 'px';
+                panel.style.top = Math.max(8, Math.min(r.top, innerHeight - height - 8)) + 'px';
+                panel.querySelector('button')?.focus();
+            }
+        }"#,
+    );
+}
+fn close_context_submenu(mut submenu: Signal<Option<&'static str>>) {
+    let opened = *submenu.read();
+    if let Some(command) = opened {
+        submenu.set(None);
+        let _ = document::eval(&format!(
+            r#"document.querySelector('.file-context-menu [data-command="{command}"]')?.focus()"#,
+        ));
+    }
+}
 #[component]
 pub(super) fn ContextMenuView(mut model: Signal<AppModel>) -> Element {
     let bridge = use_context::<Arc<Bridge>>();
+    let mut submenu = use_signal(|| None::<&'static str>);
     let Some(c) = model.read().context.clone() else {
         return rsx! {};
     };
     let count = c.paths.len();
+    let menu_state = {
+        let s = model.read();
+        s.panes.get(c.pane).and_then(|pane| {
+            pane.tabs.get(c.target_tab).map(|tab| {
+                (
+                    pane_view_option(pane.view, pane.icon_size),
+                    pane_view_option(ViewMode::Icons, pane.icon_size) == "icons",
+                    tab.sort,
+                    tab.descending,
+                    !tab.back.is_empty(),
+                    !tab.forward.is_empty(),
+                )
+            })
+        })
+    };
+    let Some((view_option, custom_icon_size, sort_column, descending, can_back, can_forward)) =
+        menu_state
+    else {
+        return rsx! {};
+    };
     let pinned = c
         .tab
         .is_some_and(|i| model.read().panes[c.pane].tabs[i].pinned);
@@ -218,9 +415,13 @@ pub(super) fn ContextMenuView(mut model: Signal<AppModel>) -> Element {
         ]
     } else if c.background {
         vec![
+            ("뒤로", "back"),
+            ("앞으로", "forward"),
+            ("보기", "view"),
+            ("정렬 기준", "sort"),
+            ("새로고침", "refresh"),
             ("새 폴더", "new"),
             ("붙여넣기", "paste"),
-            ("새로고침", "refresh"),
             ("폴더 경로 복사", "paths"),
             ("여기서 터미널 열기", "terminal"),
             ("탐색기에서 표시", "explorer"),
@@ -241,16 +442,147 @@ pub(super) fn ContextMenuView(mut model: Signal<AppModel>) -> Element {
             ("속성", "properties"),
         ]
     };
-    rsx! {div{class:"context-dismiss",onclick:move |_|close_context(model),onkeydown:move|e:KeyboardEvent|context_keys(e,model),
-    div{class:"file-context-menu",onmounted:move |_|{let _=document::eval("document.querySelector('.file-context-menu button:not(:disabled)')?.focus()");},role:"menu","aria-label":"파일 메뉴",style:"left:min({c.x}px,calc(100vw - 240px));top:min({c.y}px,calc(100vh - 440px))",onclick:move|e:MouseEvent|e.stop_propagation(),
-     for (name,cmd) in entries { {let b=bridge.clone();rsx!{button{role:"menuitem","data-command":cmd,disabled:(count!=1&&["open","with","rename","properties"].contains(&cmd))||(cmd=="tabclose"&&(pinned||tab_count==1))||(cmd=="tableft"&&c.tab==Some(0))||(cmd=="tabright"&&c.tab==Some(tab_count-1)),onclick:move |_|context_command(model,&b,cmd),"{name}"}}}}
-    }}}
+    let menu_label = if c.background {
+        "폴더 배경 메뉴"
+    } else if c.tab.is_some() {
+        "탭 메뉴"
+    } else {
+        "파일 메뉴"
+    };
+    let opened = *submenu.read();
+    rsx! {
+        div {
+            class: "context-dismiss",
+            onclick: move |_| close_context(model),
+            onkeydown: move |event: KeyboardEvent| context_keys(event, model, submenu),
+            div {
+                class: "file-context-menu",
+                onmounted: move |_| position_context_menu(),
+                role: "menu",
+                "aria-label": menu_label,
+                style: "--context-x:{c.x}px;--context-y:{c.y}px",
+                onclick: move |event: MouseEvent| event.stop_propagation(),
+                for (label, cmd) in entries {
+                    if matches!(cmd, "view" | "sort") {
+                        {
+                            let expanded = opened == Some(cmd);
+                            rsx! {
+                                div {
+                                    key: "{cmd}",
+                                    class: "context-menu-entry",
+                                    role: "none",
+                                    button {
+                                        role: "menuitem",
+                                        tabindex: -1,
+                                        "data-command": cmd,
+                                        "data-menu-level": "main",
+                                        "aria-haspopup": "menu",
+                                        "aria-expanded": if expanded { "true" } else { "false" },
+                                        onclick: move |_| {
+                                            if expanded {
+                                                close_context_submenu(submenu);
+                                            } else {
+                                                submenu.set(Some(cmd));
+                                            }
+                                        },
+                                        "{label}"
+                                        span { "aria-hidden": "true", "›" }
+                                    }
+                                    if expanded {
+                                        {
+                                            let options = if cmd == "view" {
+                                                let mut options: Vec<_> = PANE_VIEW_OPTIONS.into_iter()
+                                                    .map(|(value, action, label)| (label, action, view_option == value))
+                                                    .collect();
+                                                if custom_icon_size {
+                                                    options.push(("사용자 지정 아이콘", "view_icons", view_option == "icons"));
+                                                }
+                                                options
+                                            } else {
+                                                vec![
+                                                    ("이름", "sort_name", sort_column == SortColumn::Name),
+                                                    ("크기", "sort_size", sort_column == SortColumn::Size),
+                                                    ("수정한 날짜", "sort_modified", sort_column == SortColumn::Modified),
+                                                    ("오름차순", "sort_ascending", !descending),
+                                                    ("내림차순", "sort_descending", descending),
+                                                ]
+                                            };
+                                            rsx! {
+                                                div {
+                                                    class: "context-submenu",
+                                                    role: "menu",
+                                                    "aria-label": label,
+                                                    onmounted: move |_| position_context_submenu(),
+                                                    for (name, action, selected) in options {
+                                                        {
+                                                            let b = bridge.clone();
+                                                            rsx! {
+                                                                button {
+                                                                    key: "{action}",
+                                                                    role: "menuitemradio",
+                                                                    tabindex: -1,
+                                                                    "data-command": action,
+                                                                    "data-menu-level": "sub",
+                                                                    "aria-checked": if selected { "true" } else { "false" },
+                                                                    onclick: move |_| context_command(model, &b, action),
+                                                                    "{name}"
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        {
+                            let b = bridge.clone();
+                            let disabled = (count != 1 && ["open", "with", "rename"].contains(&cmd))
+                                || (cmd == "tabclose" && (pinned || tab_count == 1))
+                                || (cmd == "tableft" && c.tab == Some(0))
+                                || (cmd == "tabright" && c.tab == Some(tab_count - 1))
+                                || (cmd == "back" && !can_back)
+                                || (cmd == "forward" && !can_forward);
+                            rsx! {
+                                button {
+                                    key: "{cmd}",
+                                    role: "menuitem",
+                                    tabindex: -1,
+                                    "data-command": cmd,
+                                    "data-menu-level": "main",
+                                    disabled,
+                                    onclick: move |event: MouseEvent| {
+                                        if cmd == "windows_menu" {
+                                            let point = event.client_coordinates();
+                                            if let Some(context) = model.write().context.as_mut() {
+                                                context.keyboard = point.x == 0. && point.y == 0.;
+                                            }
+                                        }
+                                        context_command(model, &b, cmd);
+                                    },
+                                    "{label}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn tree_follow_tick(mut model: Signal<AppModel>, bridge: &Bridge) {
     {
         let s = model.read();
-        let follow = s.tree_follow && s.tree_seen.as_ref() != Some(&s.path());
+        let current = sdir::tree::tree_key(s.path());
+        let seen = s
+            .tree_seen
+            .as_ref()
+            .map(|path| sdir::tree::tree_key(path.clone()));
+        let follow = s.tree_follow && seen.as_ref() != Some(&current);
         if !s.tree.open || (!follow && (s.tree.pending.is_some() || s.tree_tasks.is_empty())) {
             return;
         }
@@ -260,8 +592,12 @@ pub(super) fn tree_follow_tick(mut model: Signal<AppModel>, bridge: &Bridge) {
         if !s.tree.open {
             return;
         }
-        let current = s.path();
-        if s.tree_follow && s.tree_seen.as_ref() != Some(&current) {
+        let current = sdir::tree::tree_key(s.path());
+        let seen = s
+            .tree_seen
+            .as_ref()
+            .map(|path| sdir::tree::tree_key(path.clone()));
+        if s.tree_follow && seen.as_ref() != Some(&current) {
             if s.tree_pending_auto && s.tree.pending.is_some() {
                 bridge.tree.cancel();
                 s.tree.pending = None;
@@ -279,6 +615,10 @@ pub(super) fn tree_follow_tick(mut model: Signal<AppModel>, bridge: &Bridge) {
         let Some((path, expand)) = s.tree_tasks.front().cloned() else {
             return;
         };
+        let path = sdir::tree::tree_key(path);
+        if let Some((queued, _)) = s.tree_tasks.front_mut() {
+            *queued = path.clone();
+        }
         let (next, done) = s.tree.follow_step(&path, expand);
         if done {
             s.tree_tasks.pop_front();
@@ -288,9 +628,8 @@ pub(super) fn tree_follow_tick(mut model: Signal<AppModel>, bridge: &Bridge) {
                 .iter()
                 .position(|r| r.path == path && r.message.is_none())
             {
-                let indent = rows[index].depth.min(16) * 13;
                 let _ = document::eval(&format!(
-                    "requestAnimationFrame(()=>{{const t=document.querySelector('.drive-tree');if(t){{t.scrollTop=Math.max(0,{index}*28-t.clientHeight/2);t.scrollLeft={indent};}}}})"
+                    "requestAnimationFrame(()=>{{const t=document.querySelector('.drive-tree');if(t){{t.scrollTop=Math.max(0,{index}*28-t.clientHeight/2);}}}})"
                 ));
             }
         }
@@ -333,12 +672,28 @@ pub(super) struct BatchDialog {
     pub(super) result: Option<Result<Vec<sdir::batch::RenamePair>, String>>,
     pane: usize,
 }
-pub(super) fn open_batch(mut model: Signal<AppModel>) {
+pub(super) fn open_batch(model: Signal<AppModel>) {
+    open_batch_mode(model, false);
+}
+pub(super) fn open_numbered_batch(model: Signal<AppModel>) {
+    open_batch_mode(model, true);
+}
+fn open_batch_mode(mut model: Signal<AppModel>, numbered: bool) {
     let mut s = model.write();
     if s.job.is_some() {
         return;
     }
-    let paths = s.selected();
+    let paths = if numbered {
+        let tab = s.panes[s.active].tab();
+        tab.visible
+            .iter()
+            .map(|&index| &tab.entries[index].path)
+            .filter(|path| tab.selection.contains(*path))
+            .cloned()
+            .collect()
+    } else {
+        s.selected()
+    };
     if paths.is_empty() || paths.len() > 500 {
         s.notice = "1~500개 항목을 선택하세요.".into();
         return;
@@ -346,7 +701,10 @@ pub(super) fn open_batch(mut model: Signal<AppModel>) {
     let id = s.id();
     s.batch = Some(BatchDialog {
         paths,
-        pattern: Default::default(),
+        pattern: sdir::batch::Pattern {
+            whole_stem: numbered.then(String::new),
+            ..Default::default()
+        },
         id,
         due: Some(Instant::now()),
         result: None,
@@ -369,7 +727,8 @@ fn change_pattern(mut model: Signal<AppModel>, field: usize, value: String) {
             1 => b.pattern.replace = value,
             2 => b.pattern.prefix = value,
             3 => b.pattern.suffix = value,
-            _ => b.pattern.start = value.parse().ok(),
+            4 => b.pattern.start = value.parse().ok(),
+            _ => b.pattern.whole_stem = Some(value),
         }
         b.id = id;
         b.result = None;
@@ -405,6 +764,7 @@ pub(super) fn BatchRenameDialog(mut model: Signal<AppModel>) -> Element {
     let bridge = use_context::<Arc<Bridge>>();
     let b = model.read().batch.clone().unwrap();
     let pattern = b.pattern.clone();
+    let common = pattern.whole_stem;
     let values = [
         pattern.find,
         pattern.replace,
@@ -420,7 +780,22 @@ pub(super) fn BatchRenameDialog(mut model: Signal<AppModel>) -> Element {
     let apply = bridge.clone();
     rsx! {div{class:"modal-backdrop",onkeydown:move|e:KeyboardEvent|{e.stop_propagation();if e.key()==Key::Escape{close_batch(model,&bridge);}},div{class:"modal batch-dialog",role:"dialog","aria-modal":"true","aria-label":"이름 일괄 변경",
     h2{"이름 일괄 변경 · {b.paths.len()}개"}p{"확장자는 유지됩니다. 바뀔 이름을 미리 확인한 뒤 적용하세요. 충돌이 있으면 실행하지 않습니다."}
+    if let Some(common) = common {
+        label{class:"batch-fields",span{"공통 이름"},
+            input{class:"batch-field batch-common-name",maxlength:200,initial_value:"{common}",
+                onmounted:move |_|{let _=document::eval("document.querySelector('.batch-common-name')?.focus();");},
+                onchange:move |e:FormEvent|change_pattern(model,5,e.value()),
+                onkeydown:move |e:KeyboardEvent| {
+                    if e.key()==Key::Enter && !e.is_composing() {
+                        e.prevent_default();
+                        let _=document::eval("document.querySelector('.batch-apply:not(:disabled)')?.click();");
+                    }
+                }
+            }
+        }
+    } else {
     div{class:"batch-fields",for (i,label) in ["찾을 글자","바꿀 글자","앞에 추가","뒤에 추가","시작 번호 (선택)"].iter().enumerate(){label{span{"{label}"}input{class:"batch-field","data-field":i,value:"{values[i]}",maxlength:200,oninput:move|e:FormEvent|change_pattern(model,i,e.value())}}}}
+    }
     div{class:"batch-preview",match b.result{Some(Ok(pairs))=>rsx!{for pair in pairs{div{class:"rename-preview",span{"{pair.source.name()}"}span{"→"}strong{"{pair.name}"}}}},Some(Err(e))=>rsx!{p{class:"batch-error","{e}"}},None=>rsx!{p{"미리보기 확인 중…"}}}}
     div{class:"modal-actions",button{class:"batch-cancel",onclick:move |_|close_batch(model,&cancel),"취소"}button{class:"primary batch-apply",disabled:!ready,onclick:move |_|{let pairs=model.read().batch.as_ref().and_then(|b|b.result.as_ref()).and_then(|r|r.as_ref().ok()).cloned();if let Some(pairs)=pairs{let pairs=pairs.into_iter().filter(|p|p.source.name()!=p.name).collect();model.write().batch=None;submit(model,&apply,FileAction::BatchRename{pairs});}},"적용"}}
     }}}
@@ -466,34 +841,408 @@ pub(super) fn JournalDialog(mut model: Signal<AppModel>) -> Element {
     }
 }
 
-pub(super) fn start_drag(
+#[derive(serde::Deserialize)]
+struct DropPoint {
+    pane: usize,
+    generation: u64,
+    folder: String,
+    row: Option<usize>,
+    #[serde(rename = "rowPath")]
+    row_path: Option<String>,
+}
+
+struct DragFiles {
+    folder: NativePath,
+    paths: Vec<NativePath>,
+}
+
+pub(super) struct ArmedDrag {
+    id: u64,
+    source: DropPoint,
+    files: Option<DragFiles>,
+    capture: Option<sdir::drag::MouseGesture>,
+}
+
+#[derive(serde::Deserialize)]
+struct DropTab {
+    pane: usize,
+    index: usize,
+    folder: String,
+}
+
+impl DropTab {
+    fn resolve<'a>(&self, state: &'a AppModel) -> Option<&'a NativePath> {
+        let pane = (self.pane < state.layout).then(|| &state.panes[self.pane])?;
+        let path = &pane.tabs.get(self.index)?.path;
+        (path.display() == self.folder).then_some(path)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DropTarget {
+    List(DropPoint),
+    Tab(DropTab),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DragMessage {
+    Arm {
+        id: u64,
+        source: DropPoint,
+    },
+    Begin {
+        id: u64,
+    },
+    Cancel {
+        id: u64,
+    },
+    HoverTab {
+        id: u64,
+        tab: DropTab,
+    },
+    Release {
+        id: u64,
+        target: DropTarget,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    },
+}
+
+impl DropPoint {
+    fn resolve<'a>(
+        &self,
+        state: &'a AppModel,
+    ) -> Option<(&'a sdir::model::Tab, Option<&'a sdir::model::FileEntry>)> {
+        let pane = (self.pane < state.layout).then(|| &state.panes[self.pane])?;
+        let tab = pane.tab();
+        if pane.generation != self.generation || tab.path.display() != self.folder || !tab.loaded {
+            return None;
+        }
+        let entry = if let Some(row) = self.row {
+            let entry = tab
+                .visible
+                .get(row)
+                .and_then(|&index| tab.entries.get(index))?;
+            if self.row_path.as_deref() != Some(entry.path.display().as_str()) {
+                return None;
+            }
+            Some(entry)
+        } else {
+            None
+        };
+        Some((tab, entry))
+    }
+}
+
+pub(super) fn handle_drag(mut model: Signal<AppModel>, bridge: &Arc<Bridge>, message: &str) {
+    use sdir::drag::{CursorWindow, cursor_window};
+    let Ok(message) = serde_json::from_str::<DragMessage>(message) else {
+        return;
+    };
+    match message {
+        DragMessage::Arm { id, source } => {
+            let owner = app_window_handle();
+            let events = {
+                let mut state = model.write();
+                if state.closing
+                    || state.modal_open()
+                    || state.job.is_some()
+                    || !matches!(source.resolve(&state), Some((_, Some(_))))
+                {
+                    return;
+                }
+                state.file_drag = None;
+                let capture = if cursor_window(owner) == CursorWindow::Own {
+                    sdir::drag::MouseGesture::capture().ok().flatten()
+                } else {
+                    None
+                };
+                let events = capture.as_ref().map(sdir::drag::MouseGesture::events);
+                state.file_drag = Some(ArmedDrag {
+                    id,
+                    source,
+                    files: None,
+                    capture,
+                });
+                events
+            };
+            let Some(events) = events else {
+                return;
+            };
+            let bridge = bridge.clone();
+            spawn(async move {
+                while events.ready() {
+                    let other = cursor_window(owner) == CursorWindow::Other;
+                    let handoff = {
+                        let state = model.read();
+                        let Some(drag) = state.file_drag.as_ref().filter(|drag| drag.id == id)
+                        else {
+                            return;
+                        };
+                        if state.closing || state.modal_open() || state.job.is_some() {
+                            break;
+                        }
+                        other && drag.files.is_some()
+                    };
+                    if handoff {
+                        let Some(drag) = model.write().file_drag.take() else {
+                            return;
+                        };
+                        let (Some(files), Some(capture)) = (drag.files, drag.capture) else {
+                            return;
+                        };
+                        let _ = document::eval(&format!(
+                            "window.dispatchEvent(new CustomEvent('sdir-native-drag',{{detail:{id}}}));"
+                        ));
+                        start_drag(model, &bridge, drag.source, files, id, capture);
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                if let Some(drag) = model
+                    .write()
+                    .file_drag
+                    .as_mut()
+                    .filter(|drag| drag.id == id)
+                {
+                    drag.capture = None;
+                }
+            });
+        }
+        DragMessage::Begin { id } => {
+            let mut state = model.write();
+            let Some(drag) = state.file_drag.as_ref().filter(|drag| drag.id == id) else {
+                return;
+            };
+            if drag.files.is_some() || state.closing || state.modal_open() || state.job.is_some() {
+                return;
+            }
+            let Some((tab, Some(entry))) = drag.source.resolve(&state) else {
+                state.file_drag = None;
+                return;
+            };
+            // Keep the paths alive when hovering a tab replaces the source list.
+            let paths = if tab.selection.contains(&entry.path) {
+                tab.selection.iter().cloned().collect()
+            } else {
+                vec![entry.path.clone()]
+            };
+            let files = DragFiles {
+                folder: tab.path.clone(),
+                paths,
+            };
+            if let Some(drag) = &mut state.file_drag {
+                drag.files = Some(files);
+            }
+        }
+        DragMessage::HoverTab { id, tab } => {
+            let activate = {
+                let state = model.read();
+                !state.closing
+                    && !state.modal_open()
+                    && state.job.is_none()
+                    && state
+                        .file_drag
+                        .as_ref()
+                        .is_some_and(|drag| drag.id == id && drag.files.is_some())
+                    && tab.resolve(&state).is_some()
+                    && state.panes[tab.pane].active != tab.index
+            };
+            if activate {
+                change_tab(
+                    model,
+                    bridge,
+                    tab.pane,
+                    TabCommand::Select(tab.index),
+                    false,
+                );
+            }
+        }
+        DragMessage::Cancel { id } => {
+            let mut state = model.write();
+            if state.file_drag.as_ref().is_some_and(|drag| drag.id == id) {
+                state.file_drag = None;
+            }
+        }
+        DragMessage::Release {
+            id,
+            target,
+            ctrl,
+            shift,
+            alt,
+        } => {
+            let drag = {
+                let mut state = model.write();
+                if !state.file_drag.as_ref().is_some_and(|drag| drag.id == id) {
+                    return;
+                }
+                state.file_drag.take()
+            };
+            let Some(ArmedDrag {
+                source,
+                files: Some(files),
+                ..
+            }) = drag
+            else {
+                return;
+            };
+            if cursor_window(app_window_handle()) != CursorWindow::Own {
+                return;
+            }
+            drop_in_app(
+                model,
+                bridge,
+                source.pane,
+                files,
+                target,
+                (ctrl, shift, alt),
+            );
+        }
+    }
+}
+
+fn drop_in_app(
     mut model: Signal<AppModel>,
     bridge: &Bridge,
-    pane: usize,
-    path: NativePath,
+    source_pane: usize,
+    files: DragFiles,
+    target: DropTarget,
+    modifiers: (bool, bool, bool),
 ) {
-    let paths = {
-        let mut s = model.write();
-        if s.modal_open() || s.job.is_some() {
+    let (ctrl, shift, alt) = modifiers;
+    let (pane, destination, tab_to_select) = {
+        let state = model.read();
+        if state.closing || state.modal_open() || state.job.is_some() {
             return;
         }
-        s.active = pane;
-        s.interaction += 1;
-        if !s.panes[pane].tab().selection.contains(&path) {
-            s.panes[pane].select(path, false, false);
+        match target {
+            DropTarget::List(point) => {
+                let Some((tab, row)) = point.resolve(&state) else {
+                    return;
+                };
+                let destination = match row {
+                    Some(folder) if folder.is_dir => folder.path.clone(),
+                    Some(_) => return,
+                    None => tab.path.clone(),
+                };
+                (point.pane, destination, None)
+            }
+            DropTarget::Tab(tab) => {
+                let Some(path) = tab.resolve(&state) else {
+                    return;
+                };
+                let pane = tab.pane;
+                let select = (state.panes[pane].active != tab.index).then_some(tab.index);
+                (pane, path.clone(), select)
+            }
         }
-        s.selected()
     };
-    use dioxus::desktop::tao::platform::windows::WindowExtWindows;
-    focus_list(pane);
-    match bridge.utility(Utility::Drag(
-        paths,
-        dioxus::desktop::window().window.hwnd() as u64,
-    )) {
-        Err(e) => model.write().notice = e,
+    if alt || (ctrl && shift) {
+        if let Err(error) = bridge.utility(Utility::CreateShortcuts {
+            folder: destination,
+            paths: files.paths,
+        }) {
+            model.write().notice = error;
+        }
+        return;
+    }
+    let moving = shift || (!ctrl && sdir::drag::same_volume(&files.folder, &destination));
+    if moving && files.folder == destination {
+        return;
+    }
+    activate_pane(model, source_pane);
+    if let Some(index) = tab_to_select {
+        change_tab(model, bridge, pane, TabCommand::Select(index), false);
+    }
+    let sources = files.paths;
+    let action = if moving {
+        FileAction::Move {
+            sources,
+            destination,
+        }
+    } else {
+        FileAction::Copy {
+            sources,
+            destination,
+        }
+    };
+    submit_drop(model, bridge, pane, action);
+}
+
+fn submit_drop(model: Signal<AppModel>, bridge: &Bridge, pane: usize, action: FileAction) {
+    let requested = {
+        let state = model.read();
+        let target = PaneLocation::capture(&state, pane);
+        (action.destination().as_ref() == Some(&target.path)).then(|| PasteContext {
+            target,
+            origin: PaneLocation::capture(&state, state.active),
+            interaction: state.interaction,
+        })
+    };
+    submit_context(model, bridge, action, requested);
+}
+
+pub(super) fn drop_from_windows(
+    model: Signal<AppModel>,
+    bridge: &Bridge,
+    pane: usize,
+    destination: NativePath,
+    event: DragEvent,
+) {
+    event.prevent_default();
+    event.stop_propagation();
+    let sources: Vec<_> = event
+        .files()
+        .iter()
+        .map(|file| NativePath::new(file.path()))
+        .collect();
+    if !sources.is_empty() && !model.read().modal_open() {
+        submit_drop(
+            model,
+            bridge,
+            pane,
+            FileAction::Copy {
+                sources,
+                destination,
+            },
+        );
+    }
+}
+
+fn start_drag(
+    mut model: Signal<AppModel>,
+    bridge: &Bridge,
+    source: DropPoint,
+    files: DragFiles,
+    id: u64,
+    capture: sdir::drag::MouseGesture,
+) {
+    let events = capture.events();
+    if !events.ready() {
+        return;
+    }
+    let mut state = model.write();
+    if state.modal_open() || state.job.is_some() {
+        return;
+    }
+    if let Some((_, Some(entry))) = source.resolve(&state) {
+        let path = entry.path.clone();
+        state.active = source.pane;
+        state.interaction += 1;
+        let pane = &mut state.panes[source.pane];
+        if !pane.tab().selection.contains(&path) {
+            pane.select(path, false, false);
+        }
+        focus_list(source.pane);
+    }
+    match bridge.drag(id, files.paths, app_window_handle(), events) {
+        Err(error) => state.notice = error,
         Ok(()) => {
-            model.write().notice =
-                "파일을 복사할 대상에 놓으세요. Esc로 끌기를 취소할 수 있습니다.".into()
+            state.external_drag = Some((id, capture));
+            state.notice = "기본·Ctrl·오른쪽 드래그는 복사입니다. 이동은 SDIR 창 밖으로 커서를 옮기기 전에 Shift만 누르고 드롭 순간까지 유지해야 요청됩니다. Explorer 등 Shift 이동을 지원하는 OLE 파일 대상으로 드롭하세요. Esc로 취소할 수 있습니다.".into();
         }
     }
 }
@@ -505,6 +1254,7 @@ pub(super) fn tree_key(
     path: NativePath,
     expanded: bool,
 ) {
+    let path = sdir::tree::tree_key(path);
     e.stop_propagation();
     if model.read().modal_open() {
         return;
@@ -550,7 +1300,7 @@ pub(super) fn tree_key(
             Key::ArrowDown => rows.get((i + 1).min(rows.len().saturating_sub(1))).cloned(),
             Key::Home => rows.first().cloned(),
             Key::End => rows.last().cloned(),
-            Key::ArrowLeft => path.parent(),
+            Key::ArrowLeft => path.parent().map(sdir::tree::tree_key),
             Key::ArrowRight => s
                 .tree
                 .nodes
@@ -568,12 +1318,11 @@ pub(super) fn tree_key(
             .iter()
             .enumerate()
             .find(|(_, r)| r.path == target && r.message.is_none())
-            .map(|(i, r)| (i, r.depth));
-        if let Some((index, depth)) = row {
+            .map(|(i, _)| i);
+        if let Some(index) = row {
             model.write().tree_cursor = Some(target);
-            let indent = depth.min(16) * 13;
             let _ = document::eval(&format!(
-                "{{const tree=document.querySelector('.drive-tree');if(tree){{tree.scrollTop=Math.max(0,{index}*28-tree.clientHeight/2);tree.scrollLeft={indent};tree.focus({{preventScroll:true}});}}}}"
+                "{{const tree=document.querySelector('.drive-tree');if(tree){{tree.scrollTop=Math.max(0,{index}*28-tree.clientHeight/2);tree.focus({{preventScroll:true}});}}}}"
             ));
         }
     }
@@ -585,17 +1334,21 @@ pub(super) struct BackgroundRefresh {
     pub(super) entries: Vec<sdir::model::FileEntry>,
     renames: Vec<sdir::watch::Rename>,
 }
-pub(super) fn start_background(mut model: Signal<AppModel>, bridge: &Bridge, pane: usize) {
-    let request = {
+pub(super) fn start_background(mut model: Signal<AppModel>, bridge: &Bridge, pane: usize) -> u64 {
+    let (id, request) = {
         let mut s = model.write();
         s.watch_due[pane] = None;
-        let renames = std::mem::take(&mut s.watch_renames[pane]);
+        let generation = s.panes[pane].generation;
+        let mut renames = s.refreshes[pane]
+            .take()
+            .filter(|refresh| refresh.generation == generation)
+            .map_or_else(Vec::new, |refresh| refresh.renames);
+        renames.append(&mut s.watch_renames[pane]);
         let hidden = s.show_hidden;
-        let id = s.id().max(s.panes[pane].generation + 1);
+        let id = s.id().max(generation + 1);
         s.next_id = id + 1;
         let p = &mut s.panes[pane];
         p.loading = true;
-        let generation = p.generation;
         let path = p.tab().path.clone();
         s.refreshes[pane] = Some(BackgroundRefresh {
             id,
@@ -603,14 +1356,18 @@ pub(super) fn start_background(mut model: Signal<AppModel>, bridge: &Bridge, pan
             entries: vec![],
             renames,
         });
-        Request::List {
-            pane,
+        (
             id,
-            path,
-            hidden,
-        }
+            Request::List {
+                pane,
+                id,
+                path,
+                hidden,
+            },
+        )
     };
     bridge.panes[pane].replace(request);
+    id
 }
 pub(super) fn finish_background(
     mut model: Signal<AppModel>,
@@ -628,14 +1385,14 @@ pub(super) fn finish_background(
     }
     let p = &mut s.panes[pane];
     if let Some(e) = error {
-        p.finish(
+        p.finish_preserving_order(
             r.generation,
             Some(format!("갱신 실패 · 이전 목록 유지: {e}")),
         );
         return true;
     }
     let t = p.tab_mut();
-    t.entries = Arc::new(r.entries);
+    t.replace_entries_in_current_order(r.entries, &r.renames);
     for rename in r.renames {
         if t.selection.remove(&rename.from) {
             t.selection.insert(rename.to.clone());
@@ -647,7 +1404,7 @@ pub(super) fn finish_background(
             t.anchor = Some(rename.to);
         }
     }
-    p.finish(r.generation, None);
+    p.finish_preserving_order(r.generation, None);
     let t = p.tab_mut();
     let visible: BTreeSet<_> = t
         .visible
@@ -663,6 +1420,11 @@ pub(super) fn finish_background(
 }
 
 pub(super) fn dismiss_modal(mut model: Signal<AppModel>, bridge: &Bridge) {
+    let network_dialog = model.read().network_dialog;
+    if let Some(disconnect) = network_dialog {
+        close_network_dialog(model, disconnect);
+        return;
+    }
     if model.read().context.is_some() {
         close_context(model);
         return;
@@ -686,34 +1448,62 @@ pub(super) fn dismiss_modal(mut model: Signal<AppModel>, bridge: &Bridge) {
     };
     focus_list_after_render(model, pane);
 }
-fn context_keys(e: KeyboardEvent, model: Signal<AppModel>) {
-    e.stop_propagation();
-    if e.key() == Key::Escape {
-        e.prevent_default();
-        close_context(model);
-        return;
-    }
-    let delta = match e.key() {
-        Key::ArrowDown => 1,
-        Key::ArrowUp => -1,
-        Key::Tab => {
-            if e.modifiers().shift() {
-                -1
-            } else {
-                1
+fn context_keys(
+    event: KeyboardEvent,
+    model: Signal<AppModel>,
+    submenu: Signal<Option<&'static str>>,
+) {
+    event.stop_propagation();
+    let index = match event.key() {
+        Key::Escape | Key::ArrowLeft => {
+            event.prevent_default();
+            let opened = submenu.read().is_some();
+            if opened {
+                close_context_submenu(submenu);
+            } else if event.key() == Key::Escape {
+                close_context(model);
             }
+            return;
         }
-        Key::Home => -1000,
-        Key::End => 1000,
+        Key::ArrowRight => {
+            event.prevent_default();
+            let _ = document::eval(
+                r#"{
+                    const button = document.activeElement;
+                    if (button?.matches('.file-context-menu [aria-haspopup="menu"]')) {
+                        if (button.getAttribute('aria-expanded') === 'true') {
+                            button.nextElementSibling?.querySelector('button')?.focus();
+                        } else {
+                            button.click();
+                        }
+                    }
+                }"#,
+            );
+            return;
+        }
+        Key::ArrowDown => "(current + 1) % items.length",
+        Key::ArrowUp => "(current + items.length - 1) % items.length",
+        Key::Tab if event.modifiers().shift() => "(current + items.length - 1) % items.length",
+        Key::Tab => "(current + 1) % items.length",
+        Key::Home => "0",
+        Key::End => "items.length - 1",
         _ => return,
     };
-    e.prevent_default();
+    event.prevent_default();
     let _ = document::eval(&format!(
-        "{{const a=[...document.querySelectorAll('.file-context-menu button:not(:disabled)')],i=a.indexOf(document.activeElement);if(a.length)a[({delta}===1000?a.length-1:{delta}===-1000?0:(i+{delta}+a.length)%a.length)]?.focus();}}"
+        r#"{{
+            const active = document.activeElement;
+            const level = active?.dataset.menuLevel === 'sub' ? 'sub' : 'main';
+            const menu = document.querySelector('.file-context-menu');
+            const items = [...(menu?.querySelectorAll(`[data-menu-level="${{level}}"]:not(:disabled)`) ?? [])];
+            const current = items.indexOf(active);
+            if (items.length) items[{index}]?.focus();
+        }}"#,
     ));
 }
 
 pub(super) fn tree_navigate(mut model: Signal<AppModel>, bridge: &Bridge, path: NativePath) {
+    let path = sdir::tree::tree_key(path);
     model.write().tree_cursor = Some(path.clone());
     navigate(model, bridge, active_pane(model), path);
     model.write().pending_focus = None;

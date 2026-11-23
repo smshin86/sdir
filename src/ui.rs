@@ -1,9 +1,9 @@
-use dioxus::html::HasFileData;
+use dioxus::html::{Code, HasFileData};
 use dioxus::prelude::*;
 use sdir::{
     filesystem::readable_size,
     history::Record,
-    model::{FileAction, NativePath, Pane, SortColumn, ViewMode, sort_entries},
+    model::{FileAction, GroupBy, NativePath, Pane, SortColumn, ViewMode, sort_entries},
     platform,
     search::{IndexStatus, SearchHit, SearchResult},
     settings::{self, Settings, Theme, WindowPlacement, Workspace},
@@ -19,13 +19,17 @@ fn row_height(compact: bool) -> f64 {
     if compact { 30. } else { 38. }
 }
 mod extras;
+mod parity;
+use parity::*;
+#[path = "ui/lifecycle.rs"]
+mod lifecycle;
 use extras::*;
 const STYLE: &str = include_str!("style.css");
 #[derive(Clone)]
 enum Dialog {
     NewFolder,
-    Rename(NativePath),
     Recycle(Vec<NativePath>),
+    Delete(Vec<NativePath>),
 }
 #[derive(Clone)]
 struct PaneLocation {
@@ -52,6 +56,16 @@ impl PaneLocation {
             && self.path == p.tab().path
     }
 }
+#[derive(Clone)]
+struct InlineRename {
+    id: u64,
+    location: PaneLocation,
+    source: NativePath,
+    original: String,
+    draft: String,
+    interaction: u64,
+}
+
 #[derive(Clone)]
 struct PasteContext {
     target: PaneLocation,
@@ -87,6 +101,7 @@ struct PendingReveal {
     interaction: u64,
     focus: bool,
     preserve_scroll: Option<f64>,
+    from_search: bool,
 }
 #[derive(Clone)]
 struct FolderWatch {
@@ -94,13 +109,59 @@ struct FolderWatch {
     path: NativePath,
     ready: bool,
 }
+#[derive(Clone)]
+struct JobProgressStatus {
+    id: u64,
+    kind: &'static str,
+    message: String,
+    percent: Option<u8>,
+}
+fn job_progress_status(id: u64, action: &FileAction) -> Option<JobProgressStatus> {
+    let (sources, destination) = match action {
+        FileAction::Copy {
+            sources,
+            destination,
+        }
+        | FileAction::Move {
+            sources,
+            destination,
+        } => (sources, destination),
+        _ => return None,
+    };
+    let message = if sources.len() == 1 {
+        format!(
+            "{} 중 · {}개 · {} → {}",
+            action.label(),
+            sources.len(),
+            sources[0].name(),
+            destination.display()
+        )
+    } else {
+        format!(
+            "{} 중 · {}개 → {}",
+            action.label(),
+            sources.len(),
+            destination.display()
+        )
+    };
+    Some(JobProgressStatus {
+        id,
+        kind: action.label(),
+        message,
+        percent: None,
+    })
+}
 struct AppModel {
     panes: Vec<Pane>,
     pane_names: Vec<String>,
     theme: Theme,
     compact: bool,
+    action_bar_visible: bool,
     search_preferences: sdir::preferences::SearchPreferences,
     ntfs_indexing: sdir::index_policy::NtfsIndexingSettings,
+    resume_live_index: bool,
+    close_to_tray: bool,
+    start_on_login: bool,
     preferences_open: bool,
     workspaces_open: bool,
     workspaces: Vec<Workspace>,
@@ -117,7 +178,13 @@ struct AppModel {
     layout: usize,
     active: usize,
     favorites: Vec<NativePath>,
+    recent_files: Vec<NativePath>,
+    folder_visits: Vec<settings::FolderVisit>,
+    remember_activity: bool,
+    visited: [Option<NativePath>; 4],
     show_hidden: bool,
+    show_extensions: bool,
+    selection_checkboxes: bool,
     notice: String,
     utility_pid: Option<u32>,
     search_open: bool,
@@ -127,8 +194,20 @@ struct AppModel {
     index_id: u64,
     config_generation: u64,
     host_pid: Option<u32>,
-    config_pending: Option<(u64, u64, Option<u32>, sdir::index_policy::NtfsIndexingSettings)>,
-    pending_rebuild: Option<(u64, u64, u64, sdir::index_policy::VolumeGuid, Option<u32>, bool)>,
+    config_pending: Option<(
+        u64,
+        u64,
+        Option<u32>,
+        sdir::index_policy::NtfsIndexingSettings,
+    )>,
+    pending_rebuild: Option<(
+        u64,
+        u64,
+        u64,
+        sdir::index_policy::VolumeGuid,
+        Option<u32>,
+        bool,
+    )>,
     index: Option<IndexStatus>,
     index_starting: bool,
     search_live: bool,
@@ -144,12 +223,23 @@ struct AppModel {
     index_error: Option<String>,
     next_id: u64,
     job: Option<u64>,
+    job_status: Option<JobProgressStatus>,
     batch: Option<BatchDialog>,
     journal: Vec<sdir::journal::Entry>,
     journal_open: bool,
     appearance: Option<usize>,
     context: Option<ContextMenu>,
+    pending_context: Option<(u64, ContextMenu)>,
     dialog: Option<Dialog>,
+    inline_rename: Option<InlineRename>,
+    address_history: Option<usize>,
+    inspector: Option<Inspector>,
+    file_preview: Option<PreviewRequest>,
+    folder_search: Option<FolderSearch>,
+    network_dialog: Option<bool>,
+    thumbnails: BTreeMap<ThumbnailKey, Option<Arc<str>>>,
+    thumbnail_order: std::collections::VecDeque<ThumbnailKey>,
+    thumbnail_request: Option<(u64, Vec<ThumbnailKey>)>,
     copy_destination: Option<CopyDestination>,
     dialog_name: String,
     pastes: BTreeMap<u64, PasteContext>,
@@ -163,6 +253,8 @@ struct AppModel {
     clipboard_sequence: Option<u32>,
     clipboard_pending: Option<(u64, Vec<NativePath>, bool)>,
     reveal: BTreeMap<usize, PendingReveal>,
+    file_drag: Option<ArmedDrag>,
+    external_drag: Option<(u64, sdir::drag::MouseGesture)>,
     save_due: Option<Instant>,
     pending_focus: Option<(usize, u64)>,
     pending_focus_guarded: bool,
@@ -197,8 +289,12 @@ impl AppModel {
             pane_names,
             theme: s.theme,
             compact: s.compact,
+            action_bar_visible: s.action_bar_visible,
             search_preferences,
             ntfs_indexing: s.ntfs_indexing,
+            resume_live_index: s.resume_live_index,
+            close_to_tray: s.close_to_tray,
+            start_on_login: s.start_on_login,
             preferences_open: false,
             workspaces_open: false,
             workspaces,
@@ -215,7 +311,14 @@ impl AppModel {
             tree_follow: s.tree_follow,
             tree_seen: None,
             tree_tasks: {
-                let mut v = s.tree_expanded.into_iter().take(64).collect::<Vec<_>>();
+                let mut v = s
+                    .tree_expanded
+                    .into_iter()
+                    .map(sdir::tree::tree_key)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .take(64)
+                    .collect::<Vec<_>>();
                 v.sort_by_key(|p| p.to_path().components().count());
                 v.into_iter().map(|p| (p, true)).collect()
             },
@@ -223,7 +326,13 @@ impl AppModel {
             layout,
             active: s.active_pane.min(layout - 1),
             favorites: s.favorites,
+            recent_files: s.recent_files.into_iter().take(32).collect(),
+            folder_visits: s.folder_visits.into_iter().take(64).collect(),
+            remember_activity: s.remember_activity,
+            visited: Default::default(),
             show_hidden: s.show_hidden,
+            show_extensions: s.show_extensions,
+            selection_checkboxes: s.selection_checkboxes,
             notice: "준비됐습니다.".into(),
             utility_pid: None,
             search_open: false,
@@ -250,12 +359,23 @@ impl AppModel {
             index_error: None,
             next_id: 1,
             job: None,
+            job_status: None,
             batch: None,
             journal: vec![],
             journal_open: false,
             appearance: None,
             context: None,
+            pending_context: None,
             dialog: None,
+            inline_rename: None,
+            address_history: None,
+            inspector: None,
+            file_preview: None,
+            folder_search: None,
+            network_dialog: None,
+            thumbnails: BTreeMap::new(),
+            thumbnail_order: Default::default(),
+            thumbnail_request: None,
             copy_destination: None,
             dialog_name: String::new(),
             pastes: BTreeMap::new(),
@@ -269,6 +389,8 @@ impl AppModel {
             clipboard_sequence: None,
             clipboard_pending: None,
             reveal: BTreeMap::new(),
+            file_drag: None,
+            external_drag: None,
             save_due: None,
             pending_focus: Some((s.active_pane.min(layout - 1), 0)),
             pending_focus_guarded: false,
@@ -288,6 +410,8 @@ impl AppModel {
             || self.copy_destination.is_some()
             || self.preferences_open
             || self.workspaces_open
+            || self.folder_search.is_some()
+            || self.network_dialog.is_some()
     }
     fn id(&mut self) -> u64 {
         let n = self.next_id;
@@ -305,6 +429,41 @@ impl AppModel {
     fn path(&self) -> NativePath {
         self.panes[self.active].tab().path.clone()
     }
+    fn remember_folder(&mut self, pane: usize) {
+        if !self.remember_activity {
+            return;
+        }
+        let path = self.panes[pane].tab().path.clone();
+        let key = sdir::tree::tree_key(path.clone());
+        if self.visited[pane].as_ref() == Some(&key) {
+            return;
+        }
+        self.visited[pane] = Some(key.clone());
+        let existing = self
+            .folder_visits
+            .iter()
+            .position(|visit| sdir::tree::tree_key(visit.path.clone()) == key);
+        let count = existing.map_or(1, |index| {
+            self.folder_visits.remove(index).count.saturating_add(1)
+        });
+        self.folder_visits
+            .insert(0, settings::FolderVisit { path, count });
+        self.folder_visits.truncate(64);
+        self.dirty();
+    }
+
+    fn remember_open(&mut self, path: NativePath) {
+        if !self.remember_activity {
+            return;
+        }
+        let key = sdir::tree::tree_key(path.clone());
+        self.recent_files
+            .retain(|item| sdir::tree::tree_key(item.clone()) != key);
+        self.recent_files.insert(0, path);
+        self.recent_files.truncate(32);
+        self.dirty();
+    }
+
     fn dirty(&mut self) {
         self.save_due = Some(Instant::now() + Duration::from_millis(800));
     }
@@ -318,12 +477,21 @@ impl AppModel {
                 .map(|p| p.tabs.iter().map(|t| t.path.clone()).collect())
                 .collect(),
             favorites: self.favorites.clone(),
+            recent_files: self.recent_files.clone(),
+            folder_visits: self.folder_visits.clone(),
+            remember_activity: self.remember_activity,
             show_hidden: self.show_hidden,
+            show_extensions: self.show_extensions,
+            selection_checkboxes: self.selection_checkboxes,
             pane_names: self.pane_names.clone(),
             theme: self.theme,
             compact: self.compact,
+            action_bar_visible: self.action_bar_visible,
             search_preferences: self.search_preferences.clone(),
             ntfs_indexing: self.ntfs_indexing.clone(),
+            resume_live_index: self.resume_live_index,
+            close_to_tray: self.close_to_tray,
+            start_on_login: self.start_on_login,
             active_tabs: self.panes.iter().map(|p| p.active).collect(),
             active_pane: self.active,
             workspaces: self.workspaces.clone(),
@@ -367,7 +535,7 @@ impl AppModel {
             && self.index.is_some()
             && self.config_pending.is_none()
             && self.pending_rebuild.is_none())
-            .then(|| Instant::now() + Duration::from_millis(180));
+        .then(|| Instant::now() + Duration::from_millis(180));
     }
 
     fn submit_query(&mut self) {
@@ -379,7 +547,7 @@ impl AppModel {
         self.query_due = (self.index.is_some()
             && self.config_pending.is_none()
             && self.pending_rebuild.is_none())
-            .then(Instant::now);
+        .then(Instant::now);
     }
 
     fn set_search_preferences(&mut self, mut value: sdir::preferences::SearchPreferences) {
@@ -394,21 +562,40 @@ impl AppModel {
 }
 
 pub fn launch() {
-    use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
+    let login_start = std::env::args().any(|arg| arg == "--login-start");
+    if matches!(lifecycle::claim_window(login_start), Ok(false)) {
+        return;
+    }
+    let settings = settings::load();
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(window_config(settings.window.as_ref(), false))
+        .launch(app);
+}
+
+#[derive(Clone)]
+struct IndependentWindow(NativePath);
+
+fn window_config(
+    placement: Option<&WindowPlacement>,
+    independent: bool,
+) -> dioxus::desktop::Config {
     use dioxus::desktop::tao::{
         platform::windows::{IconExtWindows, WindowBuilderExtWindows},
         window::Icon,
     };
+    use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
     let icon = Icon::from_resource(101, None).ok();
-    let placement = settings::load().window;
     let size = placement
-        .as_ref()
         .map(|p| (p.width.clamp(980., 16384.), p.height.clamp(580., 16384.)))
         .unwrap_or((1380., 880.));
     let mut config = Config::new()
         .with_window(
             WindowBuilder::new()
-                .with_title("SDIR · 가벼운 파일 작업공간")
+                .with_title(if independent {
+                    "SDIR · 새 창"
+                } else {
+                    "SDIR · 가벼운 파일 작업공간"
+                })
                 .with_inner_size(LogicalSize::new(size.0, size.1))
                 .with_min_inner_size(LogicalSize::new(980., 580.))
                 .with_window_icon(icon.clone())
@@ -422,9 +609,12 @@ pub fn launch() {
             config = config.with_windows_browser_args(format!("--remote-debugging-port={port}"));
         }
     }
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(config)
-        .launch(app);
+    config
+}
+
+fn new_window(path: NativePath) {
+    let dom = VirtualDom::new(app).with_root_context(IndependentWindow(path));
+    dioxus::desktop::window().new_window(dom, window_config(None, true));
 }
 fn active_pane(model: Signal<AppModel>) -> usize {
     model.read().active
@@ -433,6 +623,7 @@ fn activate_pane(mut model: Signal<AppModel>, pane: usize) {
     let mut s = model.write();
     if s.active != pane {
         s.active = pane;
+        s.address_history = None;
         s.pending_focus = None;
         s.dirty();
     }
@@ -465,11 +656,27 @@ fn load(mut model: Signal<AppModel>, bridge: &Bridge, pane: usize) {
     let (id, path, hidden) = {
         let mut s = model.write();
         s.reveal.remove(&pane);
+        if s.address_history == Some(pane) {
+            s.address_history = None;
+        }
+        if s.inline_rename
+            .as_ref()
+            .is_some_and(|edit| edit.location.pane == pane)
+        {
+            s.inline_rename = None;
+        }
         if let Some(r) = s.refreshes[pane].take() {
             s.panes[pane].generation = s.panes[pane].generation.max(r.id);
         }
         let hidden = s.show_hidden;
         let p = &mut s.panes[pane];
+        if matches!(p.view, ViewMode::Icons | ViewMode::Tiles) {
+            let tab = p.tab_mut();
+            tab.group_by = GroupBy::None;
+            if let Some(saved) = tab.resume.as_mut() {
+                saved.group_by = GroupBy::None;
+            }
+        }
         let id = p.begin_load();
         (id, p.tab().path.clone(), hidden)
     };
@@ -511,7 +718,16 @@ fn navigate(mut model: Signal<AppModel>, bridge: &Bridge, pane: usize, path: Nat
     load(model, bridge, pane);
     focus_list_after_render(model, pane);
 }
-fn reveal_hit(mut model: Signal<AppModel>, bridge: &Bridge, hit: SearchHit) {
+fn reveal_hit(model: Signal<AppModel>, bridge: &Bridge, hit: SearchHit) {
+    reveal_hit_in(model, bridge, hit, None);
+}
+
+fn reveal_hit_in(
+    mut model: Signal<AppModel>,
+    bridge: &Bridge,
+    hit: SearchHit,
+    target: Option<usize>,
+) {
     if hit.volume_guid.is_some() || hit.volume_mount.is_some() {
         let matches = match (&hit.volume_guid, &hit.volume_mount) {
             (Some(guid), Some(mount)) => sdir::live_search::result_mount_matches(guid, mount),
@@ -522,30 +738,39 @@ fn reveal_hit(mut model: Signal<AppModel>, bridge: &Bridge, hit: SearchHit) {
             state.query_id += 1;
             state.result = None;
             state.query_loading = false;
-            state.search_error = Some(
-                "드라이브가 바뀌어 검색 결과를 다시 확인하고 있습니다.".into(),
-            );
-            state.query_due = (state.search_live
-                && state.query_requested
-                && !state.query.is_empty())
-                .then(Instant::now);
+            state.search_error =
+                Some("드라이브가 바뀌어 검색 결과를 다시 확인하고 있습니다.".into());
+            state.query_due =
+                (state.search_live && state.query_requested && !state.query.is_empty())
+                    .then(Instant::now);
             return;
         }
     }
     let path = hit.path;
     let pane = {
         let state = model.read();
-        state
-            .search_target
+        target
+            .or(state.search_target)
             .filter(|&target| target < state.layout)
             .unwrap_or(state.active)
     };
     if let Some(parent) = path.parent() {
-        model.write().search_expanded = false;
-        navigate(model, bridge, pane, parent);
+        {
+            let mut state = model.write();
+            if !state.panes[pane].new_tab_at(parent) {
+                state.search_error =
+                    Some("대상 패널의 탭이 16개입니다. 탭을 닫은 뒤 다시 시도하세요.".into());
+                return;
+            }
+            state.search_error = None;
+            state.search_expanded = false;
+            state.active = pane;
+            state.dirty();
+        }
+        release_edit_focus(pane);
+        load(model, bridge, pane);
+        focus_list_after_render(model, pane);
         let mut state = model.write();
-        state.active = pane;
-        state.panes[pane].tab_mut().set_filter(String::new());
         let generation = state.panes[pane].generation;
         let interaction = state.interaction;
         state.reveal.insert(
@@ -556,6 +781,7 @@ fn reveal_hit(mut model: Signal<AppModel>, bridge: &Bridge, hit: SearchHit) {
                 interaction,
                 focus: true,
                 preserve_scroll: None,
+                from_search: true,
             },
         );
     }
@@ -596,7 +822,9 @@ fn submit_context(
         });
         let mut folders: Vec<_> = destination.into_iter().collect();
         match &action {
-            FileAction::Move { sources, .. } | FileAction::Recycle { sources } => {
+            FileAction::Move { sources, .. }
+            | FileAction::Recycle { sources }
+            | FileAction::Delete { sources } => {
                 folders.extend(sources.iter().filter_map(NativePath::parent))
             }
             FileAction::Rename { source, .. } => folders.extend(source.parent()),
@@ -623,10 +851,12 @@ fn submit_context(
         }
     };
     let id = model.write().id();
+    let status = job_progress_status(id, &action);
     match bridge.job(Request::Job { id, action }) {
         Ok(()) => {
             let mut s = model.write();
             s.job = Some(id);
+            s.job_status = status;
             s.job_context = Some(context);
             s.notice =
                 "Windows에서 파일을 처리하고 있습니다. 취소는 Windows 진행 창에서 할 수 있습니다."
@@ -847,19 +1077,41 @@ fn start_index(mut model: Signal<AppModel>, bridge: &Bridge) {
         let mut s = model.write();
         let id = s.id();
         reset_volume_session(&mut s, id, false);
+        s.resume_live_index = false;
+        s.save_due = Some(Instant::now());
         (id, s.path())
     };
     bridge.search.replace(Request::Index { id, root });
 }
 
-fn start_volume_index(mut model: Signal<AppModel>, bridge: &Bridge, memory_mib: u16) {
+fn start_volume_index(
+    mut model: Signal<AppModel>,
+    bridge: &Bridge,
+    memory_mib: u16,
+    service_only: bool,
+) {
+    if try_consume_context::<IndependentWindow>().is_some() {
+        model.write().notice = "전체 드라이브 색인 설정은 처음 연 SDIR 창에서 변경하세요.".into();
+        return;
+    }
     let (id, settings) = {
         let mut s = model.write();
         let id = s.id();
+        let search_open = s.search_open;
         reset_volume_session(&mut s, id, true);
+        if service_only {
+            s.search_open = search_open;
+        }
+        // Retain the persistent policy after the user has first requested live search.
+        let _ = s.ntfs_indexing.set_persistent(true);
         (id, Box::new(s.ntfs_indexing.clone()))
     };
-    bridge.search.replace(Request::IndexVolumes { id, memory_mib, settings });
+    bridge.search.replace(Request::IndexVolumes {
+        id,
+        memory_mib,
+        service_only,
+        settings,
+    });
 }
 
 fn apply_index_settings(
@@ -904,7 +1156,11 @@ fn apply_index_settings(
         s.search_error = None;
         s.index_error = None;
         s.config_pending = Some((s.index_id, generation, Some(host_pid), settings.clone()));
-        Request::Configure { session: s.index_id, generation, settings: Box::new(settings) }
+        Request::Configure {
+            session: s.index_id,
+            generation,
+            settings: Box::new(settings),
+        }
     };
     if let Err(error) = bridge.search.send(command) {
         let mut s = model.write();
@@ -947,9 +1203,14 @@ fn configure_volume(
 ) {
     let mut settings = model.read().ntfs_indexing.clone();
     let current = settings.volume_policy(&guid);
-    let next_mode = mode.unwrap_or_else(|| current.map_or(sdir::index_policy::VolumeOverride::Auto, |p| p.mode()));
+    let next_mode = mode
+        .unwrap_or_else(|| current.map_or(sdir::index_policy::VolumeOverride::Auto, |p| p.mode()));
     let next_monitor = monitor.unwrap_or_else(|| current.map_or(true, |p| p.monitor()));
-    let next_scope = scope.unwrap_or_else(|| current.map_or_else(sdir::index_policy::ScopePolicy::default, |p| p.scope().clone()));
+    let next_scope = scope.unwrap_or_else(|| {
+        current.map_or_else(sdir::index_policy::ScopePolicy::default, |p| {
+            p.scope().clone()
+        })
+    });
     let result = if next_mode == sdir::index_policy::VolumeOverride::Auto
         && next_monitor
         && next_scope.include_roots().is_empty()
@@ -958,7 +1219,10 @@ fn configure_volume(
         settings.remove_volume_policy(&guid).map(|_| ())
     } else {
         settings.set_volume_policy(sdir::index_policy::VolumePolicy::new(
-            guid, next_mode, next_monitor, next_scope,
+            guid,
+            next_mode,
+            next_monitor,
+            next_scope,
         ))
     };
     if let Err(error) = result {
@@ -969,12 +1233,14 @@ fn configure_volume(
 }
 
 fn scope_roots_text(roots: &[sdir::index_policy::RelativePathRoot]) -> String {
-    roots.iter().map(|root| root.as_str()).collect::<Vec<_>>().join("\n")
+    roots
+        .iter()
+        .map(|root| root.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn parse_scope_roots(
-    text: &str,
-) -> Result<Vec<sdir::index_policy::RelativePathRoot>, String> {
+fn parse_scope_roots(text: &str) -> Result<Vec<sdir::index_policy::RelativePathRoot>, String> {
     text.lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
@@ -1082,8 +1348,20 @@ fn rebuild_volume(
         s.result = None;
         s.search_error = None;
         s.index_error = None;
-        s.pending_rebuild = Some((session, generation, request_id, guid.clone(), Some(host_pid), false));
-        Request::Rebuild { session, generation, request_id, guid }
+        s.pending_rebuild = Some((
+            session,
+            generation,
+            request_id,
+            guid.clone(),
+            Some(host_pid),
+            false,
+        ));
+        Request::Rebuild {
+            session,
+            generation,
+            request_id,
+            guid,
+        }
     };
     if let Err(error) = bridge.search.send(command) {
         let mut s = model.write();
@@ -1101,11 +1379,8 @@ fn dialog(mut model: Signal<AppModel>, kind: &str) {
             s.dialog = Some(Dialog::NewFolder);
             s.dialog_name = "새 폴더".into();
         }
-        "rename" if selection.len() == 1 => {
-            s.dialog_name = selection[0].name();
-            s.dialog = Some(Dialog::Rename(selection[0].clone()));
-        }
         "recycle" if !selection.is_empty() => s.dialog = Some(Dialog::Recycle(selection)),
+        "delete" if !selection.is_empty() => s.dialog = Some(Dialog::Delete(selection)),
         _ => s.notice = "작업할 항목을 선택하세요.".into(),
     }
 }
@@ -1116,19 +1391,170 @@ fn confirm(model: Signal<AppModel>, bridge: &Bridge) {
             destination: s.path(),
             name: s.dialog_name.clone(),
         },
-        Some(Dialog::Rename(source)) => FileAction::Rename {
-            source,
-            name: s.dialog_name.clone(),
-        },
         Some(Dialog::Recycle(sources)) => FileAction::Recycle { sources },
+        Some(Dialog::Delete(sources)) => FileAction::Delete { sources },
         None => return,
     };
     drop(s);
     submit(model, bridge, action);
 }
-fn sort(mut model: Signal<AppModel>, pane: usize, column: SortColumn) {
+fn start_inline_rename(mut model: Signal<AppModel>) {
+    let (pane, position) = {
+        let mut state = model.write();
+        if state.modal_open() || state.job.is_some() || state.closing {
+            return;
+        }
+        let pane = state.active;
+        let tab = state.panes[pane].tab();
+        let mut selected = tab.selection.iter();
+        let (Some(path), None) = (selected.next(), selected.next()) else {
+            state.notice = "이름을 바꿀 항목 하나를 선택하세요.".into();
+            return;
+        };
+        let Some(position) = tab
+            .visible
+            .iter()
+            .position(|&index| tab.entries[index].path == *path)
+        else {
+            return;
+        };
+        let original = tab.entries[tab.visible[position]].name.clone();
+        let source = path.clone();
+        let location = PaneLocation::capture(&state, pane);
+        let id = state.id();
+        state.pending_focus = None;
+        state.inline_rename = Some(InlineRename {
+            id,
+            location,
+            source,
+            draft: original.clone(),
+            original,
+            interaction: state.interaction,
+        });
+        (pane, position)
+    };
+    scroll_selection(model, pane, position);
+}
+
+fn cancel_inline_rename(mut model: Signal<AppModel>, id: u64, return_focus: bool) {
+    let pane = {
+        let mut state = model.write();
+        let Some(edit) = state.inline_rename.as_ref().filter(|edit| edit.id == id) else {
+            return;
+        };
+        let pane = edit.location.pane;
+        state.inline_rename = None;
+        pane
+    };
+    if return_focus {
+        focus_list(pane);
+    }
+}
+
+fn confirm_inline_rename(mut model: Signal<AppModel>, bridge: &Bridge, id: u64) {
+    let Some(edit) = model
+        .read()
+        .inline_rename
+        .as_ref()
+        .filter(|edit| edit.id == id)
+        .cloned()
+    else {
+        return;
+    };
+    let valid_target = {
+        let state = model.read();
+        edit.location.matches(&state)
+            && state.active == edit.location.pane
+            && !state.modal_open()
+            && !state.closing
+            && state.panes[edit.location.pane]
+                .tab()
+                .entries
+                .iter()
+                .any(|entry| entry.path == edit.source)
+    };
+    if !valid_target || edit.draft == edit.original {
+        cancel_inline_rename(model, id, valid_target);
+        return;
+    }
+    if let Err(error) = sdir::filesystem::validate_name(&edit.draft) {
+        model.write().notice = error;
+        return;
+    }
+    cancel_inline_rename(model, id, true);
+    submit(
+        model,
+        bridge,
+        FileAction::Rename {
+            source: edit.source,
+            name: edit.draft,
+        },
+    );
+}
+
+fn inline_rename_editor(
+    mut model: Signal<AppModel>,
+    bridge: Arc<Bridge>,
+    edit: &InlineRename,
+    is_dir: bool,
+) -> Element {
+    let id = edit.id;
+    let name = edit.original.clone();
+    let stem = if is_dir {
+        name.as_str()
+    } else {
+        std::path::Path::new(&name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(&name)
+    };
+    let select_end = stem.encode_utf16().count();
+    rsx! {
+        input {
+            key: "{id}", id: "inline-rename-{id}", class: "inline-rename-input",
+            "aria-label": "파일 또는 폴더 이름", spellcheck: false, initial_value: "{name}",
+            onmounted: move |_| {
+                let state = model.read();
+                if let Some(current) = state.inline_rename.as_ref().filter(|edit| edit.id == id) {
+                    if current.location.matches(&state) && current.interaction == state.interaction {
+                        let _ = document::eval(&format!(
+                            "{{const e=document.getElementById('inline-rename-{id}');e?.focus({{preventScroll:true}});e?.setSelectionRange(0,{select_end});}}"
+                        ));
+                    }
+                }
+            },
+            onchange: move |event| {
+                event.stop_propagation();
+                if let Some(edit) = model.write().inline_rename.as_mut().filter(|edit| edit.id == id) {
+                    edit.draft = event.value();
+                }
+            },
+            onblur: move |_| cancel_inline_rename(model, id, false),
+            onclick: move |event| event.stop_propagation(),
+            ondoubleclick: move |event| event.stop_propagation(),
+            oncontextmenu: move |event| event.stop_propagation(),
+            onkeydown: move |event: KeyboardEvent| {
+                event.stop_propagation();
+                if event.is_composing() { return; }
+                match event.key() {
+                    Key::Enter => { event.prevent_default(); confirm_inline_rename(model, &bridge, id); }
+                    Key::Escape => { event.prevent_default(); cancel_inline_rename(model, id, true); }
+                    _ => {}
+                }
+            },
+        }
+    }
+}
+
+fn sort(model: Signal<AppModel>, pane: usize, column: SortColumn) {
+    let tab = model.read().panes[pane].active;
+    sort_tab(model, pane, tab, column);
+}
+fn sort_tab(mut model: Signal<AppModel>, pane: usize, tab: usize, column: SortColumn) {
     let mut s = model.write();
-    let t = s.panes[pane].tab_mut();
+    let Some(t) = s.panes.get_mut(pane).and_then(|p| p.tabs.get_mut(tab)) else {
+        return;
+    };
     if t.sort == column {
         t.descending = !t.descending;
     } else {
@@ -1141,6 +1567,24 @@ fn sort(mut model: Signal<AppModel>, pane: usize, column: SortColumn) {
         t.descending,
     );
     t.rebuild_visible();
+    s.active = pane;
+    s.dirty();
+}
+fn sort_direction_tab(mut model: Signal<AppModel>, pane: usize, tab: usize, descending: bool) {
+    let mut s = model.write();
+    let Some(t) = s.panes.get_mut(pane).and_then(|p| p.tabs.get_mut(tab)) else {
+        return;
+    };
+    if t.descending != descending {
+        t.descending = descending;
+        sort_entries(
+            Arc::make_mut(&mut t.entries).as_mut_slice(),
+            t.sort,
+            t.descending,
+        );
+        t.rebuild_visible();
+    }
+    s.active = pane;
     s.dirty();
 }
 fn focus_list(pane: usize) {
@@ -1249,17 +1693,39 @@ fn focus_list_after_render(mut model: Signal<AppModel>, pane: usize) {
     s.pending_focus_guarded = false;
 }
 
-fn history_navigation(mut model: Signal<AppModel>, bridge: &Bridge, pane: usize, forward: bool) {
-    let changed = if forward {
-        model.write().panes[pane].forward()
-    } else {
-        model.write().panes[pane].back()
+fn history_navigation(model: Signal<AppModel>, bridge: &Bridge, pane: usize, forward: bool) {
+    let tab = model.read().panes[pane].active;
+    history_navigation_tab(model, bridge, pane, tab, forward);
+}
+fn history_navigation_tab(
+    mut model: Signal<AppModel>,
+    bridge: &Bridge,
+    pane: usize,
+    tab: usize,
+    forward: bool,
+) {
+    let previous_pane = active_pane(model);
+    let changed = {
+        let mut s = model.write();
+        let changed = match s.panes.get_mut(pane) {
+            Some(pane) if pane.active == tab => {
+                if forward {
+                    pane.forward()
+                } else {
+                    pane.back()
+                }
+            }
+            _ => false,
+        };
+        if changed {
+            s.active = pane;
+            s.dirty();
+        }
+        changed
     };
     if changed {
-        release_edit_focus(active_pane(model));
+        release_edit_focus(previous_pane);
         release_edit_focus(pane);
-        model.write().active = pane;
-        model.write().dirty();
         load(model, bridge, pane);
         focus_list_after_render(model, pane);
     }
@@ -1281,6 +1747,12 @@ fn mouse_history(event: MouseEvent, model: Signal<AppModel>, bridge: &Bridge, pa
     history_navigation(model, bridge, pane, forward);
 }
 
+fn focus_address(pane: usize) {
+    let _ = document::eval(&format!(
+        "{{const e=document.getElementById('address-{pane}');e?.focus();e?.select();}}"
+    ));
+}
+
 fn pane_shortcut(
     event: &KeyboardEvent,
     mut model: Signal<AppModel>,
@@ -1293,6 +1765,20 @@ fn pane_shortcut(
     let control = event.modifiers().ctrl();
     let key = event.key();
     let alt = event.modifiers().alt();
+    if key == Key::F11 {
+        event.prevent_default();
+        event.stop_propagation();
+        let window = dioxus::desktop::window();
+        window.set_fullscreen(window.fullscreen().is_none());
+        return true;
+    }
+    if key == Key::F6 && !control {
+        event.prevent_default();
+        event.stop_propagation();
+        let reverse = event.modifiers().shift();
+        let _ = document::eval(&format!("window.__sdirCycleFocus?.({reverse});"));
+        return true;
+    }
     if key == Key::F6 {
         event.prevent_default();
         event.stop_propagation();
@@ -1324,18 +1810,56 @@ fn pane_shortcut(
         }
         return true;
     }
+    if alt && char_key("p") {
+        event.prevent_default();
+        event.stop_propagation();
+        let mode = if event.modifiers().shift() {
+            Inspector::Details
+        } else {
+            Inspector::Preview
+        };
+        let mut s = model.write();
+        s.inspector = (s.inspector != Some(mode)).then_some(mode);
+        return true;
+    }
     if alt && key == Key::Enter {
         event.prevent_default();
         event.stop_propagation();
-        let path = model
-            .read()
-            .selected()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| model.read().panes[pane].tab().path.clone());
-        if let Err(error) = bridge.properties(path) {
+        let (folder, paths) = {
+            let state = model.read();
+            let tab = state.panes[pane].tab();
+            (
+                tab.path.clone(),
+                tab.selection.iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+        if let Err(error) = selected_properties(bridge, folder, paths) {
             model.write().notice = error;
         }
+        return true;
+    }
+    if control && event.modifiers().shift() && char_key("e") {
+        event.prevent_default();
+        event.stop_propagation();
+        let mut state = model.write();
+        let path = sdir::tree::tree_key(state.panes[pane].tab().path.clone());
+        state.tree.open = true;
+        state.tree_cursor = Some(path.clone());
+        state.tree_tasks.push_front((path, false));
+        state.tree_tasks.truncate(65);
+        state.dirty();
+        return true;
+    }
+    if control && event.code() == Code::NumpadAdd {
+        event.prevent_default();
+        event.stop_propagation();
+        fit_columns(model, pane);
+        return true;
+    }
+    if control && !event.modifiers().shift() && char_key("n") {
+        event.prevent_default();
+        event.stop_propagation();
+        new_window(model.read().panes[pane].tab().path.clone());
         return true;
     }
     if control && event.modifiers().shift() && char_key("n") {
@@ -1345,21 +1869,24 @@ fn pane_shortcut(
         dialog(model, "new");
         return true;
     }
-    if control
-        && event.modifiers().shift()
-        && matches!(&key,Key::Character(c) if ["2","5","6"].contains(&c.as_str()))
-    {
-        event.prevent_default();
-        event.stop_propagation();
-        let value = if char_key("2") {
-            "icons"
-        } else if char_key("5") {
-            "list"
-        } else {
-            "details"
+    if control && event.modifiers().shift() {
+        let value = match event.code() {
+            Code::Digit1 => Some("icons-192"),
+            Code::Digit2 => Some("icons-144"),
+            Code::Digit3 => Some("icons-112"),
+            Code::Digit4 => Some("icons-80"),
+            Code::Digit5 => Some("list"),
+            Code::Digit6 => Some("details"),
+            Code::Digit7 => Some("tiles"),
+            Code::Digit8 => Some("content"),
+            _ => None,
         };
-        set_view(model, pane, value);
-        return true;
+        if let Some(value) = value {
+            event.prevent_default();
+            event.stop_propagation();
+            set_view(model, pane, value);
+            return true;
+        }
     }
 
     if key == Key::F5 || (control && char_key("r")) {
@@ -1391,7 +1918,21 @@ fn pane_shortcut(
             TabCommand::New
         })
     } else if control && matches!(&key, Key::Character(c) if c.eq_ignore_ascii_case("w")) {
-        Some(TabCommand::Close(model.read().panes[pane].active))
+        let (close_window, tab) = {
+            let state = model.read();
+            let p = &state.panes[pane];
+            (
+                state.layout == 1 && p.tabs.len() == 1 && !p.tab().pinned,
+                p.active,
+            )
+        };
+        if close_window {
+            event.prevent_default();
+            event.stop_propagation();
+            lifecycle::request_close(&dioxus::desktop::window());
+            return true;
+        }
+        Some(TabCommand::Close(tab))
     } else if control && key == Key::Tab {
         let s = model.read();
         let p = &s.panes[pane];
@@ -1410,18 +1951,47 @@ fn pane_shortcut(
         change_tab(model, bridge, pane, command, true);
         return true;
     }
-    if (control && char_key("l")) || (alt && char_key("d")) {
-        model.write().pending_focus = None;
+    if key == Key::F4 || (control && char_key("l")) || (alt && char_key("d")) {
+        let mut state = model.write();
+        state.pending_focus = None;
+        state.address_history =
+            (key == Key::F4 && state.address_history != Some(pane)).then_some(pane);
+        drop(state);
         event.prevent_default();
         event.stop_propagation();
-        let _ = document::eval(&format!(
-            "document.getElementById('address-{pane}')?.focus();document.getElementById('address-{pane}')?.select();"
-        ));
+        focus_address(pane);
         return true;
     }
-    if (control && (char_key("f") || (char_key("e") && !event.modifiers().shift())))
-        || key == Key::F3
-    {
+    if model.read().address_history == Some(pane) {
+        match key {
+            Key::Escape => {
+                event.prevent_default();
+                event.stop_propagation();
+                model.write().address_history = None;
+                focus_address(pane);
+                return true;
+            }
+            Key::ArrowDown | Key::ArrowUp if !control && !alt => {
+                event.prevent_default();
+                event.stop_propagation();
+                let step = if key == Key::ArrowDown { 1 } else { -1 };
+                let _ = document::eval(&format!(
+                    "{{const b=[...document.querySelectorAll('[data-pane=\"{pane}\"] .address-history button')];const i=b.indexOf(document.activeElement);b[i<0?({step}>0?0:b.length-1):(i+b.length+{step})%b.length]?.focus();}}"
+                ));
+                return true;
+            }
+            _ => {}
+        }
+    }
+    if (control && !event.modifiers().shift() && char_key("f")) || key == Key::F3 {
+        event.prevent_default();
+        event.stop_propagation();
+        if !model.read().modal_open() {
+            open_folder_search(model, bridge, pane);
+        }
+        return true;
+    }
+    if control && (char_key("f") || (char_key("e") && !event.modifiers().shift())) {
         event.prevent_default();
         event.stop_propagation();
         model.write().pending_focus = None;
@@ -1444,6 +2014,31 @@ fn pane_shortcut(
     }
     false
 }
+const PANE_VIEW_OPTIONS: [(&str, &str, &str); 8] = [
+    ("icons-192", "view_icons-192", "아주 큰 아이콘"),
+    ("icons-144", "view_icons-144", "큰 아이콘"),
+    ("icons-112", "view_icons-112", "보통 아이콘"),
+    ("icons-80", "view_icons-80", "작은 아이콘"),
+    ("list", "view_list", "목록"),
+    ("details", "view_details", "자세히"),
+    ("tiles", "view_tiles", "타일"),
+    ("content", "view_content", "내용"),
+];
+
+fn pane_view_option(view: ViewMode, size: u16) -> &'static str {
+    if view == ViewMode::Icons {
+        match size {
+            192 => "icons-192",
+            144 => "icons-144",
+            112 => "icons-112",
+            80 => "icons-80",
+            _ => "icons",
+        }
+    } else {
+        view.value()
+    }
+}
+
 fn set_view(mut model: Signal<AppModel>, pane: usize, value: &str) {
     let mut s = model.write();
     s.interaction += 1;
@@ -1451,16 +2046,152 @@ fn set_view(mut model: Signal<AppModel>, pane: usize, value: &str) {
     let p = &mut s.panes[pane];
     p.view = match value {
         "list" => ViewMode::List,
+        "tiles" => ViewMode::Tiles,
+        "content" => ViewMode::Content,
         "icons" => ViewMode::Icons,
+        "icons-192" | "icons-144" | "icons-112" | "icons-80" => {
+            p.icon_size = value[6..].parse().expect("icon preset is numeric");
+            ViewMode::Icons
+        }
         _ => ViewMode::Details,
     };
+    if matches!(p.view, ViewMode::Icons | ViewMode::Tiles) && p.tab().group_by != GroupBy::None {
+        let tab = p.tab_mut();
+        tab.group_by = GroupBy::None;
+        tab.rebuild_visible();
+    }
     let geometry = p.geometry(compact);
     let position = p.tab().cursor_position();
-    p.tab_mut().scroll = position.map_or(0., |position| geometry.row_top(position));
+    p.tab_mut().scroll = position.map_or(0., |position| {
+        geometry.row_top(p.tab().render_position(position))
+    });
     s.active = pane;
     s.pending_focus = Some((pane, s.interaction));
     s.dirty();
 }
+fn fit_columns(mut model: Signal<AppModel>, pane: usize) {
+    fn width(text: &str, padding: u16) -> u16 {
+        text.chars().take(100).fold(padding, |width, ch| {
+            width
+                + if ch.is_ascii() {
+                    if matches!(ch, 'M' | 'W' | '@') { 12 } else { 8 }
+                } else {
+                    14
+                }
+        })
+    }
+    let mut state = model.write();
+    let pane = &mut state.panes[pane];
+    if pane.view != ViewMode::Details {
+        return;
+    }
+    let mut widths = [120, 65, 58, 145];
+    let tab = pane.tab();
+    for &index in tab.visible.iter() {
+        let entry = &tab.entries[index];
+        widths[0] = widths[0].max(width(&entry.name, 43));
+        widths[1] = widths[1].max(width(&readable_size(entry.bytes), 23));
+        if let Some(extension) = std::path::Path::new(&entry.name).extension() {
+            widths[2] = widths[2].max(width(&extension.to_string_lossy(), 49));
+        }
+    }
+    for (index, width) in widths.into_iter().enumerate() {
+        pane.columns.resize(index, width);
+    }
+    state.dirty();
+}
+
+fn zoom_icons(model: Signal<AppModel>, pane: usize, larger: bool) {
+    let presets = ["details", "icons-80", "icons-112", "icons-144", "icons-192"];
+    let next = {
+        let state = model.read();
+        let pane = &state.panes[pane];
+        let current = pane_view_option(pane.view, pane.icon_size);
+        let index = presets
+            .iter()
+            .position(|value| *value == current)
+            .unwrap_or(0);
+        if larger {
+            (index + 1).min(presets.len() - 1)
+        } else {
+            index.saturating_sub(1)
+        }
+    };
+    set_view(model, pane, presets[next]);
+}
+
+#[derive(serde::Deserialize)]
+struct SelectionRect {
+    generation: u64,
+    start: [f64; 2],
+    end: [f64; 2],
+    width: f64,
+    ctrl: bool,
+    shift: bool,
+}
+
+fn select_rectangle(mut model: Signal<AppModel>, pane: usize, value: &str) {
+    let Ok(rect) = serde_json::from_str::<SelectionRect>(value) else {
+        return;
+    };
+    let mut state = model.write();
+    if state.modal_open()
+        || !rect.start.iter().chain(&rect.end).all(|v| v.is_finite())
+        || !rect.width.is_finite()
+        || rect.width <= 0.
+    {
+        return;
+    }
+    let p = &state.panes[pane];
+    if p.generation != rect.generation {
+        return;
+    }
+    let geometry = p.geometry(state.compact);
+    let tab = p.tab();
+    let [x, y] = rect.start;
+    let [end_x, end_y] = rect.end;
+    if x.max(end_x) < 0. || x.min(end_x) >= rect.width {
+        return;
+    }
+    let cell_width = rect.width / geometry.columns as f64;
+    let col = |x: f64| ((x / cell_width).floor() as usize).min(geometry.columns - 1);
+    let row_count = tab.render_len().div_ceil(geometry.columns);
+    let row = |y: f64| ((y / geometry.row_height).floor() as usize).min(row_count);
+    let first_col = col(x.min(end_x));
+    let last_col = col(x.max(end_x));
+    let tab = state.panes[pane].tab_mut();
+    if !(rect.ctrl || rect.shift) {
+        tab.clear_selection();
+    }
+    let mut last = None;
+    for display_row in row(y.min(end_y))..=row(y.max(end_y)) {
+        for column in first_col..=last_col {
+            let Ok(position) = tab.item_at_render_row(display_row * geometry.columns + column)
+            else {
+                continue;
+            };
+            let Some(&entry) = tab.visible.get(position) else {
+                continue;
+            };
+            let path = &tab.entries[entry].path;
+            if !rect.ctrl || !tab.selection.remove(path) {
+                tab.selection.insert(path.clone());
+            }
+            last = Some(position);
+        }
+    }
+    if let Some(position) = last {
+        tab.move_cursor(position);
+        tab.anchor = tab.cursor.clone();
+    }
+    state.active = pane;
+    state.interaction += 1;
+    state.pending_focus = None;
+    state.dirty();
+    drop(state);
+    focus_list(pane);
+}
+
 fn invert_selection(mut model: Signal<AppModel>, pane: usize) {
     model.write().panes[pane].tab_mut().invert_selection();
     model.write().active = pane;
@@ -1471,7 +2202,9 @@ fn scroll_selection(mut model: Signal<AppModel>, pane: usize, position: usize) {
         let mut s = model.write();
         let compact = s.compact;
         let p = &mut s.panes[pane];
-        let scroll = p.geometry(compact).scroll_to(position, p.tab().scroll);
+        let scroll = p
+            .geometry(compact)
+            .scroll_to(p.tab().render_position(position), p.tab().scroll);
         p.tab_mut().scroll = scroll;
         scroll
     };
@@ -1496,15 +2229,28 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
     if event.key() == Key::ContextMenu || (event.key() == Key::F10 && event.modifiers().shift()) {
         event.prevent_default();
         event.stop_propagation();
-        open_selected_context(model, pane);
+        open_selected_context(model, bridge, pane);
         return;
     }
     if pane_shortcut(&event, model, pane, bridge) {
         return;
     }
     let ctrl = event.modifiers().ctrl();
+    let shift = event.modifiers().shift();
     let key = event.key();
-    if ctrl {
+    let cursor_key = matches!(
+        key,
+        Key::ArrowDown
+            | Key::ArrowUp
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::Home
+            | Key::End
+            | Key::PageDown
+            | Key::PageUp
+    );
+    let space = matches!(&key, Key::Character(text) if text == " ");
+    if ctrl && !cursor_key && !space {
         if let Key::Character(ref k) = key {
             match k.to_lowercase().as_str() {
                 "a" => {
@@ -1535,7 +2281,18 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
                 }
                 "c" => {
                     event.prevent_default();
-                    copy(model, bridge, false);
+                    if shift {
+                        let paths = model.read().selected();
+                        if !paths.is_empty() {
+                            if let Err(error) =
+                                bridge.utility(sdir::utility::Utility::CopyPaths(paths))
+                            {
+                                model.write().notice = error;
+                            }
+                        }
+                    } else {
+                        copy(model, bridge, false);
+                    }
                 }
                 "x" => {
                     event.prevent_default();
@@ -1554,6 +2311,12 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
         return;
     }
     let position = match &key {
+        Key::Character(_) if space => {
+            event.prevent_default();
+            let mut state = model.write();
+            let tab = state.panes[pane].tab_mut();
+            tab.toggle_position(tab.cursor_position().unwrap_or(0))
+        }
         Key::Character(text) => {
             event.prevent_default();
             model.write().panes[pane]
@@ -1596,7 +2359,11 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
                     .min(tab.visible.len().saturating_sub(1)),
                 _ => tab.cursor_position().unwrap_or(0).saturating_sub(page),
             };
-            tab.select_position(next, event.modifiers().shift())
+            if ctrl && !shift {
+                tab.move_cursor(next)
+            } else {
+                tab.select_position(next, shift)
+            }
         }
         _ => None,
     };
@@ -1622,15 +2389,46 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
                 }
             }
         }
-        Key::Delete => dialog(model, "recycle"),
-        Key::F2 => dialog(model, "rename"),
+        Key::Delete => {
+            event.prevent_default();
+            dialog(model, if shift { "delete" } else { "recycle" });
+        }
+        Key::F2 => {
+            event.prevent_default();
+            if model.read().panes[pane].tab().selection.len() > 1 {
+                open_numbered_batch(model);
+            } else {
+                start_inline_rename(model);
+            }
+        }
         Key::Backspace => history_navigation(model, bridge, pane, false),
         _ => {}
     }
 }
 
 fn app() -> Element {
-    let mut model = use_signal(|| AppModel::new(settings::load()));
+    let independent = try_consume_context::<IndependentWindow>();
+    let primary = independent.is_none();
+    use_drop(move || {
+        if primary {
+            lifecycle::release_activation();
+        }
+    });
+    let mut model = use_signal(|| {
+        let mut settings = settings::load();
+        if let Some(IndependentWindow(path)) = independent {
+            settings.layout = 1;
+            settings.active_pane = 0;
+            settings.active_tabs.clear();
+            settings.tab_states.clear();
+            settings.panes = vec![vec![path]];
+            settings.close_to_tray = false;
+            settings.start_on_login = false;
+            settings.resume_live_index = false;
+            settings.window = None;
+        }
+        AppModel::new(settings)
+    });
     use_hook(|| {
         let _ = document::eval(include_str!("editing.js"));
         let _ = document::eval(include_str!("search_focus.js"));
@@ -1642,24 +2440,52 @@ fn app() -> Element {
     let settings_writer = use_hook(|| Arc::new(settings::SettingsWriter::new()));
     let close_window = dioxus::desktop::use_window();
     let close_writer = settings_writer.clone();
-    let placement_window = close_window.clone();
-    use_hook(move || {
-        use dioxus::desktop::tao::dpi::PhysicalPosition;
-        if let Some(saved) = model.read().window.clone() {
-            let visible = placement_window.available_monitors().any(|m| {
-                let p = m.position();
-                let z = m.size();
-                saved.x + 100 > p.x
-                    && saved.y + 80 > p.y
-                    && saved.x < p.x + z.width as i32 - 80
-                    && saved.y < p.y + z.height as i32 - 60
-            });
-            if visible {
-                placement_window.set_outer_position(PhysicalPosition::new(saved.x, saved.y));
+    let close_bridge = bridge.clone();
+    let tray = use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None)));
+    let tray_for_close = tray.clone();
+    let window_for_activation = close_window.clone();
+    use_effect(move || {
+        if primary && model.read().close_to_tray {
+            if tray.borrow().is_none() {
+                match lifecycle::make_tray() {
+                    Ok(icon) => *tray.borrow_mut() = Some(icon),
+                    Err(error) => {
+                        let mut state = model.write();
+                        state.close_to_tray = false;
+                        state.notice = format!("트레이 아이콘을 만들지 못했습니다. {error}");
+                        state.save_due = Some(Instant::now());
+                    }
+                }
             }
-            placement_window.set_maximized(saved.maximized);
+        } else {
+            tray.borrow_mut().take();
         }
     });
+    let tray_window = close_window.clone();
+    let tray_writer = settings_writer.clone();
+    let tray_bridge = bridge.clone();
+    // Native menu items share the menubar event receiver in the pinned desktop runtime.
+    dioxus::desktop::use_muda_event_handler(move |event| match event.id.as_ref() {
+        lifecycle::OPEN_ID if primary => lifecycle::show_window(&tray_window),
+        lifecycle::EXIT_ID if primary => {
+            lifecycle::save_then_close(model, &tray_writer, &tray_window, &tray_bridge)
+        }
+        _ => {}
+    });
+    let placement_window = close_window.clone();
+    use_hook(move || {
+        let saved = model.read().window.clone();
+        let placement = if let Some(saved) = saved.as_ref() {
+            Some(lifecycle::restore_placement(&placement_window, saved))
+        } else {
+            lifecycle::observe_placement(&placement_window, None)
+        };
+        if let Some(placement) = placement {
+            model.write().window = Some(placement);
+        }
+    });
+    let placement_dirty = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    let placement_changed = placement_dirty.clone();
 
     dioxus::desktop::use_wry_event_handler(move |event, _| {
         use dioxus::desktop::{WindowCloseBehaviour, WindowEvent, tao::event::Event};
@@ -1691,26 +2517,7 @@ fn app() -> Element {
         } = event
         {
             if *window_id == close_window.id() && !model.read().closing {
-                let maximized = close_window.is_maximized();
-                let size = close_window.inner_size();
-                if size.width > 0 && size.height > 0 {
-                    let mut s = model.write();
-                    if !maximized {
-                        if let Ok(pos) = close_window.outer_position() {
-                            let scale = close_window.scale_factor();
-                            s.window = Some(WindowPlacement {
-                                x: pos.x,
-                                y: pos.y,
-                                width: size.width as f64 / scale,
-                                height: size.height as f64 / scale,
-                                maximized: false,
-                            });
-                        }
-                    } else if let Some(placement) = s.window.as_mut() {
-                        placement.maximized = true;
-                    }
-                    s.dirty();
-                }
+                placement_changed.set(true);
             }
         }
         if let Event::WindowEvent {
@@ -1719,41 +2526,17 @@ fn app() -> Element {
             ..
         } = event
         {
-            if *window_id != close_window.id() {
+            if *window_id != close_window.id() || !primary {
                 return;
             }
-            if model.read().close_save_failed {
-                close_window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+            if model.read().close_to_tray
+                && tray_for_close.borrow().is_some()
+                && !model.read().closing
+            {
+                close_window.set_close_behavior(WindowCloseBehaviour::WindowHides);
                 return;
             }
-            close_window.set_close_behavior(WindowCloseBehaviour::WindowHides);
-            if model.read().closing {
-                return;
-            }
-            let settings = {
-                let mut s = model.write();
-                s.closing = true;
-                s.save_due = None;
-                s.settings()
-            };
-            let finished = close_writer.flush(settings);
-            let window = close_window.clone();
-            spawn(async move {
-                let result = tokio::task::spawn_blocking(move || finished.recv()).await;
-                match result {
-                    Ok(Ok(Ok(()))) => {
-                        window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
-                        window.close();
-                    }
-                    _ => {
-                        let mut s = model.write();
-                        s.closing = false;
-                        s.close_save_failed = true;
-                        s.notice = "마지막 설정을 저장하지 못했습니다. 다시 닫으면 저장하지 않고 종료합니다.".into();
-                        window.window.set_visible(true);
-                    }
-                }
-            });
+            lifecycle::save_then_close(model, &close_writer, &close_window, &close_bridge);
         }
     });
     use_context_provider(|| bridge.clone());
@@ -1761,29 +2544,85 @@ fn app() -> Element {
     use_future(move || {
         let bridge = poll.clone();
         let settings_writer = settings_writer.clone();
+        let window = window_for_activation.clone();
+        let placement_dirty = placement_dirty.clone();
         async move {
             let layout = model.read().layout;
             for p in 0..layout {
                 load(model, &bridge, p);
             }
+            let resume = {
+                let state = model.read();
+                state
+                    .resume_live_index
+                    .then_some(state.search_preferences.memory_mib)
+            };
+            if let Some(memory) = resume {
+                start_volume_index(model, &bridge, memory, true);
+            }
+            let mut next_thumbnail_check = Instant::now();
             loop {
                 tokio::time::sleep(Duration::from_millis(40)).await;
+                if placement_dirty.replace(false) && !model.read().closing {
+                    let placement =
+                        lifecycle::observe_placement(&window, model.read().window.as_ref());
+                    if let Some(placement) = placement {
+                        let mut state = model.write();
+                        state.window = Some(placement);
+                        state.dirty();
+                    }
+                }
+                if primary && lifecycle::activation_pending() && !model.read().closing {
+                    lifecycle::show_window(&window);
+                }
                 let events: Vec<_> = bridge.events.try_iter().take(128).collect();
                 for event in events {
                     match event {
                         WorkerEvent::Utility { action, result } => {
+                            if matches!(&action, sdir::utility::Utility::FolderMenu { .. }) {
+                                finish_context(model, &action, result);
+                                continue;
+                            }
                             let mut s = model.write();
+                            if let sdir::utility::Utility::Drag { id, .. } = &action {
+                                if s.external_drag
+                                    .as_ref()
+                                    .is_some_and(|(current, _)| current == id)
+                                {
+                                    s.external_drag = None;
+                                }
+                            }
                             s.notice = match result {
                                 Ok(pid) => match action {
-                                    sdir::utility::Utility::Drag(_, _) => {
-                                        if pid == Some(0) {
+                                    sdir::utility::Utility::Drag { .. } => {
+                                        if pid == Some(sdir::utility::SDIR_DRAG_CANCELLED) {
                                             "외부 드래그를 취소했습니다.".into()
+                                        } else if pid
+                                            == Some(sdir::utility::SDIR_DRAG_VERIFIED_MOVE)
+                                        {
+                                            "외부 대상의 이동 효과와 원본 경로 제거를 확인했습니다.".into()
+                                        } else if pid
+                                            == Some(sdir::utility::SDIR_DRAG_EXTERNAL_HANDOFF)
+                                        {
+                                            "외부 파일 대상에 전달했습니다. 이동 완료는 확인되지 않았으니 결과를 대상에서 확인하세요.".into()
                                         } else {
-                                            "외부 프로그램에 파일 목록을 전달했습니다. 저장 결과는 대상 프로그램에서 확인하세요.".into()
+                                            "외부 드래그 결과를 확인할 수 없습니다. 대상에서 파일 상태를 확인하세요.".into()
                                         }
                                     }
                                     sdir::utility::Utility::OpenWith(_, _) if pid.is_none() => {
                                         "연결 프로그램 선택을 취소했습니다.".into()
+                                    }
+                                    sdir::utility::Utility::CreateShortcuts { .. } => {
+                                        "선택한 폴더에 바로 가기를 만들었습니다.".into()
+                                    }
+                                    sdir::utility::Utility::NetworkDrive { remote, .. } => {
+                                        s.tree.update_roots(platform::navigation_drives());
+                                        s.tree_seen = None;
+                                        if remote.is_some() {
+                                            "네트워크 드라이브를 연결했습니다.".into()
+                                        } else {
+                                            "네트워크 드라이브 연결을 끊었습니다.".into()
+                                        }
                                     }
                                     sdir::utility::Utility::CopyPaths(_) => {
                                         "전체 경로를 클립보드에 복사했습니다.".into()
@@ -1880,12 +2719,22 @@ fn app() -> Element {
                             }
                         }
                         WorkerEvent::Listed { pane, id, error } => {
-                            if finish_background(model, pane, id, error.clone()) {
-                                continue;
-                            }
+                            let background = finish_background(model, pane, id, error.clone());
+                            let listed = error.is_none();
+                            let mut reveal_in_place = None;
                             let mut s = model.write();
-                            if s.panes[pane].finish(id, error) {
-                                if let Some(request) = s.reveal.remove(&pane) {
+                            if background || s.panes[pane].finish(id, error) {
+                                if !background && listed {
+                                    s.remember_folder(pane);
+                                }
+                                if s.reveal
+                                    .get(&pane)
+                                    .is_some_and(|request| request.generation == id)
+                                {
+                                    let request = s.reveal.remove(&pane).unwrap();
+                                    if background && !listed {
+                                        continue;
+                                    }
                                     let allowed = request.interaction == s.interaction;
                                     if request.generation == id && allowed {
                                         let compact = s.compact;
@@ -1897,20 +2746,58 @@ fn app() -> Element {
                                         {
                                             p.tab_mut().scroll =
                                                 request.preserve_scroll.unwrap_or_else(|| {
-                                                    geometry.scroll_to(position, old_scroll)
+                                                    geometry.scroll_to(
+                                                        p.tab().render_position(position),
+                                                        old_scroll,
+                                                    )
                                                 });
-                                            p.reveal_revision += 1;
+                                            if background && request.focus {
+                                                let selected = p.tab().cursor.as_ref().unwrap();
+                                                let path =
+                                                    serde_json::to_string(&selected.display())
+                                                        .expect(
+                                                            "a file display path is serializable",
+                                                        );
+                                                reveal_in_place = Some((
+                                                    position,
+                                                    p.tab().scroll,
+                                                    p.generation,
+                                                    path,
+                                                ));
+                                            } else {
+                                                p.reveal_revision += 1;
+                                            }
                                             if request.focus {
                                                 s.active = pane;
                                                 s.pending_focus = Some((pane, s.interaction));
                                                 s.dirty();
                                             }
+                                        } else if request.from_search && listed {
+                                            s.search_error = Some(
+                                                "검색 결과를 폴더 목록에서 찾을 수 없습니다. 검색을 다시 실행하세요."
+                                                    .into(),
+                                            );
                                         }
                                     }
                                 }
                             }
+                            drop(s);
+                            if let Some((position, scroll, generation, path)) = reveal_in_place {
+                                let _ = document::eval(&format!(
+                                    "window.__sdirScrollSelection?.({pane},{position},{scroll},{{generation:'{generation}',path:{path}}});"
+                                ));
+                            }
+                        }
+                        WorkerEvent::Thumbnails { id, images } => {
+                            finish_thumbnails(model, id, images)
+                        }
+                        WorkerEvent::ReadPreview { id, result } => {
+                            finish_preview(model, id, result)
                         }
                         WorkerEvent::Index { index_id, status } => {
+                            if scoped_index_event(model, index_id, &status) {
+                                continue;
+                            }
                             if index_id == model.read().index_id {
                                 let mut s = model.write();
                                 let completed = status.complete;
@@ -1929,6 +2816,9 @@ fn app() -> Element {
                             }
                         }
                         WorkerEvent::Search { id, result } => {
+                            if scoped_query_event(model, id, &result) {
+                                continue;
+                            }
                             if id == model.read().query_id {
                                 let mut s = model.write();
                                 s.query_loading = false;
@@ -1960,7 +2850,14 @@ fn app() -> Element {
                                 let live = status.live;
                                 let query_needed = !status.live || s.index.is_none();
                                 let rebuild_outcome = s.pending_rebuild.as_ref().and_then(
-                                    |(pending_session, pending_generation, _, guid, expected_pid, accepted)| {
+                                    |(
+                                        pending_session,
+                                        pending_generation,
+                                        _,
+                                        guid,
+                                        expected_pid,
+                                        accepted,
+                                    )| {
                                         if !accepted
                                             || *pending_session != session
                                             || *pending_generation != generation
@@ -1968,20 +2865,27 @@ fn app() -> Element {
                                         {
                                             return None;
                                         }
-                                        status.volumes.iter().find(|volume| volume.guid.as_ref() == Some(guid)).and_then(|volume| {
-                                            match &volume.phase {
-                                                sdir::live_search::Phase::Live | sdir::live_search::Phase::Snapshot => Some((true, None)),
+                                        status
+                                            .volumes
+                                            .iter()
+                                            .find(|volume| volume.guid.as_ref() == Some(guid))
+                                            .and_then(|volume| match &volume.phase {
+                                                sdir::live_search::Phase::Live
+                                                | sdir::live_search::Phase::Snapshot => {
+                                                    Some((true, None))
+                                                }
                                                 sdir::live_search::Phase::Offline
                                                 | sdir::live_search::Phase::Excluded
                                                 | sdir::live_search::Phase::Error
                                                 | sdir::live_search::Phase::Unsupported
                                                 | sdir::live_search::Phase::Unavailable
-                                                | sdir::live_search::Phase::Limited => Some((false, volume.message.clone())),
+                                                | sdir::live_search::Phase::Limited => {
+                                                    Some((false, volume.message.clone()))
+                                                }
                                                 sdir::live_search::Phase::Indexing
                                                 | sdir::live_search::Phase::CatchingUp => None,
-                                            }
-                                        })
-                                    }
+                                            })
+                                    },
                                 );
                                 s.host_pid = Some(host_pid);
                                 s.index = Some(*status);
@@ -1998,7 +2902,9 @@ fn app() -> Element {
                                         }
                                     } else {
                                         s.result = None;
-                                        s.index_error = Some(message.unwrap_or_else(|| "드라이브 색인을 다시 만들지 못했습니다.".into()));
+                                        s.index_error = Some(message.unwrap_or_else(|| {
+                                            "드라이브 색인을 다시 만들지 못했습니다.".into()
+                                        }));
                                     }
                                 } else if s.pending_rebuild.is_none()
                                     && s.config_pending.is_none()
@@ -2062,8 +2968,18 @@ fn app() -> Element {
                                         } else {
                                             !accepted
                                         }
-                                }
+                                },
                             );
+                            let startup = generation == 0
+                                && session == s.index_id
+                                && s.search_live
+                                && s.index_starting
+                                && s.config_pending.is_none()
+                                && s.host_pid.is_none();
+                            if startup && accepted && host_pid.is_some() {
+                                s.resume_live_index = true;
+                                s.save_due = Some(Instant::now());
+                            }
                             let startup_rejected = !accepted
                                 && generation == 0
                                 && session == s.index_id
@@ -2072,9 +2988,13 @@ fn app() -> Element {
                                 && s.config_pending.is_none()
                                 && s.config_generation == 0
                                 && s.host_pid.is_none();
-                            if startup_rejected || (pending_matches && (host_pid.is_some() || !accepted)) {
+                            if startup_rejected
+                                || (pending_matches && (host_pid.is_some() || !accepted))
+                            {
                                 if accepted {
-                                    if let (Some(pid), Some((_, _, _, settings))) = (host_pid, s.config_pending.take()) {
+                                    if let (Some(pid), Some((_, _, _, settings))) =
+                                        (host_pid, s.config_pending.take())
+                                    {
                                         s.ntfs_indexing = settings;
                                         s.config_generation = generation;
                                         s.host_pid = Some(pid);
@@ -2092,7 +3012,9 @@ fn app() -> Element {
                                     s.query_loading = false;
                                     s.result = None;
                                     s.index_starting = false;
-                                    s.index_error = Some(message.unwrap_or_else(|| "검색 설정을 적용하지 못했습니다.".into()));
+                                    s.index_error = Some(message.unwrap_or_else(|| {
+                                        "검색 설정을 적용하지 못했습니다.".into()
+                                    }));
                                 }
                             }
                         }
@@ -2107,7 +3029,14 @@ fn app() -> Element {
                         } => {
                             let mut s = model.write();
                             let pending_matches = s.pending_rebuild.as_ref().is_some_and(
-                                |(pending_session, pending_generation, pending_id, pending_guid, expected_pid, _)| {
+                                |(
+                                    pending_session,
+                                    pending_generation,
+                                    pending_id,
+                                    pending_guid,
+                                    expected_pid,
+                                    _,
+                                )| {
                                     *pending_session == session
                                         && *pending_generation == generation
                                         && *pending_id == request_id
@@ -2117,7 +3046,7 @@ fn app() -> Element {
                                         } else {
                                             !accepted
                                         }
-                                }
+                                },
                             );
                             if pending_matches && (host_pid.is_some() || !accepted) {
                                 if accepted {
@@ -2133,7 +3062,9 @@ fn app() -> Element {
                                     s.query_loading = false;
                                     s.query_due = None;
                                     s.result = None;
-                                    s.index_error = Some(message.unwrap_or_else(|| "드라이브 색인을 다시 만들지 못했습니다.".into()));
+                                    s.index_error = Some(message.unwrap_or_else(|| {
+                                        "드라이브 색인을 다시 만들지 못했습니다.".into()
+                                    }));
                                 }
                             }
                         }
@@ -2146,11 +3077,22 @@ fn app() -> Element {
                                 }
                             }
                         }
+                        WorkerEvent::JobProgress { id, percent } => {
+                            let mut s = model.write();
+                            if s.job == Some(id) && (1..=99).contains(&percent) {
+                                if let Some(status) = s.job_status.as_mut() {
+                                    if status.id == id {
+                                        status.percent = Some(percent);
+                                    }
+                                }
+                            }
+                        }
                         WorkerEvent::Job { id, result } => {
                             if model.read().job == Some(id) {
                                 let context = {
                                     let mut s = model.write();
                                     s.job = None;
+                                    s.job_status = None;
                                     s.notice = result.message.clone();
                                     if let Some(c) = &s.job_context {
                                         let entry =
@@ -2245,14 +3187,28 @@ fn app() -> Element {
                                             .collect()
                                     };
                                     for pane in refresh {
-                                        let (selection, scroll) = {
+                                        let (background, selection, scroll) = {
                                             let s = model.read();
-                                            let tab = s.panes[pane].tab();
-                                            (tab.selection.iter().cloned().collect(), tab.scroll)
+                                            let p = &s.panes[pane];
+                                            let tab = p.tab();
+                                            let background = tab.loaded
+                                                && tab.resume.is_none()
+                                                && !s.reveal.contains_key(&pane)
+                                                && (!p.loading || s.refreshes[pane].is_some());
+                                            let selection = if background {
+                                                vec![]
+                                            } else {
+                                                tab.selection.iter().cloned().collect()
+                                            };
+                                            (background, selection, tab.scroll)
                                         };
-                                        load(model, &bridge, pane);
+                                        let generation = if background {
+                                            start_background(model, &bridge, pane)
+                                        } else {
+                                            load(model, &bridge, pane);
+                                            model.read().panes[pane].generation
+                                        };
                                         let mut s = model.write();
-                                        let generation = s.panes[pane].generation;
                                         let reveal =
                                             target.as_ref().filter(|c| c.target.pane == pane);
                                         let paths = if reveal.is_some() {
@@ -2270,6 +3226,7 @@ fn app() -> Element {
                                                     interaction: reveal
                                                         .map_or(interaction, |c| c.interaction),
                                                     focus: reveal.is_some(),
+                                                    from_search: false,
                                                     preserve_scroll: if reveal.is_some() {
                                                         None
                                                     } else {
@@ -2320,10 +3277,32 @@ fn app() -> Element {
                             }
                         }
                         WorkerEvent::Notice { message } => model.write().notice = message,
+                        WorkerEvent::Opened { path } => model.write().remember_open(path),
                         WorkerEvent::Failure { lane, id, message } => {
+                            if scoped_failure(model, id, &message) {
+                                continue;
+                            }
+                            if lane == 13 {
+                                finish_thumbnails(model, id, Vec::new());
+                                continue;
+                            }
+                            if lane == 11 {
+                                finish_preview(model, id, Err(message));
+                                continue;
+                            }
                             if lane < 4 {
-                                if !finish_background(model, lane, id, Some(message.clone())) {
-                                    model.write().panes[lane].finish(id, Some(message));
+                                let background =
+                                    finish_background(model, lane, id, Some(message.clone()));
+                                let mut state = model.write();
+                                if !background {
+                                    state.panes[lane].finish(id, Some(message));
+                                }
+                                if state
+                                    .reveal
+                                    .get(&lane)
+                                    .is_some_and(|request| request.generation == id)
+                                {
+                                    state.reveal.remove(&lane);
                                 }
                             } else if (6..10).contains(&lane) {
                                 let pane = lane - 6;
@@ -2363,6 +3342,12 @@ fn app() -> Element {
                 }
                 batch_tick(model, &bridge);
                 tree_follow_tick(model, &bridge);
+                scoped_search_tick(model, &bridge);
+                preview_tick(model, &bridge);
+                if Instant::now() >= next_thumbnail_check {
+                    next_thumbnail_check = Instant::now() + Duration::from_millis(250);
+                    thumbnail_tick(model, &bridge);
+                }
                 for pane in 0..4 {
                     if pane >= model.read().layout {
                         if model.read().watches[pane].is_some() {
@@ -2406,7 +3391,10 @@ fn app() -> Element {
                                 text: s.query.clone(),
                             }
                         } else {
-                            Request::Query { id: s.query_id, text: s.query.clone() }
+                            Request::Query {
+                                id: s.query_id,
+                                text: s.query.clone(),
+                            }
                         }
                     };
                     if let Err(message) = bridge.search.send(request) {
@@ -2428,12 +3416,11 @@ fn app() -> Element {
                 }
                 let save = model.read().save_due.is_some_and(|t| Instant::now() >= t);
                 if save {
-                    let settings = {
-                        let mut s = model.write();
-                        s.save_due = None;
-                        s.settings()
-                    };
-                    settings_writer.submit(settings);
+                    let mut state = model.write();
+                    state.save_due = None;
+                    if primary {
+                        settings_writer.submit(state.settings());
+                    }
                 }
                 if let Ok(error) = settings_writer.errors.try_recv() {
                     if !model.read().close_save_failed {
@@ -2449,6 +3436,8 @@ fn app() -> Element {
     let active_context = format!("{} · {}", s.pane_names[active], s.path().display());
     let selected = s.selected().len();
     let job = s.job.is_some();
+    let action_bar_visible = s.action_bar_visible;
+    let job_status = s.job_status.clone();
     let can_undo = !s.undo.is_empty();
     let can_redo = !s.redo.is_empty();
     let search_open = s.search_open;
@@ -2466,6 +3455,9 @@ fn app() -> Element {
     let modal_name = s.dialog_name.clone();
     let preferences_open = s.preferences_open;
     let workspaces_open = s.workspaces_open;
+    let inspector = s.inspector;
+    let folder_search_open = s.folder_search.is_some();
+    let network_dialog = s.network_dialog;
     let theme = s.theme.value();
     let search_select_all = s.search_preferences.select_on_focus.to_string();
     let row = row_height(s.compact);
@@ -2481,14 +3473,27 @@ fn app() -> Element {
             if modal_open{if e.key()==Key::Escape{dismiss_modal(model,&keyboard_bridge);}return;}
             if control&&matches!(e.key(),Key::Character(ref c) if ["a","c","x","v","i","z","y","d"].iter().any(|k|c.eq_ignore_ascii_case(k))){list_key(e,model,&keyboard_bridge,active_pane(model));return;}
             if e.key()==Key::F5{pane_shortcut(&e,model,active_pane(model),&keyboard_bridge);}
-            if control||e.modifiers().alt()||matches!(e.key(),Key::F3|Key::F6){pane_shortcut(&e,model,active_pane(model),&keyboard_bridge);}
+            if control||e.modifiers().alt()||matches!(e.key(),Key::F3|Key::F4|Key::F6|Key::F11){pane_shortcut(&e,model,active_pane(model),&keyboard_bridge);}
             if e.key()==Key::Escape{let mut s=model.write();s.dialog=None;s.preferences_open=false;s.workspaces_open=false;}
         },
+            div { class:"file-drag-preview", hidden:true, "aria-hidden":"true" }
+            input { class:"internal-drop-input", r#type:"hidden",
+                oninput:{let b=bridge.clone(); move |event:FormEvent| {
+                    event.stop_propagation();
+                    handle_drag(model,&b,&event.value());
+                }}
+            }
             header { class:"app-header",
-                div { class:"brand",span{class:"brand-icon","S"}strong{"SDIR"}span{class:"version","PREVIEW"} }
+                div { class:"brand",span{class:"brand-icon","S"}strong{"SDIR"} }
                 div {class:"header-divider"}
                 div {class:"header-title","나의 파일 작업공간"}
                 div {class:"header-spacer"}
+                button{class:"action-bar-toggle",title:"파일 작업 도구 모음 표시 전환","aria-expanded":action_bar_visible,
+                    "aria-controls":"file-action-bar",onclick:move |_|{
+                        let mut state = model.write();
+                        state.action_bar_visible = !state.action_bar_visible;
+                        state.dirty();
+                    },"작업 도구"}
                 button{class:"journal-toggle",onclick:move |_|model.write().journal_open=true,"작업 기록"}
                 button{class:"workspace-toggle",title:"작업공간 저장·전환",onclick:move |_|model.write().workspaces_open=true,"작업공간"}
                 button{class:"settings-toggle",title:"설정",onclick:move |_|model.write().preferences_open=true,Icon{kind:"settings"}span{"설정"}}
@@ -2503,14 +3508,22 @@ fn app() -> Element {
                         button {class:"side-link",onclick:{let b=bridge.clone();let path=path.clone();move |_|navigate(model,&b,active_pane(model),path.clone())},Icon{kind:"folder"}span{"{name}"}}
                     }
                     DirectoryTree { model }
+                    RecentLocations{model}
+                    details{class:"sidebar-section network-drive-controls",
+                        summary{"네트워크 드라이브"}
+                        for (disconnect,label) in [(false,"연결"),(true,"연결 끊기")] {
+                            button{class:"side-link",onclick:move |_|model.write().network_dialog=Some(disconnect),"{label}"}
+                        }
+                    }
                     div {class:"sidebar-section",div {class:"section-label",span{"즐겨찾기"}button{class:"small-add",title:"현재 폴더 추가",onclick:move |_|{let path=model.read().path();let mut s=model.write();if !s.favorites.contains(&path){s.favorites.push(path);s.dirty();}},"+"}}
                         if favorites.is_empty(){p{class:"side-hint","자주 쓰는 폴더를\n추가해 보세요."}}
                         for (i,path) in favorites.iter().enumerate(){ { let p=path.clone();let name=path.name();let full=path.display(); rsx! { div{class:"favorite-row",button{class:"side-link",title:"{full}",onclick:{let b=bridge.clone();move |_|navigate(model,&b,active_pane(model),p.clone())},Icon{kind:"star"}span{"{name}"}}button{class:"remove-favorite",title:"즐겨찾기에서 제거",onclick:move |_|{model.write().favorites.remove(i);model.write().dirty();},"×"}} } } }
                     }
                     div {class:"sidebar-bottom",label{class:"hidden-option",input{r#type:"checkbox",checked:show_hidden,onchange:{let b=bridge.clone();move|e:FormEvent|set_hidden(model,&b,e.checked())}}span{"숨김 파일 표시"}}p{"SDIR 0.1 · Windows"}}
                 }
-                main {class:"workspace",
-                    div {class:"action-bar",
+                main {class:"workspace","data-action-bar":if action_bar_visible{"open"}else{"closed"},
+                    if action_bar_visible {
+                    div {class:"action-bar",id:"file-action-bar",
                         button{class:"history-undo",title:"파일 작업 실행 취소 · Ctrl+Z","aria-label":"파일 작업 실행 취소",disabled:job||!can_undo,onclick:{let b=bridge.clone();move |_|history_action(model,&b,false)},"↶"}
                         button{class:"history-redo",title:"파일 작업 다시 실행 · Ctrl+Y","aria-label":"파일 작업 다시 실행",disabled:job||!can_redo,onclick:{let b=bridge.clone();move |_|history_action(model,&b,true)},"↷"}
                         button{disabled:job,onclick:move |_|dialog(model,"new"),Icon{kind:"plus"}span{"새 폴더"}}
@@ -2518,17 +3531,55 @@ fn app() -> Element {
                         button{disabled:selected==0||job,onclick:{let b=bridge.clone();move |_|copy(model,&b,false)},Icon{kind:"copy"}span{"복사"}}
                         button{disabled:selected==0||job,onclick:{let b=bridge.clone();move |_|copy(model,&b,true)},Icon{kind:"cut"}span{"잘라내기"}}
                         button{disabled:job,onclick:{let b=bridge.clone();move |_|paste(model,&b)},Icon{kind:"paste"}span{"붙여넣기"}}
-                        button{disabled:selected!=1||job,onclick:move |_|dialog(model,"rename"),Icon{kind:"rename"}span{"이름 변경"}}
+                        button{disabled:selected!=1||job,onclick:move |_|start_inline_rename(model),Icon{kind:"rename"}span{"이름 변경"}}
                         button{class:"batch-toggle",disabled:selected==0||selected>500||job,onclick:move |_|open_batch(model),"일괄 이름"}
                         button{class:"delete-action",disabled:selected==0||job,onclick:move |_|dialog(model,"recycle"),Icon{kind:"trash"}span{"휴지통"}}
                         div{class:"header-spacer"}
                         if layout>1{button{class:"transfer-action",disabled:selected==0||job,title:"복사할 패널과 탭의 폴더 선택",onclick:move |_|open_copy_destination(model),Icon{kind:"arrow"}span{"복사 대상 선택"}}}
                     }
+                    }
                     div {class:format!("panes layout-{layout}"),for pane_id in 0..layout{PaneView{key:"pane-{pane_id}",pane_id,model}}}
                 }
+                if let Some(mode) = inspector { FileInspector {model,mode} }
                 if search_open{SearchPanel{model}}
             }
-            footer{class:"status-bar",span{class:if job{"status-dot busy"}else{"status-dot"}}span{class:"status-message",title:"{notice}","{notice}"}span{class:"status-meta",title:"{active_context}","현재 패널 {active+1} · {selected}개 선택"}}
+            footer {
+                class: "status-bar",
+                span { class: if job { "status-dot busy" } else { "status-dot" } }
+                if let Some(status) = job_status {
+                    span {
+                        class: "status-message status-job-message",
+                        title: "{status.message}",
+                        "{status.message}"
+                    }
+                    span {
+                        class: "status-job-progress",
+                        if let Some(percent) = status.percent {
+                            progress {
+                                value: "{percent}",
+                                max: "100",
+                                "aria-label": "{status.kind} 진행률"
+                            }
+                            span { class: "status-job-percent", "약 {percent}%" }
+                        } else {
+                            progress {
+                                max: "100",
+                                "aria-label": "{status.kind} 진행률, 측정값 없음"
+                            }
+                            span { class: "status-job-percent", "진행 중" }
+                        }
+                    }
+                } else {
+                    span { class: "status-message", title: "{notice}", "{notice}" }
+                }
+                span {
+                    class: "status-meta",
+                    title: "{active_context}",
+                    "현재 패널 {active+1} · {selected}개 선택"
+                }
+            }
+            if folder_search_open { FolderSearchDialog {model} }
+            if let Some(disconnect) = network_dialog { NetworkDriveDialog {model,disconnect} }
             if batch_open{BatchRenameDialog{model}}
             if journal_open{JournalDialog{model}}
             if let Some(pane)=appearance_open{AppearanceDialog{model,pane}}
@@ -2538,8 +3589,9 @@ fn app() -> Element {
             if workspaces_open{Workspaces{model}}
             if let Some(kind)=modal{
                 div{class:"modal-backdrop",div{class:"modal",role:"dialog","aria-modal":"true",
-                    h2{match &kind{Dialog::NewFolder=>"새 폴더 만들기",Dialog::Rename(_)=>"이름 변경",Dialog::Recycle(_)=>"휴지통으로 이동"}}
-                    if let Dialog::Recycle(ref paths)=kind{p{"선택한 {paths.len()}개 항목을 휴지통으로 이동합니다. 위치에 따라 Windows가 영구 삭제 여부를 별도로 확인할 수 있습니다."}}
+                    h2{match &kind{Dialog::NewFolder=>"새 폴더 만들기",Dialog::Recycle(_)=>"휴지통으로 이동",Dialog::Delete(_)=>"영구 삭제"}}
+                    if let Dialog::Delete(ref paths)=kind{p{"선택한 {paths.len()}개 항목을 영구 삭제합니다. 휴지통으로 이동하지 않으며 이 작업은 실행 취소할 수 없습니다."}}
+                    else if let Dialog::Recycle(ref paths)=kind{p{"선택한 {paths.len()}개 항목을 휴지통으로 이동합니다. 위치에 따라 Windows가 영구 삭제 여부를 별도로 확인할 수 있습니다."}}
                     else{input{class:"dialog-input",autofocus:true,value:"{modal_name}",oninput:move|e|model.write().dialog_name=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();if e.key()==Key::Enter&&!e.is_composing(){confirm(model,&b);}if e.key()==Key::Escape{model.write().dialog=None;}}}}}
                     div{class:"modal-actions",button{onclick:move |_|model.write().dialog=None,"취소"}button{class:"primary",disabled:job,onclick:{let b=bridge.clone();move |_|confirm(model,&b)},"확인"}}
                 }}
@@ -2551,6 +3603,8 @@ fn app() -> Element {
 #[component]
 fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
     let mut editing = use_signal(|| None::<String>);
+    let mut rename_seed = use_signal(String::new);
+    let mut rename_focus = use_signal(|| None::<u64>);
     let mut path_menu = use_signal(|| false);
     use_drop(move || {
         let _ = document::eval(&format!(
@@ -2565,8 +3619,16 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
     let watch_ready = state.watches[pane_id].as_ref().is_some_and(|w| w.ready);
     let watch_error = state.watch_errors[pane_id].clone();
     let compact = state.compact;
+    let show_extensions = state.show_extensions;
+    let selection_checkboxes = state.selection_checkboxes;
     let marked = state.clipboard_marked.clone();
     let cut = state.clipboard_cut;
+    let history_open = state.address_history == Some(pane_id);
+    let inline_rename = state
+        .inline_rename
+        .as_ref()
+        .filter(|edit| edit.location.pane == pane_id && edit.location.matches(&state))
+        .cloned();
     drop(state);
     let view = p.view.value();
     let geometry = p.geometry(compact);
@@ -2574,8 +3636,9 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
     let tile_height = geometry.row_height;
     let small_icons = tile_height < 90.;
     let reveal_revision = p.reveal_revision;
-    let detail_template = p.columns.template();
-    let detail_width = p.columns.total();
+    let detail_style = p.columns.details_style();
+    let icon_size = p.icon_size;
+    let selected_view = pane_view_option(p.view, icon_size);
     let custom_columns = p.columns.custom;
     let col_visible = p.columns.visible;
     let icon_pixels = if small_icons {
@@ -2584,10 +3647,18 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
         (f64::from(p.icon_size) * 0.32).clamp(24., 64.)
     };
     let tab = p.tab();
-    let (start, end, offset, height) = geometry.virtual_range(tab.visible.len(), tab.scroll);
+    let grouping = tab.group_by.value();
+    let (start, end, offset, height) = geometry.virtual_range(tab.render_len(), tab.scroll);
     let indices = tab.visible.clone();
     let entries = tab.entries.clone();
     let selected = tab.selection.clone();
+    let cursor = tab.cursor.clone();
+    let focused_row = cursor.as_ref().and_then(|path| {
+        (start..end)
+            .filter_map(|row| tab.item_at_render_row(row).ok())
+            .find(|&position| &tab.entries[tab.visible[position]].path == path)
+            .map(|position| format!("pane-{pane_id}-file-{position}"))
+    });
     let generation = p.generation;
     let filter = tab.filter.clone();
     let error = tab.error.clone();
@@ -2597,7 +3668,8 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
     let keys = bridge.clone();
     let pane_keys = bridge.clone();
     let click_bridge = bridge.clone();
-    let edit = editing.read().clone();
+    let editing_name = editing.read().is_some();
+    let initial_name = rename_seed.read().clone();
     let ancestors: Vec<_> = tab
         .path
         .to_path()
@@ -2605,24 +3677,52 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
         .map(NativePath::new)
         .collect();
     let menu_open = *path_menu.read();
+    let mut seen = BTreeSet::new();
+    let history: Vec<_> = std::iter::once(&tab.path)
+        .chain(tab.back.iter().rev())
+        .chain(tab.forward.iter().rev())
+        .take(if history_open { usize::MAX } else { 0 })
+        .filter(|path| seen.insert((*path).clone()))
+        .take(12)
+        .cloned()
+        .collect();
     rsx! {
-        article{onmouseup:{let b=bridge.clone();move|e:MouseEvent|mouse_history(e,model,&b,pane_id)},class:if active{"pane focused"}else{"pane"},"data-pane":pane_id,"data-auto-watch":if watch_ready{"ready"}else{"waiting"},role:"region","aria-current":if active{"true"}else{"false"},"aria-label":format!("패널 {} · {}",pane_id+1,name),"data-view":view,"data-small-icons":small_icons,"data-custom-columns":custom_columns,style:"--tile-height:{tile_height}px;--detail-columns:{detail_template};--detail-width:{detail_width}px;--file-icon-size:{icon_pixels}px",onclick:move |_|activate_pane(model,pane_id),onfocusin:move |_|activate_pane(model,pane_id),onkeydown:move|e:KeyboardEvent|{if e.modifiers().ctrl()||e.modifiers().alt()||matches!(e.key(),Key::F3|Key::F6)||matches!(e.key(),Key::Character(ref c) if !c.trim().is_empty()){list_key(e,model,&pane_keys,pane_id);}},
+        article{onmouseup:{let b=bridge.clone();move|e:MouseEvent|mouse_history(e,model,&b,pane_id)},class:if active{"pane focused"}else{"pane"},"data-pane":pane_id,"data-auto-watch":if watch_ready{"ready"}else{"waiting"},role:"region","aria-current":if active{"true"}else{"false"},"aria-label":format!("패널 {} · {}",pane_id+1,name),"data-view":view,"data-small-icons":small_icons,"data-custom-columns":custom_columns,style:"--tile-height:{tile_height}px;{detail_style}--file-icon-size:{icon_pixels}px",onclick:move |_|activate_pane(model,pane_id),onfocusin:move |_|activate_pane(model,pane_id),onkeydown:move|e:KeyboardEvent|{if e.modifiers().ctrl()||e.modifiers().alt()||matches!(e.key(),Key::F3|Key::F4|Key::F6|Key::F11)||matches!(e.key(),Key::Character(ref c) if !c.trim().is_empty()){list_key(e,model,&pane_keys,pane_id);}},
             div{class:"group-header",
                 span{class:"group-number","{pane_id+1}"}
-                if let Some(value)=edit{
-                    input{class:"group-name-input","aria-label":"그룹 이름",value:"{value}",maxlength:64,autofocus:true,
-                        oninput:move|e|editing.set(Some(e.value())),
+                if editing_name{
+                    input{class:"group-name-input","aria-label":"그룹 이름",initial_value:"{initial_name}",maxlength:64,
+                        onmounted:move |_|{
+                            let request=rename_focus.write().take();
+                            let state=model.read();
+                            if request==Some(state.interaction)&&!state.modal_open(){
+                                let _=document::eval(&format!("{{const e=document.querySelector('[data-pane=\"{pane_id}\"] .group-name-input');if(e&&document.activeElement===document.body){{e.focus({{preventScroll:true}});e.select();}}}}"));
+                            }
+                        },
+                        onchange:move|e|{
+                            let value=e.value();
+                            if editing.peek().as_ref()!=Some(&value){editing.set(Some(value));}
+                        },
                         onkeydown:move|e:KeyboardEvent|{e.stop_propagation();if e.is_composing(){return;}match e.key(){Key::Enter=>{let value=editing.read().clone().unwrap_or_default();name_pane(model,pane_id,value);editing.set(None);},Key::Escape=>editing.set(None),_=>{}}}}
                     button{class:"group-save",title:"그룹 이름 저장",onclick:move |_|{let value=editing.read().clone().unwrap_or_default();name_pane(model,pane_id,value);editing.set(None);},"저장"}
                     button{class:"group-cancel",title:"그룹 이름 취소",onclick:move |_|editing.set(None),"취소"}
                 }else{
-                    button{class:"group-name",title:"그룹 이름 변경",onclick:{let name=name.clone();move |_|{editing.set(Some(name.clone()));let _=document::eval(&format!("setTimeout(()=>{{const e=document.querySelector('[data-pane=\"{pane_id}\"] .group-name-input');e?.focus();e?.select();}},40)"));}},span{class:"group-title","{name}"}Icon{kind:"rename"}}
+                    button{class:"group-name",title:"그룹 이름 변경",onclick:{let name=name.clone();move |_|{
+                        model.write().pending_focus=None;
+                        rename_focus.set(Some(model.read().interaction));
+                        rename_seed.set(name.clone());
+                        editing.set(Some(name.clone()));
+                    }},span{class:"group-title","{name}"}Icon{kind:"rename"}}
                 }
                 button{class:"pane-appearance",title:"보기 설정 · 열/아이콘 크기",onclick:move |_|model.write().appearance=Some(pane_id),"⚙"}
                 if active {span{class:"pane-active-badge",title:"파일 작업이 적용되는 현재 패널","현재 패널"}}
-                select{class:"view-select","aria-label":"보기 방식",title:"이 패널 보기 방식",value:view,onkeydown:move|e:KeyboardEvent|e.stop_propagation(),onchange:move|e:FormEvent|set_view(model,pane_id,&e.value()),option{value:"details","자세히"}option{value:"list","목록"}option{value:"icons","큰 아이콘"}}
+                select{class:"view-select","aria-label":"보기 방식",title:"이 패널 보기 방식",value:selected_view,onkeydown:move|e:KeyboardEvent|e.stop_propagation(),onchange:move|e:FormEvent|set_view(model,pane_id,&e.value()),
+                    for (value, _, label) in PANE_VIEW_OPTIONS {
+                        option{key:"{value}",value,"{label}"}
+                    }
+                    if pane_view_option(ViewMode::Icons, icon_size) == "icons" { option{value:"icons","사용자 지정 아이콘"} }}
             }
-            div{class:"tabs",for (i,t) in p.tabs.iter().enumerate(){ { let name=t.path.name();let pinned=t.pinned; rsx! { button{oncontextmenu:move|e:MouseEvent|{e.prevent_default();e.stop_propagation();open_tab_context(model,pane_id,i,e.client_coordinates().x,e.client_coordinates().y);},class:if p.active==i{"tab selected"}else{"tab"},title:"{t.path.display()}",onclick:{let b=bridge.clone();move |_|change_tab(model,&b,pane_id,TabCommand::Select(i),false)},Icon{kind:"folder"}span{"{name}"}if pinned{span{class:"tab-pinned",title:"고정된 탭 · 우클릭으로 해제","●"}}if p.tabs.len()>1&&!pinned{span{class:"tab-close",title:"탭 닫기 · Ctrl+W",onclick:{let b=bridge.clone();move|e:MouseEvent|{e.stop_propagation();change_tab(model,&b,pane_id,TabCommand::Close(i),true);}},"×"}}} } } }
+            div{class:"tabs",for (i,t) in p.tabs.iter().enumerate(){ { let name=t.path.name();let pinned=t.pinned; rsx! { button{oncontextmenu:move|e:MouseEvent|{e.prevent_default();e.stop_propagation();open_tab_context(model,pane_id,i,e.client_coordinates().x,e.client_coordinates().y);},class:if p.active==i{"tab selected"}else{"tab"},"data-drag-tab":i,title:"{t.path.display()}",onclick:{let b=bridge.clone();move |_|change_tab(model,&b,pane_id,TabCommand::Select(i),false)},Icon{kind:"folder"}span{"{name}"}if pinned{span{class:"tab-pinned",title:"고정된 탭 · 우클릭으로 해제","●"}}if p.tabs.len()>1&&!pinned{span{class:"tab-close",title:"탭 닫기 · Ctrl+W",onclick:{let b=bridge.clone();move|e:MouseEvent|{e.stop_propagation();change_tab(model,&b,pane_id,TabCommand::Close(i),true);}},"×"}}} } } }
                 button{class:"new-tab",title:"새 탭 · Ctrl+T",disabled:p.tabs.len()>=16,onclick:move |_|change_tab(model,&pane_bridge,pane_id,TabCommand::New,true),"+"}
                 button{class:"restore-tab",title:"닫은 탭 복원 · Ctrl+Shift+T",disabled:!p.can_restore_tab(),onclick:{let b=bridge.clone();move |_|change_tab(model,&b,pane_id,TabCommand::Restore,true)},"↶"}
             }
@@ -2631,37 +3731,229 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                 button{class:"icon-button",title:"앞으로",disabled:tab.forward.is_empty(),onclick:{let b=bridge.clone();move |_|{history_navigation(model,&b,pane_id,true)}},"›"}
                 button{class:"icon-button",title:"상위 폴더",onclick:{let b=bridge.clone();move |_|{let parent=model.read().panes[pane_id].tab().path.parent();if let Some(path)=parent{navigate(model,&b,pane_id,path);}}},"↑"}
                 div{class:"address-input-wrap",button{class:"path-menu-toggle",title:"상위 경로 바로 이동","aria-expanded":menu_open,onclick:move |_|path_menu.set(!menu_open),Icon{kind:"folder"}}input{id:"address-{pane_id}",class:"address-input",value:"{p.address}",spellcheck:false,oninput:move|e|model.write().panes[pane_id].address=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();model.write().interaction+=1;if pane_shortcut(&e,model,pane_id,&b){return;}if e.key()==Key::Enter&&!e.is_composing(){let value=model.read().panes[pane_id].address.clone();navigate(model,&b,pane_id,NativePath::new(value));}}}}
-                    if menu_open{
+                    if history_open {
+                        div {class:"path-menu-dismiss", onclick:move |e:MouseEvent|{e.stop_propagation();model.write().address_history=None;}}
+                        div {class:"path-menu address-history", role:"menu", "aria-label":"주소 기록",
+                            onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();pane_shortcut(&e,model,pane_id,&b);}},
+                            for location in history {
+                                {let label=location.display();let keyboard_target=location.clone();rsx!{button {
+                                    class:"path-crumb", role:"menuitem", title:"{label}",
+                                    onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{
+                                        if e.key()==Key::Enter&&!e.is_composing(){
+                                            e.prevent_default();e.stop_propagation();navigate(model,&b,pane_id,keyboard_target.clone());
+                                        }
+                                    }},
+                                    onclick:{let b=bridge.clone();move|e:MouseEvent|{e.stop_propagation();navigate(model,&b,pane_id,location.clone());}},
+                                    "{label}"
+                                }}}
+                            }
+                        }
+                    } else if menu_open{
                         div{class:"path-menu-dismiss",onclick:move|e:MouseEvent|{e.stop_propagation();path_menu.set(false);}}
                         div{class:"path-menu",role:"menu",for ancestor in ancestors.iter().rev(){ {let target=ancestor.clone();let full=target.display();let name=target.name();rsx!{button{class:"path-crumb",role:"menuitem",title:"{full}",onclick:{let b=bridge.clone();move|e:MouseEvent|{e.stop_propagation();path_menu.set(false);model.write().active=pane_id;navigate(model,&b,pane_id,target.clone());}},"{name}"}}}}}
                     }
                 }
                 button{class:"icon-button",title:if p.loading{"읽기 취소"}else{"새로고침 · F5"},onclick:{let b=bridge.clone();move |_|{if model.read().panes[pane_id].loading{b.panes[pane_id].cancel();let mut s=model.write();let id=s.refreshes[pane_id].take().map(|r|r.id);let p=&mut s.panes[pane_id];p.loading=false;p.generation=p.generation.max(id.unwrap_or(0))+1;s.notice="폴더 읽기를 취소했습니다.".into();}else{load(model,&b,pane_id);}}},if p.loading{"×"}else{"↻"}}
             }
-            div{class:"pane-filter",Icon{kind:"search"}input{id:"pane-query-{pane_id}",placeholder:"현재 폴더 검색 · Ctrl+F",title:"이 패널의 현재 폴더에서 이름 검색",value:"{filter}",oninput:move|e|{let mut s=model.write();s.panes[pane_id].tab_mut().set_filter(e.value());s.dirty();},onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();model.write().interaction+=1;if e.is_composing(){return;}if pane_shortcut(&e,model,pane_id,&b){return;}if e.key()==Key::Escape{model.write().panes[pane_id].tab_mut().set_filter(String::new());release_edit_focus(pane_id);focus_list_after_render(model,pane_id);}if e.key()==Key::Enter{release_edit_focus(pane_id);focus_list_after_render(model,pane_id);}}}}if !filter.is_empty(){button{class:"clear-pane-search",title:"패널 검색 지우기",onclick:move |_|{model.write().panes[pane_id].tab_mut().set_filter(String::new());focus_list_after_render(model, pane_id);},"×"}}span{class:"pane-label","패널 {pane_id+1}"}}
-            div{class:"list-header",button{onclick:move |_|sort(model,pane_id,SortColumn::Name),"이름"}button{class:if custom_columns&&!col_visible[1]{"column-hidden"}else{""},onclick:move |_|sort(model,pane_id,SortColumn::Size),"크기"}span{class:if custom_columns&&!col_visible[2]{"column-hidden"}else{""},"종류"}button{class:if custom_columns&&!col_visible[3]{"column-hidden"}else{""},onclick:move |_|sort(model,pane_id,SortColumn::Modified),"수정 날짜"}}
-            {rsx! {div{key:"list-{pane_id}-{generation}-{filter}-{compact}-{view}-{reveal_revision}",class:"list-scroll",tabindex:0,oncontextmenu:move|e:MouseEvent|{e.prevent_default();e.stop_propagation();open_context(model,pane_id,None,e.client_coordinates().x,e.client_coordinates().y);},"data-columns":columns,onmounted:move |_|{
+            div{class:"pane-filter",Icon{kind:"search"}input{id:"pane-query-{pane_id}",placeholder:"현재 목록 필터 · Ctrl+E",title:"이 패널의 현재 폴더에서 이름 검색",value:"{filter}",oninput:move|e|{let mut s=model.write();s.panes[pane_id].tab_mut().set_filter(e.value());s.dirty();},onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();model.write().interaction+=1;if e.is_composing(){return;}if pane_shortcut(&e,model,pane_id,&b){return;}if e.key()==Key::Escape{model.write().panes[pane_id].tab_mut().set_filter(String::new());release_edit_focus(pane_id);focus_list_after_render(model,pane_id);}if e.key()==Key::Enter{release_edit_focus(pane_id);focus_list_after_render(model,pane_id);}}}}if !filter.is_empty(){button{class:"clear-pane-search",title:"패널 검색 지우기",onclick:move |_|{model.write().panes[pane_id].tab_mut().set_filter(String::new());focus_list_after_render(model, pane_id);},"×"}}span{class:"pane-label","패널 {pane_id+1}"}}
+            input { class:"pane-marquee-input", r#type:"hidden",
+                oninput:move |e:FormEvent| {
+                    e.stop_propagation();
+                    select_rectangle(model, pane_id, &e.value());
+                }
+            }
+            input { class:"pane-zoom-input", r#type:"hidden",
+                oninput:move |e:FormEvent| {
+                    e.stop_propagation();
+                    if !model.read().modal_open() {
+                        zoom_icons(model, pane_id, e.value() == "in");
+                    }
+                }
+            }
+            if p.view == ViewMode::Details {
+                div{class:"list-header detail-header",
+                    div{class:"detail-header-track",
+                        for (column, (label, sort_column)) in [
+                            ("이름", Some(SortColumn::Name)),
+                            ("크기", Some(SortColumn::Size)),
+                            ("종류", None),
+                            ("수정 날짜", Some(SortColumn::Modified)),
+                        ].into_iter().enumerate() {
+                            if col_visible[column] {
+                                div{key:"column-{column}",class:"detail-heading","data-detail-column":column,
+                                    if let Some(sort_column) = sort_column {
+                                        button{onclick:move |_| sort(model,pane_id,sort_column),"{label}"}
+                                    } else {
+                                        span{"{label}"}
+                                    }
+                                    span{class:"detail-resize-handle",title:"{label} 너비 조정","aria-hidden":"true",
+                                        "data-min-width":sdir::preferences::Columns::minimum_width(column),
+                                        "data-max-width":sdir::preferences::Columns::MAX_WIDTH,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    input{class:"detail-width-input",r#type:"hidden",oninput:move|e:FormEvent| {
+                        let value = e.value();
+                        let Some((column, width)) = value.split_once(':') else { return; };
+                        let (Ok(column), Ok(width)) = (column.parse::<usize>(), width.parse::<u16>()) else { return; };
+                        let mut state = model.write();
+                        let pane = &mut state.panes[pane_id];
+                        if pane.view == ViewMode::Details && pane.columns.resize(column, width) {
+                            state.dirty();
+                        }
+                    }}
+                }
+            } else {
+                div{class:"list-header",button{onclick:move |_|sort(model,pane_id,SortColumn::Name),"이름"}}
+            }
+            {rsx! {div{key:"list-{pane_id}-{generation}-{filter}-{compact}-{view}-{icon_size}-{reveal_revision}",class:"list-scroll",tabindex:0,role:"listbox","aria-label":"{name} 파일 목록","aria-multiselectable":"true","aria-activedescendant":focused_row,"data-grouping":grouping,"data-drag-generation":generation,"data-drag-selection-count":selected.len(),"data-drag-folder":"{p.tab().path.display()}",oncontextmenu:{let b=bridge.clone();move|e:MouseEvent|{e.prevent_default();e.stop_propagation();open_context(model,&b,pane_id,None,e.client_coordinates().x,e.client_coordinates().y,false);}},"data-columns":columns,onmounted:move |_|{
                     let (scroll,focus,startup)={let s=model.read();(s.panes[pane_id].tab().scroll,s.pending_focus==Some((pane_id,s.interaction))&&s.active==pane_id&&!s.modal_open(),s.interaction==0||s.pending_focus_guarded)};
                     let _=document::eval(&format!("{{const e=document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll');if(e){{e.scrollTop={scroll};window.__sdirViewObservers??={{}};window.__sdirViewObservers[{pane_id}]?.disconnect();window.__sdirScrollRequests?.[{pane_id}]?.disconnect();const observer=new ResizeObserver(()=>e.dispatchEvent(new Event('scroll')));window.__sdirViewObservers[{pane_id}]=observer;observer.observe(e);}}}}"));
                     if focus{if startup{let _=document::eval(&format!("if(!document.activeElement?.matches('input,textarea,select,button'))document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll')?.focus({{preventScroll:true}});"));}else{let _=document::eval(&format!("if(!document.activeElement?.matches('input,textarea')&&!document.querySelector('.modal-backdrop,.context-dismiss'))document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll')?.focus({{preventScroll:true}});"));}}
-                },onclick:move |_|focus_list(pane_id),onkeydown:move|e|list_key(e,model,&keys,pane_id),onscroll:move|e:ScrollEvent|{let value=e.scroll_top();let left=e.scroll_left();let _=document::eval(&format!("{{let h=document.querySelector('[data-pane=\"{pane_id}\"] .list-header');if(h)h.scrollLeft={left};}}"));let width=e.client_width() as f64;let height=e.client_height() as f64;let change={let s=model.read();let p=&s.panes[pane_id];(value-p.tab().scroll).abs()>=1.||(width-p.viewport_width).abs()>=1.||(height-p.viewport_height).abs()>=1.};if change&&width>0.&&height>0.{let requested={let mut s=model.write();let compact=s.compact;let requested=s.panes[pane_id].update_viewport(width,height,value,compact);s.dirty();requested};if let Some((position,scroll))=requested{let _=document::eval(&format!("window.__sdirScrollSelection?.({pane_id},{position},{scroll});"));}}},
-                ondragover:move|e:DragEvent|e.prevent_default(),ondrop:move|e:DragEvent|{e.prevent_default();let paths:Vec<_>=e.files().iter().map(|f|NativePath::new(f.path())).collect();if !paths.is_empty(){let destination=model.read().panes[pane_id].tab().path.clone();submit(model,&click_bridge,FileAction::Copy{sources:paths,destination});}},
+                },onclick:move |_| {
+                    let mut state = model.write();
+                    state.active = pane_id;
+                    state.interaction += 1;
+                    state.pending_focus = None;
+                    state.panes[pane_id].tab_mut().clear_selection();
+                    state.dirty();
+                    drop(state);
+                    focus_list(pane_id);
+                },onkeydown:move|e|list_key(e,model,&keys,pane_id),onscroll:move|e:ScrollEvent|{let value=e.scroll_top();let left=e.scroll_left();let _=document::eval(&format!("{{let h=document.querySelector('[data-pane=\"{pane_id}\"] .list-header');if(h)h.style.setProperty('--detail-scroll-left','{left}px');}}"));let width=e.client_width() as f64;let height=e.client_height() as f64;let change={let s=model.read();let p=&s.panes[pane_id];(value-p.tab().scroll).abs()>=1.||(width-p.viewport_width).abs()>=1.||(height-p.viewport_height).abs()>=1.};if change&&width>0.&&height>0.{let requested={let mut s=model.write();let compact=s.compact;let requested=s.panes[pane_id].update_viewport(width,height,value,compact);s.dirty();requested};if let Some((position,scroll))=requested{let _=document::eval(&format!("window.__sdirScrollSelection?.({pane_id},{position},{scroll});"));}}},
+                ondragover:move|e:DragEvent|e.prevent_default(),ondrop:move|e:DragEvent|{let destination=model.read().panes[pane_id].tab().path.clone();drop_from_windows(model,&click_bridge,pane_id,destination,e);},
                 if total==0&&!p.loading{div{class:"empty-folder",Icon{kind:"folder"}strong{if error.is_some(){"폴더를 열지 못했습니다"}else{"폴더가 비어 있습니다"}}p{if error.is_some(){"클라우드·네트워크 드라이브의 연결과 접근 권한을 확인하세요. F5로 다시 시도할 수 있습니다."}else{"파일을 여기에 끌어다 놓아 복사할 수 있습니다."}}}}
                 if p.loading&&total==0{div{class:"loading-folder",span{class:"spinner"}span{"폴더를 읽고 있습니다"}}}
                 if total>0&&count==0{div{class:"empty-folder",strong{"일치하는 항목이 없습니다"}p{"필터를 바꿔 보세요."}}}
                 div{class:"virtual-space",style:"height:{height}px",div{class:"virtual-rows",style:"transform:translateY({offset}px);--view-columns:{columns}",
-                    for position in start..end{ {
-                        let entry=entries[indices[position]].clone();let path=entry.path.clone();let open=entry.path.clone();let chosen=selected.contains(&entry.path);let clipboard=if marked.contains(&entry.path){if cut{"clipboard-cut"}else{"clipboard-copy"}}else{""};let class=format!("file-row {} {clipboard}",if chosen{"selected"}else{""});let kind=if entry.is_dir{"폴더".to_string()}else{entry.path.to_path().extension().map(|s|format!("{} 파일",s.to_string_lossy().to_uppercase())).unwrap_or_else(||"파일".into())};let bytes=readable_size(entry.bytes);let modified=entry.modified.and_then(|s|chrono::DateTime::from_timestamp(s as i64,0)).map(|t|t.with_timezone(&chrono::Local).format("%Y.%m.%d %H:%M").to_string()).unwrap_or_else(||"—".into());let is_dir=entry.is_dir;let cloud=entry.cloud.label();
-                         rsx! { div{key:"row-{position}","data-row-index":position,draggable:false,"data-drag-key":"{entry.path.display()}",ondragstart:{let b=bridge.clone();let p=path.clone();move|e:DragEvent|{e.prevent_default();e.stop_propagation();start_drag(model,&b,pane_id,p.clone());}},oncontextmenu:{let p=path.clone();move|e:MouseEvent|{e.prevent_default();e.stop_propagation();open_context(model,pane_id,Some(p.clone()),e.client_coordinates().x,e.client_coordinates().y);}},class,role:"option","aria-selected":chosen,onclick:move|e:MouseEvent|{model.write().active=pane_id;model.write().panes[pane_id].select(path.clone(),e.modifiers().ctrl(),e.modifiers().shift());model.write().dirty();},ondoubleclick:{let b=bridge.clone();move |_|{if is_dir{navigate(model,&b,pane_id,open.clone());}else{let _=b.job(Request::Open{path:open.clone()});}}},
-                            div{class:"file-name",Icon{kind:if is_dir{"folder"}else{"file"}}span{title:"{entry.name}","{entry.name}"}if !cloud.is_empty(){span{class:"cloud-state",title:"파일 시스템이 보고한 보관 상태; 동기화 성공 여부는 공급자에서 확인하세요","{cloud}"}}if entry.is_link{span{class:"link-badge","↗"}}}span{class:if custom_columns&&!col_visible[1]{"file-size column-hidden"}else{"file-size"},"{bytes}"}span{class:if custom_columns&&!col_visible[2]{"file-kind column-hidden"}else{"file-kind"},"{kind}"}span{class:if custom_columns&&!col_visible[3]{"file-date column-hidden"}else{"file-date"},"{modified}"}
+                    for visual_row in start..end{ {
+                        if let Ok(position) = tab.item_at_render_row(visual_row) {
+                        let entry=entries[indices[position]].clone();
+                        let thumbnail=if p.view == ViewMode::Icons {
+                            model.read().thumbnails.get(&ThumbnailKey::from(&entry)).and_then(Clone::clone)
+                        } else {None};
+                        let display_name=if show_extensions||entry.is_dir {entry.name.as_str()} else {
+                            std::path::Path::new(&entry.name).file_stem().and_then(|name|name.to_str()).unwrap_or(&entry.name)
+                        };let path=entry.path.clone();let open=entry.path.clone();let chosen=selected.contains(&entry.path);let clipboard=if marked.contains(&entry.path){if cut{"clipboard-cut"}else{"clipboard-copy"}}else{""};
+                        let state_class = if chosen {
+                            "selected"
+                        } else if cursor.as_ref() == Some(&entry.path) {
+                            "keyboard-cursor"
+                        } else {
+                            ""
+                        };
+                        let class = format!("file-row {state_class} {clipboard}");
+                        let kind=if entry.is_dir{"폴더".to_string()}else{entry.path.to_path().extension().map(|s|format!("{} 파일",s.to_string_lossy().to_uppercase())).unwrap_or_else(||"파일".into())};let bytes=readable_size(entry.bytes);let modified=entry.modified.and_then(|s|chrono::DateTime::from_timestamp(s as i64,0)).map(|t|t.with_timezone(&chrono::Local).format("%Y.%m.%d %H:%M").to_string()).unwrap_or_else(||"—".into());let is_dir=entry.is_dir;let cloud=entry.cloud.label();
+                         rsx! { div{key:"row-{position}",id:"pane-{pane_id}-file-{position}","data-row-index":position,draggable:false,"data-drag-key":"{entry.path.display()}","data-drop-directory":if is_dir{"true"}else{"false"},
+                        ondrop:{let b=bridge.clone();let destination=path.clone();move|event:DragEvent|{if is_dir{drop_from_windows(model,&b,pane_id,destination.clone(),event);}}},
+                        oncontextmenu:{let p=path.clone();let b=bridge.clone();move|e:MouseEvent|{e.prevent_default();e.stop_propagation();open_context(model,&b,pane_id,Some(p.clone()),e.client_coordinates().x,e.client_coordinates().y,false);}},class,role:"option","aria-selected":chosen,onclick:move|e:MouseEvent| {
+                            e.stop_propagation();
+                            let mut state = model.write();
+                            state.active = pane_id;
+                            state.interaction += 1;
+                            state.pending_focus = None;
+                            state.panes[pane_id].select(path.clone(), e.modifiers().ctrl(), e.modifiers().shift());
+                            state.dirty();
+                            drop(state);
+                            focus_list(pane_id);
+                        },ondoubleclick:{let b=bridge.clone();move |_|{if is_dir{navigate(model,&b,pane_id,open.clone());}else{let _=b.job(Request::Open{path:open.clone()});}}},
+                            div{class:"file-name",
+                            if selection_checkboxes {
+                                input{class:"file-select-checkbox",r#type:"checkbox","aria-label":"{entry.name} 선택",tabindex:-1,checked:chosen,
+                                    onclick:move |e:MouseEvent| {
+                                        e.stop_propagation();
+                                        let mut s = model.write();
+                                        s.active = pane_id;
+                                        s.interaction += 1;
+                                        s.pending_focus = None;
+                                        s.panes[pane_id].tab_mut().toggle_position(position);
+                                        s.dirty();
+                                        drop(s);
+                                        focus_list(pane_id);
+                                    },
+                                    ondoubleclick:move|e:MouseEvent|e.stop_propagation()
+                                }
+                            }
+                            if let Some(url) = thumbnail.as_ref() {
+                                img{class:"file-thumbnail",src:"{url}",alt:"","aria-hidden":"true",draggable:false}
+                            } else {
+                                Icon{kind:if is_dir{"folder"}else{"file"}}
+                            }
+                            if let Some(edit)=inline_rename.as_ref().filter(|edit|edit.source==entry.path) {
+                                {inline_rename_editor(model,bridge.clone(),edit,is_dir)}
+                            } else { span{title:"{entry.name}","{display_name}"} }
+                            if !cloud.is_empty(){span{class:"cloud-state",title:"파일 시스템이 보고한 보관 상태; 동기화 성공 여부는 공급자에서 확인하세요","{cloud}"}}if entry.is_link{span{class:"link-badge","↗"}}}span{class:if !col_visible[1]{"file-size column-hidden"}else{"file-size"},"{bytes}"}span{class:if !col_visible[2]{"file-kind column-hidden"}else{"file-kind"},"{kind}"}span{class:if !col_visible[3]{"file-date column-hidden"}else{"file-date"},"{modified}"}
                         }
+                     } } else {
+                        let heading = tab.item_at_render_row(visual_row).unwrap_err();
+                        rsx!{div{key:"file-group-{visual_row}",class:"file-group-heading",role:"presentation","{heading}"}}
                      } } }
                 }}
             }
             }}
-            div{class:"pane-status",span{class:"watch-state",title:watch_error.clone().unwrap_or_else(||"현재 폴더의 외부 변경을 자동 반영합니다".into()),if watch_error.is_some(){"갱신 중단"}else if watch_ready{"자동 갱신"}else{"연결 중"}}if p.loading{span{class:"mini-spinner"}span{"읽는 중 · {total}개"}}else{span{"{count} / {total}개 항목"}}div{class:"header-spacer"}button{class:"selection-invert",title:"선택 반전 · Ctrl+I",disabled:p.loading||count==0,onclick:move |_|invert_selection(model,pane_id),"반전"}if let Some(error)=error{span{class:"pane-error",title:"{error}","{error}"}}}
+            div{class:"pane-status",span{class:"watch-state",title:watch_error.clone().unwrap_or_else(||"현재 폴더의 외부 변경을 자동 반영합니다".into()),if watch_error.is_some(){"갱신 중단"}else if watch_ready{"자동 갱신"}else{"연결 중"}}if p.loading{span{class:"mini-spinner"}span{"읽는 중 · {total}개"}}else{span{"{count} / {total}개 항목"}}if !matches!(p.view, ViewMode::Icons | ViewMode::Tiles) {
+                label{class:"pane-group-items",span{"분류 방법"}select{class:"group-items-select","aria-label":"항목 분류 방법",value:grouping,
+                    onchange:move |e:FormEvent| {
+                        let group = match e.value().as_str() {
+                            "modified" => GroupBy::Modified,
+                            "kind" => GroupBy::Kind,
+                            _ => GroupBy::None,
+                        };
+                        let mut state = model.write();
+                        let tab = state.panes[pane_id].tab_mut();
+                        tab.group_by = group;
+                        tab.rebuild_visible();
+                        tab.scroll = 0.;
+                        state.dirty();
+                        drop(state);
+                        focus_list_after_render(model, pane_id);
+                    },
+                    option{value:"none","없음"} option{value:"modified","수정 날짜"} option{value:"kind","종류"}
+                }}
+            }
+                div{class:"header-spacer"}button{class:"selection-invert",title:"선택 반전 · Ctrl+I",disabled:p.loading||count==0,onclick:move |_|invert_selection(model,pane_id),"반전"}if let Some(error)=error{span{class:"pane-error",title:"{error}","{error}"}}}
         }
     }
+}
+
+#[component]
+fn RecentLocations(model: Signal<AppModel>) -> Element {
+    let bridge = use_context::<Arc<Bridge>>();
+    let state = model.read();
+    if !state.remember_activity || (state.recent_files.is_empty() && state.folder_visits.is_empty())
+    {
+        return rsx! {};
+    }
+    let recent = state
+        .recent_files
+        .iter()
+        .take(6)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut frequent = state.folder_visits.clone();
+    frequent.sort_by_key(|entry| std::cmp::Reverse(entry.count));
+    rsx! { details{class:"sidebar-section recent-locations",
+        summary{"최근 항목"}
+        if !frequent.is_empty() {
+            div{class:"section-label","자주 쓰는 폴더"}
+            for entry in frequent.into_iter().take(6) {
+                { let full=entry.path.display();let name=entry.path.name();let b=bridge.clone();
+                    rsx!{button{key:"directory-{full}",class:"side-link recent-folder",title:"{full}",
+                        onclick:move |_|navigate(model,&b,active_pane(model),entry.path.clone()),"{name}"}}
+                }
+            }
+        }
+        if !recent.is_empty() {
+            div{class:"section-label","최근 파일"}
+            for path in recent {
+                { let full=path.display();let name=path.name();let b=bridge.clone();
+                    rsx!{button{key:"file-{full}",class:"side-link recent-file",title:"{full}",
+                        onclick:move |_|{let _=b.job(Request::Open{path:path.clone()});},"{name}"}}
+                }
+            }
+        }
+    }}
 }
 
 #[component]
@@ -2711,7 +4003,8 @@ fn Workspaces(mut model: Signal<AppModel>) -> Element {
 #[component]
 fn Preferences(mut model: Signal<AppModel>) -> Element {
     let bridge = use_context::<Arc<Bridge>>();
-    let inventory_result = use_signal(|| None::<Result<sdir::live_search::MountedInventory, String>>);
+    let inventory_result =
+        use_signal(|| None::<Result<sdir::live_search::MountedInventory, String>>);
     use_future(move || {
         let mut inventory_result = inventory_result;
         async move {
@@ -2727,6 +4020,10 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
     let theme = s.theme;
     let compact = s.compact;
     let hidden = s.show_hidden;
+    let independent = try_consume_context::<IndependentWindow>().is_some();
+    let close_to_tray = s.close_to_tray;
+    let start_on_login = s.start_on_login;
+    let remember_activity = s.remember_activity;
     let search = s.search_preferences.clone();
     let memory_mib = search.memory_mib;
     let indexing = s.ntfs_indexing.clone();
@@ -2737,7 +4034,9 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
         .unwrap_or_else(|| s.path().display());
     let index_dirty = s.index_dirty;
     let index_error = s.index_error.clone();
-    let live_status = s.index.as_ref()
+    let live_status = s
+        .index
+        .as_ref()
         .filter(|status| s.search_live && status.host_pid == s.host_pid && s.host_pid.is_some())
         .cloned();
     let search_live = s.search_live;
@@ -2752,14 +4051,46 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
     rsx! {
         div{class:"modal-backdrop",div{class:"modal preferences",role:"dialog","aria-modal":"true","aria-label":"사용자 설정",
             div{class:"preferences-heading",h2{"사용자 설정"}button{class:"icon-button",title:"설정 닫기",onclick:move |_|model.write().preferences_open=false,"×"}}
+            if !independent {
             p{class:"preference-note","변경한 설정은 바로 적용하고 자동 저장합니다."}
+            div{class:"preference-section",h3{"창과 시작"}
+                label{class:"preference-option",span{"X로 닫을 때 트레이에 유지"}
+                    input{class:"preferences-close-to-tray",r#type:"checkbox",checked:close_to_tray,
+                        onchange:move|e:FormEvent|{let mut state=model.write();state.close_to_tray=e.checked();state.save_due=Some(Instant::now());}}
+                }
+                label{class:"preference-option",span{"Windows 로그인 시 실행"}
+                    input{class:"preferences-login-start",r#type:"checkbox",checked:start_on_login,
+                        onchange:move|e:FormEvent|{
+                            let enabled=e.checked();
+                            let result=lifecycle::set_login_start(enabled);
+                            let mut state=model.write();
+                            match result {
+                                Ok(())=>{state.start_on_login=enabled;state.save_due=Some(Instant::now());}
+                                Err(error)=>state.notice=error,
+                            }
+                        }}
+                }
+            }
+            }
             div{class:"preference-section",h3{"화면 테마"}
                 div{class:"theme-choices",for (value,label) in [(Theme::System,"시스템"),(Theme::Light,"밝게"),(Theme::Dark,"어둡게")]{
                     button{class:if theme==value{"theme-choice chosen"}else{"theme-choice"},"data-theme-choice":value.value(),"aria-pressed":theme==value,onclick:move |_|{let mut s=model.write();s.theme=value;s.save_due=Some(Instant::now());},"{label}"}
                 }}
             }
             div{class:"preference-section",h3{"파일 목록"}
+                label{class:"preference-option",span{"최근 파일과 자주 쓰는 폴더 기록"}input{class:"preferences-recent",r#type:"checkbox",checked:remember_activity,onchange:move|e:FormEvent|{
+                    let mut s=model.write();
+                    s.remember_activity=e.checked();
+                    s.visited=Default::default();
+                    s.dirty();
+                }}}
+                button{class:"preferences-clear-recent",onclick:move |_|{
+                    let mut s=model.write();
+                    s.recent_files.clear();s.folder_visits.clear();s.dirty();
+                },"최근 기록 지우기"}
                 label{class:"preference-option",span{"목록 간격"}select{class:"density-select","aria-label":"목록 간격",value:if compact{"compact"}else{"comfortable"},onchange:move|e:FormEvent|{let mut s=model.write();s.compact=e.value()=="compact";for pane in &mut s.panes {for tab in &mut pane.tabs {tab.scroll=0.;}}s.save_due=Some(Instant::now());},option{value:"compact","촘촘하게"}option{value:"comfortable","여유 있게"}}}
+                label{class:"preference-option",span{"파일 확장명 표시"}input{class:"preferences-extensions",r#type:"checkbox",checked:model.read().show_extensions,onchange:move|e:FormEvent|{let mut s=model.write();s.show_extensions=e.checked();s.dirty();}}}
+                label{class:"preference-option",span{"항목 선택 체크박스"}input{class:"preferences-selection-checkboxes",r#type:"checkbox",checked:model.read().selection_checkboxes,onchange:move|e:FormEvent|{let mut s=model.write();s.selection_checkboxes=e.checked();s.dirty();}}}
                 label{class:"preference-option",span{"숨김 파일 표시"}input{class:"preferences-hidden",r#type:"checkbox",checked:hidden,onchange:{let b=bridge.clone();move|e:FormEvent|set_hidden(model,&b,e.checked())}}}
             }
             div{class:"preference-section",h3{"통합 검색"}
@@ -2770,8 +4101,8 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
                         else{p{class:"index-count","색인 없음"}}
                     }
                     div{class:"index-actions",button{class:"primary",onclick:{let b=bridge.clone();move |_|start_index(model,&b)},if index_status.is_some(){"현재 폴더로 다시 색인"}else{"현재 폴더 색인"}}
-                        button{class:"volume-index-start",onclick:{let b=bridge.clone();move |_|start_volume_index(model,&b,memory_mib)},"전체 드라이브 실시간 검색"}
-                        if search_live||index_starting||index_status.as_ref().is_some_and(|status|!status.complete){button{class:"index-stop",onclick:{let b=bridge.clone();move |_|{b.search.cancel();let mut s=model.write();s.index_id+=1;s.query_id+=1;s.index=None;s.index_starting=false;s.search_live=false;s.config_generation=0;s.host_pid=None;s.config_pending=None;s.pending_rebuild=None;s.query_loading=false;s.query_due=None;s.result=None;s.index_error=Some("색인을 취소했습니다.".into());}},"중지"}}
+                        button{class:"volume-index-start",disabled:independent,onclick:{let b=bridge.clone();move |_|start_volume_index(model,&b,memory_mib,false)},"전체 드라이브 실시간 검색"}
+                        if search_live||index_starting||index_status.as_ref().is_some_and(|status|!status.complete){button{class:"index-stop",onclick:{let b=bridge.clone();move |_|{b.search.cancel();let mut s=model.write();s.index_id+=1;s.query_id+=1;s.index=None;s.index_starting=false;s.search_live=false;s.resume_live_index=false;s.save_due=Some(Instant::now());s.config_generation=0;s.host_pid=None;s.config_pending=None;s.pending_rebuild=None;s.query_loading=false;s.query_due=None;s.result=None;s.index_error=Some("색인을 취소했습니다.".into());}},"중지"}}
                     }
                     if let Some(error)=index_error.as_ref(){p{class:"search-error index-error","{error}"}}
                     if index_status.as_ref().is_some_and(|index|index.limited){p{class:"index-warning","색인 상한에 도달했습니다."}}
@@ -2789,7 +4120,18 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
                         label{class:"preference-option",span{"고정 드라이브 자동 포함"}input{class:"drive-index-auto-fixed",r#type:"checkbox",checked:indexing.auto_fixed(),disabled:drive_controls_disabled,onchange:{let b=bridge.clone();move|e:FormEvent|configure_auto_volumes(model,&b,Some(e.checked()),None)}}}
                         label{class:"preference-option",span{"이동식 드라이브 자동 포함"}input{class:"drive-index-auto-removable",r#type:"checkbox",checked:indexing.auto_removable(),disabled:drive_controls_disabled,onchange:{let b=bridge.clone();move|e:FormEvent|configure_auto_volumes(model,&b,None,Some(e.checked()))}}}
                     }
-                    p{class:"preference-note","전체 드라이브 실시간 색인은 윈도우 관리자 승인이 필요합니다. 비NTFS 드라이브와 네트워크 위치는 폴더 색인을 이용하세요."}
+                    label{class:"preference-option",span{"Windows 구성 요소(WinSxS) 표시"}
+                        input{class:"drive-index-show-windows-components",r#type:"checkbox",checked:indexing.show_windows_components(),disabled:drive_controls_disabled,
+                            onchange:{let b=bridge.clone();move |e:FormEvent|{
+                                let mut settings=model.read().ntfs_indexing.clone();
+                                match settings.set_show_windows_components(e.checked()){
+                                    Ok(())=>apply_index_settings(model,&b,settings),
+                                    Err(error)=>model.write().index_error=Some(error.to_string()),
+                                }
+                            }}
+                        }
+                    }
+                    p{class:"preference-note","전체 드라이브 실시간 색인은 SDIR 색인 서비스 또는 관리자 승인을 사용합니다. 비NTFS 드라이브와 네트워크 위치는 폴더 색인을 이용하세요."}
                     if let Some(ref index)=live_status{
                         p{class:"preference-note","색인 항목 {index.entries}개 · 메모리 {readable_size(Some(index.allocated_bytes))} · 접근 불가·제외 {index.skipped}개"}
                     }
@@ -2861,19 +4203,29 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
 
 #[component]
 fn SearchPanel(mut model: Signal<AppModel>) -> Element {
+    let initial_query = use_hook(move || model.peek().query.clone());
     let bridge = use_context::<Arc<Bridge>>();
     let s = model.read();
-    let index_host = s.index.as_ref().and_then(|status| status.host_pid)
-        .map(|pid| pid.to_string()).unwrap_or_default();
-    let query = s.query.clone();
+    let index_host = s
+        .index
+        .as_ref()
+        .and_then(|status| status.host_pid)
+        .map(|pid| pid.to_string())
+        .unwrap_or_default();
     let instant = s.search_preferences.instant;
     let query_loading = s.query_loading;
     let result = s.result.clone();
     let error = s.search_error.clone();
     let expanded = s.search_expanded;
-    let target = s.search_target.map_or_else(|| "active".to_string(), |pane| pane.to_string());
+    let target = s
+        .search_target
+        .map_or_else(|| "active".to_string(), |pane| pane.to_string());
     let pane_names = s.pane_names[..s.layout].to_vec();
-    let expand_label = if expanded { "검색 화면 축소" } else { "검색 화면 확대" };
+    let expand_label = if expanded {
+        "검색 화면 축소"
+    } else {
+        "검색 화면 확대"
+    };
     drop(s);
     rsx! {
         aside{class:if expanded{"search-panel search-expanded"}else{"search-panel"},"data-index-host":"{index_host}",
@@ -2885,7 +4237,7 @@ fn SearchPanel(mut model: Signal<AppModel>) -> Element {
                     onclick:move |_|{let mut s=model.write();s.search_expanded=!s.search_expanded;},if expanded{"축소"}else{"확대"}}
                 button{class:"icon-button",title:"검색 닫기","aria-label":"검색 닫기",onclick:move |_|{let mut s=model.write();s.search_open=false;s.search_expanded=false;},"×"}
             }
-            div{class:"search-input-wrap",Icon{kind:"search"}input{id:"global-query",onmounted:move |_|{let focus={let s=model.read();s.search_focus==Some(s.interaction)&&s.search_open&&!s.modal_open()};if focus{model.write().search_focus=None;let _=document::eval("window.sdirFocusSearch?.()");}},onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();if e.is_composing(){return;}if pane_shortcut(&e,model,active_pane(model),&b){return;}if e.key()==Key::Enter{model.write().submit_query();}}},placeholder:if instant{"파일명, ext:pdf, *.txt"}else{"입력 후 Enter로 검색"},value:"{query}",spellcheck:false,oninput:move|e|model.write().edit_query(e.value())}button{class:"search-submit",title:"검색 실행 (Enter)",onclick:move |_|model.write().submit_query(),"검색"}}
+            div{class:"search-input-wrap",Icon{kind:"search"}input{id:"global-query",onmounted:move |_|{let focus={let s=model.read();s.search_focus==Some(s.interaction)&&s.search_open&&!s.modal_open()};if focus{model.write().search_focus=None;let _=document::eval("window.sdirFocusSearch?.()");}},onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();if e.is_composing(){return;}if pane_shortcut(&e,model,active_pane(model),&b){return;}if e.key()==Key::Enter{model.write().submit_query();}}},placeholder:if instant{"파일명, ext:pdf, *.txt"}else{"입력 후 Enter로 검색"},initial_value:"{initial_query}",spellcheck:false,onchange:move|e|{let value=e.value();if model.peek().query!=value{model.write().edit_query(value);}}}button{class:"search-submit",title:"검색 실행 (Enter)",onclick:move |_|model.write().submit_query(),"검색"}}
             if pane_names.len()>1{
                 label{class:"search-target",span{"결과를 열 패널"}
                     select{class:"search-target-select",value:"{target}",onchange:move|e:FormEvent|{
@@ -2943,6 +4295,7 @@ fn Icon(kind: String) -> Element {
 }
 
 fn tree_toggle(mut model: Signal<AppModel>, bridge: &Bridge, path: NativePath, retry: bool) {
+    let path = sdir::tree::tree_key(path);
     {
         let mut s = model.write();
         s.tree_tasks.clear();
@@ -2979,8 +4332,8 @@ fn DirectoryTree(mut model: Signal<AppModel>) -> Element {
     let rows = s.tree.rows();
     let open = s.tree.open;
     let follow = s.tree_follow;
-    let active_path = s.path();
-    let cursor = s.tree_cursor.as_ref().unwrap_or(&active_path).clone();
+    let active_path = sdir::tree::tree_key(s.path());
+    let cursor = sdir::tree::tree_key(s.tree_cursor.clone().unwrap_or_else(|| active_path.clone()));
     let focused_path = cursor.display();
     let active_descendant = rows
         .iter()
@@ -3000,20 +4353,20 @@ fn DirectoryTree(mut model: Signal<AppModel>) -> Element {
             label{class:"tree-follow",input{r#type:"checkbox",checked:follow,onchange:move|e:FormEvent|{let mut s=model.write();s.tree_follow=e.checked();s.tree_seen=None;s.tree_tasks.clear();s.dirty();}}span{"현재 위치 따라가기"}}
             button{class:"tree-computer", "aria-expanded":open,onclick:{let b=bridge.clone();move |_|{let mut s=model.write();s.tree.open=!s.tree.open;s.dirty();if !s.tree.open{b.tree.cancel();s.tree.reset();s.tree_tasks.clear();}else{s.tree_seen=None;}}},span{if open{"⌄"}else{"›"}}Icon{kind:"drive"}span{"내 PC"}}
             if open {
-                div{class:"drive-tree",style:"height:min({height}px,clamp(112px,30vh,340px))",role:"tree","aria-label":"드라이브와 폴더",tabindex:0,"data-focused-path":"{focused_path}","aria-activedescendant":"{active_descendant}","aria-busy":tree_busy,onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{let (path,expanded)={let s=model.read();let p=s.tree_cursor.clone().unwrap_or_else(||s.path());let expanded=s.tree.nodes.get(&p).is_some_and(|n|n.expanded);(p,expanded)};tree_key(e,model,&b,path,expanded);}},onscroll:move|e:ScrollEvent|scroll.set(e.scroll_top()),
+                div{class:"drive-tree",style:"height:min({height}px,clamp(112px,30vh,340px))",role:"tree","aria-label":"드라이브와 폴더",tabindex:0,"data-focused-path":"{focused_path}","aria-activedescendant":"{active_descendant}","aria-busy":tree_busy,onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{let (path,expanded)={let s=model.read();let p=sdir::tree::tree_key(s.tree_cursor.clone().unwrap_or_else(||s.path()));let expanded=s.tree.nodes.get(&p).is_some_and(|n|n.expanded);(p,expanded)};tree_key(e,model,&b,path,expanded);}},onscroll:move|e:ScrollEvent|scroll.set(e.scroll_top()),
                     div{class:"tree-space",style:"height:{height}px",
                         div{class:"tree-rows",style:"transform:translateY({start*28}px)",
                             for (offset,row) in rows[start..end].iter().enumerate() { {
-                                let path=row.path.clone();let full=path.display();let depth=row.depth;let indent=depth.min(16)*13;
+                                let path=sdir::tree::tree_key(row.path.clone());let full=path.display();let depth=row.depth;let indent=depth.min(16)*13;
                                 let node=nodes.get(&path).cloned().unwrap_or_default();let expanded=node.expanded;let empty=node.loaded&&node.children.is_empty()&&node.message.is_none();let loading=s.tree.pending.as_ref().is_some_and(|(_,p)|p==&path);
                                 let selected=path==active_path;let keyboard=path==cursor;let row_id=format!("tree-node-{}",start+offset);let row_class=format!("tree-row{}{}",if selected{" selected"}else{""},if keyboard{" keyboard-focused"}else{""});let name=if depth==0{format!("드라이브 ({full})")}else{path.name()};let label=if expanded{"접기"}else{"펼치기"};
                                 if let Some(message)=&row.message {
-                                        rsx! { div{key:"message-{full}",class:"tree-message",style:"padding-left:{indent+23}px;min-width:{indent+110}px",title:"{message}",span{"{message}"}
+                                        rsx! { div{key:"message-{full}",class:"tree-message",style:"padding-left:min({indent+23}px, 45%)",title:"{message}",span{"{message}"}
                                             if !loading&&node.message.is_some(){button{class:"tree-retry",title:"{full} 다시 시도",onclick:{let b=bridge.clone();let p=path.clone();move |_|tree_toggle(model,&b,p.clone(),true)},"다시 시도"}}
                                         }
                                         }
                                     }else{
-                                        rsx! { div{key:"node-{full}",class:row_class,id:row_id,role:"treeitem","aria-level":depth+1,"aria-expanded":expanded,"aria-selected":selected,"aria-busy":loading,"data-tree-path":"{full}",style:"padding-left:{indent}px;min-width:{indent+140}px",tabindex:-1,onkeydown:{let b=bridge.clone();let p=path.clone();move|e:KeyboardEvent|tree_key(e,model,&b,p.clone(),expanded)},
+                                        rsx! { div{key:"node-{full}",class:row_class,id:row_id,role:"treeitem","aria-level":depth+1,"aria-expanded":expanded,"aria-selected":selected,"aria-busy":loading,"data-tree-path":"{full}",style:"padding-left:min({indent}px, 35%)",tabindex:-1,onkeydown:{let b=bridge.clone();let p=path.clone();move|e:KeyboardEvent|tree_key(e,model,&b,p.clone(),expanded)},
                                             button{class:"tree-expander",tabindex:-1,title:"{full} {label}","aria-label":"{full} {label}",disabled:empty,onclick:{let b=bridge.clone();let p=path.clone();move |_|tree_toggle(model,&b,p.clone(),false)},if loading{"…"}else if empty{"·"}else if expanded{"⌄"}else{"›"}}
                                             button{class:"tree-label",tabindex:-1,title:"{full}",onclick:{let b=bridge.clone();let p=path.clone();move |_|tree_navigate(model,&b,p.clone())},Icon{kind:if depth==0{"drive"}else{"folder"}}span{"{name}"}}
                                         }

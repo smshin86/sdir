@@ -13,6 +13,7 @@ pub mod tree;
 
 pub mod watch;
 
+pub mod file_preview;
 pub mod utility;
 
 pub mod index_cache;
