@@ -2,11 +2,19 @@ use crate::model::{FileAction, FileEntry, NativePath};
 use std::{fs, path::Path, time::UNIX_EPOCH};
 
 pub fn entry(path: &Path) -> Result<FileEntry, String> {
+    #[cfg(target_os = "macos")]
+    if path.to_str().is_none() {
+        return Err("이 파일 이름을 UTF-8로 읽을 수 없습니다.".into());
+    }
     let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     Ok(from_metadata(path, metadata))
 }
 /// Windows ReadDir already carries this metadata: do not reopen every cloud item.
 pub fn directory_entry(item: &fs::DirEntry) -> Result<FileEntry, String> {
+    #[cfg(target_os = "macos")]
+    if item.path().to_str().is_none() {
+        return Err("이 파일 이름을 UTF-8로 읽을 수 없습니다.".into());
+    }
     let metadata = item.metadata().map_err(|e| e.to_string())?;
     Ok(from_metadata(&item.path(), metadata))
 }
@@ -110,6 +118,15 @@ pub fn list_folder(
     Ok(skipped)
 }
 
+#[cfg(target_os = "macos")]
+pub fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', ':', '\0']) {
+        return Err("파일 이름에 사용할 수 없는 문자가 있습니다.".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.encode_utf16().count() > 255

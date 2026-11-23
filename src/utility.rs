@@ -79,6 +79,34 @@ pub fn screen_cursor_position() -> Result<(i32, i32), String> {
     Ok((point.x, point.y))
 }
 pub fn run(action: &Utility) -> Result<Option<u32>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        match action {
+            Utility::CopyPaths(paths) => crate::macos::copy_path_text(paths).map(|()| None),
+            Utility::Explorer(path) => {
+                crate::macos::reveal(path);
+                Ok(None)
+            }
+            Utility::Terminal(path) => {
+                let status = Command::new("/usr/bin/open")
+                    .args(["-a", "Terminal"])
+                    .arg(path.to_path())
+                    .status()
+                    .map_err(|error| error.to_string())?;
+                status
+                    .success()
+                    .then_some(None)
+                    .ok_or_else(|| "터미널을 열 수 없습니다.".into())
+            }
+            Utility::PropertiesSelection { entries, .. } => entries
+                .first()
+                .ok_or_else(|| "항목을 선택해 주세요.".to_string())
+                .and_then(crate::macos::properties)
+                .map(|()| None),
+            _ => Err("이 작업은 macOS에서 지원하지 않습니다.".into()),
+        }
+    }
     #[cfg(windows)]
     {
         use windows::{
@@ -183,7 +211,7 @@ pub fn run(action: &Utility) -> Result<Option<u32>, String> {
             } => folder_menu::run(folder, entries, *owner, *point),
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = action;
         Err("Windows 전용 기능입니다.".into())

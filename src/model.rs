@@ -231,6 +231,7 @@ pub struct Tab {
     type_ahead: String,
     type_ahead_at: Option<std::time::Instant>,
     pub filter: String,
+    filter_revision: u64,
     pub sort: SortColumn,
     pub descending: bool,
     pub scroll: f64,
@@ -333,6 +334,16 @@ impl ViewGeometry {
     }
 }
 impl Tab {
+    fn next_filter_revision() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn filter_revision(&self) -> u64 {
+        self.filter_revision
+    }
+
     pub fn new(path: NativePath) -> Self {
         Self {
             path,
@@ -348,6 +359,7 @@ impl Tab {
             type_ahead: String::new(),
             type_ahead_at: None,
             filter: String::new(),
+            filter_revision: Self::next_filter_revision(),
             sort: SortColumn::Name,
             descending: false,
             scroll: 0.,
@@ -425,7 +437,11 @@ impl Tab {
             .into_iter()
             .rev()
             .collect();
-        self.filter = state.filter.chars().take(4096).collect();
+        let filter: String = state.filter.chars().take(4096).collect();
+        if filter != self.filter {
+            self.filter_revision = Self::next_filter_revision();
+            self.filter = filter;
+        }
         self.sort = state.sort;
         self.group_by = state.group_by;
         self.descending = state.descending;
@@ -547,6 +563,12 @@ impl Tab {
         }
     }
 
+    /// Replace the filter input when a file operation or command clears its draft.
+    pub fn clear_filter(&mut self) {
+        self.filter_revision = Self::next_filter_revision();
+        self.set_filter(String::new());
+    }
+
     pub fn set_filter(&mut self, filter: String) {
         self.resume = None;
         self.filter = filter;
@@ -590,7 +612,7 @@ impl Tab {
             .map(|&i| &self.entries[i].path)
             .collect();
         if results.iter().any(|p| !visible.contains(p)) {
-            self.set_filter(String::new());
+            self.clear_filter();
         }
         let position = self
             .visible

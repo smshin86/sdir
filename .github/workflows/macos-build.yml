@@ -1,0 +1,27 @@
+name: macOS Apple Silicon
+
+on:
+  push:
+    branches: [macos-apple-silicon]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.96.0 --profile minimal
+      - run: cargo +1.96.0 test --locked --features desktop
+      - run: rustup run 1.96.0 bash scripts/package-macos.sh
+      - run: python3 scripts/verify-macos-package.py dist/SDIR-macos-arm64-*.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SDIR-macos-arm64
+          path: dist/SDIR-macos-arm64-*.dmg
+          if-no-files-found: error

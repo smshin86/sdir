@@ -14,6 +14,8 @@ use std::{
 
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_DEPTH: usize = 128;
+const SEARCH_HIT_LIMIT: u32 = 200;
+const ACCESS_CHECK_LIMIT: u32 = 512;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchHit {
     pub path: NativePath,
@@ -207,6 +209,33 @@ pub(crate) fn query_index_with_exclusion(
     excluded: Option<&crate::index_policy::RelativePathRoot>,
     budget: &Budget<'_>,
 ) -> Result<SearchResult, String> {
+    query_index_with_access(
+        index,
+        root,
+        text,
+        complete,
+        QueryScope { scope, excluded },
+        budget,
+        None,
+    )
+}
+
+pub(crate) struct QueryScope<'a> {
+    pub scope: Option<&'a crate::index_policy::ScopePolicy>,
+    pub excluded: Option<&'a crate::index_policy::RelativePathRoot>,
+}
+
+type AccessCheck<'a> = dyn FnMut(&[u8], Frn, bool) -> bool + 'a;
+
+pub(crate) fn query_index_with_access(
+    index: &VolumeIndex,
+    root: &NativePath,
+    text: &str,
+    complete: bool,
+    QueryScope { scope, excluded }: QueryScope<'_>,
+    budget: &Budget<'_>,
+    mut access: Option<&mut AccessCheck<'_>>,
+) -> Result<SearchResult, String> {
     let started = Instant::now();
     validate_query_text(text)?;
     if text.trim().is_empty() {
@@ -221,11 +250,18 @@ pub(crate) fn query_index_with_exclusion(
     let scoped_policy = scope
         .filter(|policy| !policy.include_roots().is_empty() || !policy.exclude_roots().is_empty());
     let filtered = scoped_policy.is_some() || excluded.is_some();
-    if filtered && budget.check() {
+    let restricted = access.is_some();
+    if filtered && !restricted && budget.check() {
         return Err(search_timeout_error());
     }
 
     let mut parsed = parse_query(text).map_err(|error| error.to_string())?;
+    if access.is_some() && has_graph_dependency(parsed.expr.as_ref()) {
+        return Err(
+            "전체 드라이브 검색에서는 Related, Count, TotalChildSize 조건을 지원하지 않습니다."
+                .into(),
+        );
+    }
     let mount_prefix = if filtered {
         scoped_mount_prefix(root)
     } else {
@@ -235,22 +271,10 @@ pub(crate) fn query_index_with_exclusion(
         use goz_core::query::Expr;
         let mut terms = parsed.expr.take().into_iter().collect::<Vec<_>>();
         if let Some(policy) = scoped_policy {
-            let mut graph_dependent = false;
-            if let Some(expression) = terms.first() {
-                expression.for_each_leaf(&mut |leaf| {
-                    if matches!(
-                        leaf,
-                        goz_core::query::Leaf::Related { .. }
-                            | goz_core::query::Leaf::Count { .. }
-                            | goz_core::query::Leaf::TotalChildSize(_)
-                    ) {
-                        graph_dependent = true;
-                    }
-                });
-            }
-            if graph_dependent {
+            if has_graph_dependency(terms.first()) {
                 return Err(
-                    "범위 검색에서는 Related, Count, TotalChildSize 조건을 지원하지 않습니다.".into(),
+                    "범위 검색에서는 Related, Count, TotalChildSize 조건을 지원하지 않습니다."
+                        .into(),
                 );
             }
             terms.push(scoped_expression(policy, &mount_prefix));
@@ -263,49 +287,81 @@ pub(crate) fn query_index_with_exclusion(
         }
         parsed.expr = Some(Expr::And(terms));
     }
-    if filtered && budget.check() {
-        return Err(search_timeout_error());
-    }
-    let out = run_query_refs(
-        index,
-        &mount_prefix,
-        &parsed,
-        None,
-        Default::default(),
-        0,
-        Some(200),
-        false,
-        budget,
-    )
-    .map_err(|_| search_timeout_error())?;
-    if filtered && budget.check() {
-        return Err(search_timeout_error());
-    }
-
-    let mut hits = vec![];
-    for result in out.refs {
-        if filtered && budget.check() {
+    let limit = if restricted {
+        ACCESS_CHECK_LIMIT
+    } else {
+        SEARCH_HIT_LIMIT
+    };
+    let out = if (filtered || restricted) && budget.check() {
+        None
+    } else {
+        run_query_refs(
+            index,
+            &mount_prefix,
+            &parsed,
+            None,
+            Default::default(),
+            0,
+            Some(limit),
+            false,
+            budget,
+        )
+        .ok()
+    };
+    let Some(out) = out else {
+        if !restricted {
             return Err(search_timeout_error());
         }
-        let mut relative = vec![];
+        return Ok(SearchResult {
+            hits: vec![],
+            total: 0,
+            elapsed_ms: started.elapsed().as_secs_f64() * 1000.,
+            complete: false,
+        });
+    };
+
+    let mut hits = vec![];
+    let mut visible_total = 0;
+    let mut complete = complete && (!restricted || out.refs.len() < limit as usize);
+    let mut relative = Vec::new();
+    for result in out.refs {
+        if (filtered || restricted) && budget.check() {
+            if !restricted {
+                return Err(search_timeout_error());
+            }
+            complete = false;
+            break;
+        }
+        relative.clear();
         if index.path_of(result.idx, &mut relative) != PathStatus::Ok {
+            continue;
+        }
+        let is_dir = index.entry(result.idx).is_dir();
+        if access
+            .as_mut()
+            .is_some_and(|allows| !allows(&relative, result.frn, is_dir))
+        {
+            continue;
+        }
+        visible_total += 1;
+        if hits.len() == SEARCH_HIT_LIMIT as usize {
             continue;
         }
         let path = join_relative(root, &relative);
         hits.push(SearchHit {
             name: path.name(),
             path,
-            is_dir: index.entry(result.idx).is_dir(),
+            is_dir,
             volume_guid: None,
             volume_mount: None,
         });
     }
-    if filtered && budget.check() {
+    if !restricted && filtered && budget.check() {
         return Err(search_timeout_error());
     }
     Ok(SearchResult {
         hits,
-        total: out.total,
+        total: if restricted { visible_total } else { out.total },
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.,
         complete,
     })
@@ -375,6 +431,20 @@ fn scoped_full_path_leaf(path: &str, exact: bool) -> goz_core::query::Expr {
         skip: goz_core::query::Skip::default(),
     })
 }
+fn has_graph_dependency(expr: Option<&goz_core::query::Expr>) -> bool {
+    use goz_core::query::Leaf;
+    let mut dependent = false;
+    if let Some(expr) = expr {
+        expr.for_each_leaf(&mut |leaf| {
+            dependent |= matches!(
+                leaf,
+                Leaf::Related { .. } | Leaf::Count { .. } | Leaf::TotalChildSize(_)
+            );
+        });
+    }
+    dependent
+}
+
 fn join_relative(root: &NativePath, relative: &[u8]) -> NativePath {
     #[cfg(windows)]
     {
@@ -412,6 +482,98 @@ mod tests {
         assert_eq!(result.hits[0].path.to_path(), file);
         assert!(index.query("ext:txt").unwrap().total == 1);
     }
+    #[test]
+    fn authorized_query_counts_only_visible_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["shared-hit.txt", "private-hit.txt", "revoked-hit.txt"] {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let mut folder = FolderIndex::new(NativePath::new(dir.path())).unwrap();
+        folder.step(32);
+        let result = query_index_with_access(
+            &folder.index,
+            &folder.root,
+            "hit.txt",
+            true,
+            QueryScope {
+                scope: None,
+                excluded: None,
+            },
+            &Budget::unlimited(),
+            Some(&mut |name, _, _| name == b"shared-hit.txt"),
+        )
+        .unwrap();
+        assert!(result.complete);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.hits[0].name, "shared-hit.txt");
+    }
+
+    #[test]
+    fn slow_access_checks_keep_verified_results() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["matched-a-shared.txt", "matched-z-unverified.txt"] {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let mut folder = FolderIndex::new(NativePath::new(dir.path())).unwrap();
+        folder.step(10);
+        let cancelled = AtomicBool::new(false);
+        let budget = Budget::until(Instant::now() + Duration::from_millis(200), &cancelled);
+        let mut checked = 0;
+        let result = query_index_with_access(
+            &folder.index,
+            &folder.root,
+            "matched-",
+            true,
+            QueryScope {
+                scope: None,
+                excluded: None,
+            },
+            &budget,
+            Some(&mut |name, _, _| {
+                checked += 1;
+                assert_eq!(name, b"matched-a-shared.txt");
+                std::thread::sleep(Duration::from_millis(225));
+                true
+            }),
+        )
+        .expect("an expired search deadline must still return verified hits");
+        assert_eq!(checked, 1);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.hits[0].name, "matched-a-shared.txt");
+        assert!(!result.complete);
+    }
+
+    #[test]
+    fn authorization_work_is_bounded_and_remaining_matches_are_not_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..=ACCESS_CHECK_LIMIT {
+            fs::write(dir.path().join(format!("record-{n:04}.txt")), b"").unwrap();
+        }
+        let mut folder = FolderIndex::new(NativePath::new(dir.path())).unwrap();
+        folder.step(ACCESS_CHECK_LIMIT as usize + 2);
+        let mut checked = 0;
+        let result = query_index_with_access(
+            &folder.index,
+            &folder.root,
+            "record-",
+            true,
+            QueryScope {
+                scope: None,
+                excluded: None,
+            },
+            &Budget::unlimited(),
+            Some(&mut |_, _, _| {
+                checked += 1;
+                checked % 2 == 0
+            }),
+        )
+        .unwrap();
+        assert!(!result.complete);
+        assert_eq!(checked, ACCESS_CHECK_LIMIT);
+        assert_eq!(result.total, u64::from(ACCESS_CHECK_LIMIT / 2));
+        assert_eq!(result.hits.len(), SEARCH_HIT_LIMIT as usize);
+    }
+
     #[cfg(unix)]
     #[test]
     fn index_does_not_follow_symlink_loops() {
@@ -483,15 +645,29 @@ mod tests {
         let index = completed_index(fixture.path());
         let excluded = crate::index_policy::RelativePathRoot::parse("WINDOWS/winsxs").unwrap();
         let query = |text, scope, exclusion| {
-            query_index_with_exclusion(&index.index, &index.root, text, index.done, scope,
-                exclusion, &Budget::unlimited()).unwrap()
+            query_index_with_exclusion(
+                &index.index,
+                &index.root,
+                text,
+                index.done,
+                scope,
+                exclusion,
+                &Budget::unlimited(),
+            )
+            .unwrap()
         };
         let filtered = query("component.txt", None, Some(&excluded));
         assert_eq!(filtered.total, 1);
-        assert_eq!(filtered.hits[0].path.to_path(), shown.join("z-component.txt"));
+        assert_eq!(
+            filtered.hits[0].path.to_path(),
+            shown.join("z-component.txt")
+        );
         assert_eq!(query("component.txt", None, None).total, 206);
         let custom = make_scope(&["Windows"], &["Windows/WinSxS-backup"]);
-        assert_eq!(query("component.txt", Some(&custom), Some(&excluded)).total, 0);
+        assert_eq!(
+            query("component.txt", Some(&custom), Some(&excluded)).total,
+            0
+        );
         let _ = query("parent-count:1", None, Some(&excluded));
     }
 

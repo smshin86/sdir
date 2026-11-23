@@ -134,7 +134,7 @@ pub(super) struct FolderSearch {
     text: String,
     due: Option<Instant>,
     query_id: u64,
-    result: Option<SearchResult>,
+    pub(super) result: Option<SearchResult>,
     error: Option<String>,
 }
 
@@ -300,11 +300,13 @@ pub(super) fn FolderSearchDialog(mut model: Signal<AppModel>) -> Element {
                 div{class:"folder-search-hits",
                     for hit in result.hits {
                         {let b=bridge.clone();let path=hit.path.display();let name=hit.name.clone();
+                            let is_dir=hit.is_dir;
+                            let appearance=if is_dir{None}else{model.read().file_appearance.for_type(&name)};
                             rsx!{button{key:"{path}",title:"{path}",
                                 onclick:move |_| {
                                     close_folder_search(model,&b);
                                     reveal_hit_in(model,&b,hit.clone(),Some(pane));
-                                },strong{"{name}"}span{"{path}"}
+                                },{file_icon(is_dir, appearance.as_deref(), false)}div{strong{"{name}"}span{"{path}"}}
                             }}
                         }
                     }

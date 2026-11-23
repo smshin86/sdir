@@ -134,7 +134,35 @@ pub fn run(
             }
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        use notify::{
+            EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+            event::{ModifyKind, RenameMode},
+        };
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(send, notify::Config::default())
+            .map_err(|error| error.to_string())?;
+        watcher
+            .watch(&root.to_path(), RecursiveMode::NonRecursive)
+            .map_err(|error| error.to_string())?;
+        ready();
+        for result in receive {
+            let event = result.map_err(|error| error.to_string())?;
+            let renames = match (&event.kind, event.paths.as_slice()) {
+                (EventKind::Modify(ModifyKind::Name(RenameMode::Both)), [from, to]) => {
+                    vec![Rename {
+                        from: NativePath::new(from),
+                        to: NativePath::new(to),
+                    }]
+                }
+                _ => Vec::new(),
+            };
+            changed(renames);
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (root, &mut ready, &mut changed);
         Err("폴더 변경 감시는 Windows 전용입니다.".into())

@@ -1,4 +1,12 @@
 #[cfg(windows)]
+const SERVICE_PROTOCOL: u32 = 2;
+
+#[cfg(windows)]
+pub(crate) fn service_pipe_name(pipe_id: &str) -> String {
+    format!(r"\\.\pipe\SDIR-index-v{SERVICE_PROTOCOL}-{pipe_id}")
+}
+
+#[cfg(windows)]
 mod windows_service {
     use std::{
         ffi::c_void,
@@ -120,6 +128,9 @@ mod windows_service {
             }
         };
 
+        if read_registry_dword(OWNER_KEY, "SearchProtocol").ok() != Some(super::SERVICE_PROTOCOL) {
+            return Ok(None);
+        }
         let owner_sid = read_owner_sid()?;
         let current_sid = current_process_user_sid()?;
         if !sid_equal(&owner_sid, &current_sid) {
@@ -184,7 +195,7 @@ mod windows_service {
 
             let arguments = [
                 "--protocol".into(),
-                "1".into(),
+                super::SERVICE_PROTOCOL.to_string(),
                 "--pipe-id".into(),
                 pipe_id.into(),
                 "--parent".into(),
@@ -571,10 +582,11 @@ mod windows_service {
             .iter()
             .map(|value| wide_argument(*value))
             .collect::<Result<Vec<_>, _>>()?;
+        let protocol = super::SERVICE_PROTOCOL.to_string();
         let expected_names = [
             SERVICE_NAME,
             "--protocol",
-            "1",
+            &protocol,
             "--pipe-id",
             "",
             "--parent",

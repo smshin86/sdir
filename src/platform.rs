@@ -1,6 +1,6 @@
 use crate::{
     filesystem::validate_action,
-    history::{self, Change},
+    history,
     model::{FileAction, JobResult, NativePath},
 };
 
@@ -31,16 +31,18 @@ where
                 .collect(),
         };
     }
+    #[cfg(target_os = "macos")]
+    let (result, destinations, changes, mut outcomes) = crate::macos::perform(action, progress);
     #[cfg(windows)]
     let (result, destinations, changes, mut outcomes) =
         windows_impl::perform(action, std::sync::Arc::new(progress));
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = progress;
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let (result, destinations, changes, mut outcomes): (
         Result<bool, String>,
         Vec<NativePath>,
-        Vec<Change>,
+        Vec<crate::history::Change>,
         Vec<crate::model::ItemOutcome>,
     ) = (
         Err("파일 작업은 Windows 빌드에서 지원합니다.".into()),
@@ -133,44 +135,60 @@ where
 }
 
 pub fn open_path(path: &NativePath) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::open(path)
+    }
     #[cfg(windows)]
     {
         windows_impl::open(path)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = path;
         Err("Windows 전용 기능입니다.".into())
     }
 }
 pub fn clipboard_set(paths: &[NativePath], cut: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::clip_write(paths, cut)
+    }
     #[cfg(windows)]
     {
         windows_impl::clipboard_set(paths, cut)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (paths, cut);
         Err("Windows 전용 기능입니다.".into())
     }
 }
 pub fn clipboard_get() -> Result<(Vec<NativePath>, bool), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::clip_read()
+    }
     #[cfg(windows)]
     {
         windows_impl::clipboard_get()
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Err("Windows 전용 기능입니다.".into())
     }
 }
 /// A nonblocking sequence check invalidates visual marks after another app replaces the clipboard.
 pub fn clipboard_sequence() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::clip_sequence()
+    }
     #[cfg(windows)]
     unsafe {
         windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         0
     }
@@ -227,6 +245,10 @@ pub(crate) unsafe fn wait_shell_windows() {
 }
 
 pub fn properties(path: &NativePath) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::properties(path)
+    }
     #[cfg(windows)]
     unsafe {
         use windows::{
@@ -253,7 +275,7 @@ pub fn properties(path: &NativePath) -> Result<(), String> {
             Err("속성 창을 열지 못했습니다.".into())
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = path;
         Err("Windows 전용 기능입니다.".into())
@@ -261,6 +283,18 @@ pub fn properties(path: &NativePath) -> Result<(), String> {
 }
 
 pub fn navigation_locations() -> Vec<(String, NativePath)> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = crate::settings::home().to_path();
+        [
+            ("바탕 화면", "Desktop"),
+            ("다운로드", "Downloads"),
+            ("문서", "Documents"),
+        ]
+        .into_iter()
+        .map(|(label, name)| (label.into(), NativePath::new(home.join(name))))
+        .collect()
+    }
     #[cfg(windows)]
     {
         use windows::Win32::{
@@ -291,12 +325,27 @@ pub fn navigation_locations() -> Vec<(String, NativePath)> {
         })
         .collect()
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         vec![]
     }
 }
 pub fn navigation_drives() -> Vec<NativePath> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots = vec![NativePath::new("/")];
+        if let Ok(volumes) = std::fs::read_dir("/Volumes") {
+            roots.extend(volumes.flatten().filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(|kind| kind.is_dir())
+                    .map(|_| NativePath::new(entry.path()))
+            }));
+        }
+        roots.sort();
+        roots
+    }
     #[cfg(windows)]
     {
         let mask = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
@@ -305,7 +354,7 @@ pub fn navigation_drives() -> Vec<NativePath> {
             .map(|n| NativePath::new(format!("{}:\\", (b'A' + n) as char)))
             .collect()
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         vec![]
     }
@@ -314,6 +363,7 @@ pub fn navigation_drives() -> Vec<NativePath> {
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
+    use crate::history::Change;
     use crate::history::{ChangeKind, ItemSource, ItemTarget, RecycledItem};
     use windows::{
         Win32::{

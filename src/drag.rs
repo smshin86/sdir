@@ -12,6 +12,18 @@ pub struct DragTicket {
     right: bool,
 }
 
+#[cfg(target_os = "macos")]
+pub fn same_volume(source: &NativePath, destination: &NativePath) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::metadata(source.to_path()),
+        std::fs::metadata(destination.to_path()),
+    ) {
+        (Ok(source), Ok(destination)) => source.dev() == destination.dev(),
+        _ => false,
+    }
+}
+
 #[cfg(windows)]
 pub fn same_volume(source: &NativePath, destination: &NativePath) -> bool {
     use windows::{

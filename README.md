@@ -4,6 +4,12 @@ Windows용 다중 패널 파일 관리자입니다. Rust + Dioxus Desktop으로 
 
 최신 구현·여정 테스트·실측과 미확인 환경은 [검증 요약](docs/test-summary.md)을 확인하세요.
 
+## macOS Apple Silicon
+
+macOS 앱에서는 다중 패널과 탭, 작업공간, 폴더별 검색, 파일 작업을 사용할 수 있습니다. 통합검색의 기본 소스는 Spotlight입니다. 색인에 포함되지 않은 위치는 설정에서 현재 폴더를 색인해 검색할 수 있습니다. `⌘C`와 `⌘V`로 파일을 복사하고, `⌘⌥V`로 복사한 파일을 이동합니다. `Return`은 이름 변경, `⌘↓`는 열기, `⌘Delete`는 휴지통 이동입니다.
+
+Apple Silicon Mac에서 `cargo test --locked --features desktop`을 실행하고 `bash scripts/package-macos.sh`로 `dist/SDIR-macos-arm64-<version>.dmg`를 만듭니다. Rust 1.94 이상, Xcode Command Line Tools, Python 3이 필요합니다. 이 스크립트는 개발 시험용으로 로컬 서명합니다. 외부 배포에는 Apple Developer ID 서명과 공증을 적용할 수 있습니다.
+
 ## 실행
 
 `dist/SDIR-windows-x64-portable.zip`을 풀고 `SDIR.exe`를 실행합니다. `Start-SDIR.cmd`로 WebView2 설치 여부를 먼저 확인할 수도 있습니다. 파일 탐색과 현재 폴더 검색에는 별도 검색 프로그램이나 관리자 권한이 필요하지 않습니다. Windows 10/11 x64, Microsoft Edge WebView2 Runtime이 필요합니다. 앱은 Windows 서비스나 시작 프로그램을 등록하지 않습니다.

@@ -11,6 +11,12 @@ pub(super) struct ContextMenu {
     pub keyboard: bool,
     pub tab: Option<usize>,
 }
+#[cfg(target_os = "macos")]
+fn app_window_handle() -> u64 {
+    0
+}
+
+#[cfg(windows)]
 fn app_window_handle() -> u64 {
     use dioxus::desktop::tao::platform::windows::WindowExtWindows;
     dioxus::desktop::window().window.hwnd() as usize as u64
@@ -60,38 +66,44 @@ pub(super) fn open_context(
     let target_tab = s.panes[pane].active;
     let folder = s.panes[pane].tab().path.clone();
     let request = s.interaction;
-    let action = Utility::FolderMenu {
-        request,
-        folder,
-        entries: if background {
-            Vec::new()
-        } else {
-            paths.clone()
-        },
-        owner: app_window_handle(),
-        point: if keyboard {
-            None
-        } else {
-            sdir::utility::screen_cursor_position().ok()
-        },
+    let context = ContextMenu {
+        pane,
+        target_tab,
+        paths,
+        x,
+        y,
+        background,
+        keyboard,
+        tab: None,
     };
-    s.pending_context = Some((
-        request,
-        ContextMenu {
-            pane,
-            target_tab,
-            paths,
-            x,
-            y,
-            background,
-            keyboard,
-            tab: None,
-        },
-    ));
-    s.dirty();
-    drop(s);
-    if let Err(error) = bridge.utility(action.clone()) {
-        finish_context(model, &action, Err(error));
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (bridge, folder, request);
+        s.context = Some(context);
+    }
+    #[cfg(windows)]
+    {
+        let action = Utility::FolderMenu {
+            request,
+            folder,
+            entries: if background {
+                Vec::new()
+            } else {
+                context.paths.clone()
+            },
+            owner: app_window_handle(),
+            point: if keyboard {
+                None
+            } else {
+                sdir::utility::screen_cursor_position().ok()
+            },
+        };
+        s.pending_context = Some((request, context));
+        s.dirty();
+        drop(s);
+        if let Err(error) = bridge.utility(action.clone()) {
+            finish_context(model, &action, Err(error));
+        }
     }
 }
 
@@ -136,10 +148,15 @@ pub(super) fn finish_context(
     {
         return;
     }
-    let active = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-    if active.0 as usize as u64 != *owner {
-        return;
+    #[cfg(windows)]
+    {
+        let active = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        if active.0 as usize as u64 != *owner {
+            return;
+        }
     }
+    #[cfg(target_os = "macos")]
+    let _ = owner;
     match result {
         Ok(Some(sdir::utility::SDIR_MENU_SELECTED)) => state.context = Some(context),
         Err(error) => {
@@ -287,6 +304,10 @@ fn context_command(mut model: Signal<AppModel>, bridge: &Bridge, command: &str) 
             model.read().panes[c.pane].tabs[c.target_tab].path.clone(),
         )),
         "explorer" => bridge.utility(Utility::Explorer(path)),
+        "properties" if cfg!(target_os = "macos") => {
+            model.write().inspector = Some(Inspector::Details);
+            Ok(())
+        }
         "properties" => {
             let folder = model.read().panes[c.pane].tabs[c.target_tab].path.clone();
             selected_properties(bridge, folder, c.paths)
@@ -442,6 +463,17 @@ pub(super) fn ContextMenuView(mut model: Signal<AppModel>) -> Element {
             ("속성", "properties"),
         ]
     };
+    let entries = entries.into_iter().filter_map(|(label, command)| {
+        if cfg!(target_os = "macos") {
+            match command {
+                "with" | "windows_menu" => return None,
+                "explorer" => return Some(("Finder에서 표시", command)),
+                "properties" => return Some(("정보 보기", command)),
+                _ => {}
+            }
+        }
+        Some((label, command))
+    });
     let menu_label = if c.background {
         "폴더 배경 메뉴"
     } else if c.tab.is_some() {
@@ -860,6 +892,7 @@ pub(super) struct ArmedDrag {
     id: u64,
     source: DropPoint,
     files: Option<DragFiles>,
+    #[cfg(windows)]
     capture: Option<sdir::drag::MouseGesture>,
 }
 
@@ -938,11 +971,13 @@ impl DropPoint {
 }
 
 pub(super) fn handle_drag(mut model: Signal<AppModel>, bridge: &Arc<Bridge>, message: &str) {
+    #[cfg(windows)]
     use sdir::drag::{CursorWindow, cursor_window};
     let Ok(message) = serde_json::from_str::<DragMessage>(message) else {
         return;
     };
     match message {
+        #[cfg(windows)]
         DragMessage::Arm { id, source } => {
             let owner = app_window_handle();
             let events = {
@@ -1011,6 +1046,21 @@ pub(super) fn handle_drag(mut model: Signal<AppModel>, bridge: &Arc<Bridge>, mes
                     drag.capture = None;
                 }
             });
+        }
+        #[cfg(target_os = "macos")]
+        DragMessage::Arm { id, source } => {
+            let mut state = model.write();
+            if !state.closing
+                && !state.modal_open()
+                && state.job.is_none()
+                && matches!(source.resolve(&state), Some((_, Some(_))))
+            {
+                state.file_drag = Some(ArmedDrag {
+                    id,
+                    source,
+                    files: None,
+                });
+            }
         }
         DragMessage::Begin { id } => {
             let mut state = model.write();
@@ -1089,6 +1139,7 @@ pub(super) fn handle_drag(mut model: Signal<AppModel>, bridge: &Arc<Bridge>, mes
             else {
                 return;
             };
+            #[cfg(windows)]
             if cursor_window(app_window_handle()) != CursorWindow::Own {
                 return;
             }
@@ -1140,7 +1191,7 @@ fn drop_in_app(
             }
         }
     };
-    if alt || (ctrl && shift) {
+    if cfg!(windows) && (alt || (ctrl && shift)) {
         if let Err(error) = bridge.utility(Utility::CreateShortcuts {
             folder: destination,
             paths: files.paths,
@@ -1149,7 +1200,8 @@ fn drop_in_app(
         }
         return;
     }
-    let moving = shift || (!ctrl && sdir::drag::same_volume(&files.folder, &destination));
+    let copying = if cfg!(windows) { ctrl } else { alt };
+    let moving = !copying && (shift || sdir::drag::same_volume(&files.folder, &destination));
     if moving && files.folder == destination {
         return;
     }
@@ -1185,7 +1237,7 @@ fn submit_drop(model: Signal<AppModel>, bridge: &Bridge, pane: usize, action: Fi
     submit_context(model, bridge, action, requested);
 }
 
-pub(super) fn drop_from_windows(
+pub(super) fn drop_external_files(
     model: Signal<AppModel>,
     bridge: &Bridge,
     pane: usize,
@@ -1212,6 +1264,7 @@ pub(super) fn drop_from_windows(
     }
 }
 
+#[cfg(windows)]
 fn start_drag(
     mut model: Signal<AppModel>,
     bridge: &Bridge,

@@ -19,12 +19,35 @@ fn row_height(compact: bool) -> f64 {
     if compact { 30. } else { 38. }
 }
 mod extras;
+mod file_appearance;
+use file_appearance::*;
 mod parity;
 use parity::*;
+mod pane_arrangement;
+use pane_arrangement::{LayoutSwitcher, grid_style};
+use sdir::pane_arrangement::PaneArrangement;
+#[cfg(windows)]
 #[path = "ui/lifecycle.rs"]
 mod lifecycle;
+#[cfg(target_os = "macos")]
+#[path = "ui/lifecycle_macos.rs"]
+mod lifecycle;
+#[path = "ui/session_close.rs"]
+mod session_close;
+
+const PLATFORM_NAME: &str = if cfg!(windows) { "Windows" } else { "macOS" };
+
+fn command_modifier(modifiers: Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.meta()
+    } else {
+        modifiers.ctrl()
+    }
+}
 use extras::*;
 const STYLE: &str = include_str!("style.css");
+const SIDEBAR_MIN_WIDTH: u16 = 155;
+const SIDEBAR_MAX_WIDTH: u16 = 360;
 #[derive(Clone)]
 enum Dialog {
     NewFolder,
@@ -157,6 +180,8 @@ struct AppModel {
     theme: Theme,
     compact: bool,
     action_bar_visible: bool,
+    sidebar_visible: bool,
+    sidebar_width: Option<u16>,
     search_preferences: sdir::preferences::SearchPreferences,
     ntfs_indexing: sdir::index_policy::NtfsIndexingSettings,
     resume_live_index: bool,
@@ -176,6 +201,7 @@ struct AppModel {
     tree_tasks: std::collections::VecDeque<(NativePath, bool)>,
     tree_pending_auto: bool,
     layout: usize,
+    pane_arrangement: PaneArrangement,
     active: usize,
     favorites: Vec<NativePath>,
     recent_files: Vec<NativePath>,
@@ -210,6 +236,7 @@ struct AppModel {
     )>,
     index: Option<IndexStatus>,
     index_starting: bool,
+    spotlight: bool,
     search_live: bool,
     index_dirty: bool,
     query: String,
@@ -240,9 +267,10 @@ struct AppModel {
     thumbnails: BTreeMap<ThumbnailKey, Option<Arc<str>>>,
     thumbnail_order: std::collections::VecDeque<ThumbnailKey>,
     thumbnail_request: Option<(u64, Vec<ThumbnailKey>)>,
+    file_appearance: AppearanceCache,
     copy_destination: Option<CopyDestination>,
     dialog_name: String,
-    pastes: BTreeMap<u64, PasteContext>,
+    pastes: BTreeMap<u64, (PasteContext, bool)>,
     job_context: Option<JobContext>,
     undo: Vec<Record>,
     redo: Vec<Record>,
@@ -254,6 +282,7 @@ struct AppModel {
     clipboard_pending: Option<(u64, Vec<NativePath>, bool)>,
     reveal: BTreeMap<usize, PendingReveal>,
     file_drag: Option<ArmedDrag>,
+    #[cfg(windows)]
     external_drag: Option<(u64, sdir::drag::MouseGesture)>,
     save_due: Option<Instant>,
     pending_focus: Option<(usize, u64)>,
@@ -290,6 +319,10 @@ impl AppModel {
             theme: s.theme,
             compact: s.compact,
             action_bar_visible: s.action_bar_visible,
+            sidebar_visible: s.sidebar_visible,
+            sidebar_width: s
+                .sidebar_width
+                .map(|width| width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)),
             search_preferences,
             ntfs_indexing: s.ntfs_indexing,
             resume_live_index: s.resume_live_index,
@@ -324,6 +357,7 @@ impl AppModel {
             },
             tree_pending_auto: false,
             layout,
+            pane_arrangement: s.pane_arrangement.layout(layout).arrangement,
             active: s.active_pane.min(layout - 1),
             favorites: s.favorites,
             recent_files: s.recent_files.into_iter().take(32).collect(),
@@ -346,6 +380,7 @@ impl AppModel {
             pending_rebuild: None,
             index: None,
             index_starting: false,
+            spotlight: false,
             search_live: false,
             index_dirty: false,
             query: String::new(),
@@ -376,6 +411,7 @@ impl AppModel {
             thumbnails: BTreeMap::new(),
             thumbnail_order: Default::default(),
             thumbnail_request: None,
+            file_appearance: AppearanceCache::default(),
             copy_destination: None,
             dialog_name: String::new(),
             pastes: BTreeMap::new(),
@@ -390,6 +426,7 @@ impl AppModel {
             clipboard_pending: None,
             reveal: BTreeMap::new(),
             file_drag: None,
+            #[cfg(windows)]
             external_drag: None,
             save_due: None,
             pending_focus: Some((s.active_pane.min(layout - 1), 0)),
@@ -471,6 +508,7 @@ impl AppModel {
         Settings {
             version: 1,
             layout: self.layout,
+            pane_arrangement: self.pane_arrangement,
             panes: self
                 .panes
                 .iter()
@@ -487,6 +525,8 @@ impl AppModel {
             theme: self.theme,
             compact: self.compact,
             action_bar_visible: self.action_bar_visible,
+            sidebar_visible: self.sidebar_visible,
+            sidebar_width: self.sidebar_width,
             search_preferences: self.search_preferences.clone(),
             ntfs_indexing: self.ntfs_indexing.clone(),
             resume_live_index: self.resume_live_index,
@@ -579,36 +619,41 @@ fn window_config(
     placement: Option<&WindowPlacement>,
     independent: bool,
 ) -> dioxus::desktop::Config {
-    use dioxus::desktop::tao::{
-        platform::windows::{IconExtWindows, WindowBuilderExtWindows},
-        window::Icon,
-    };
     use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
-    let icon = Icon::from_resource(101, None).ok();
     let size = placement
         .map(|p| (p.width.clamp(980., 16384.), p.height.clamp(580., 16384.)))
         .unwrap_or((1380., 880.));
-    let mut config = Config::new()
-        .with_window(
-            WindowBuilder::new()
-                .with_title(if independent {
-                    "SDIR · 새 창"
-                } else {
-                    "SDIR · 가벼운 파일 작업공간"
-                })
-                .with_inner_size(LogicalSize::new(size.0, size.1))
-                .with_min_inner_size(LogicalSize::new(980., 580.))
-                .with_window_icon(icon.clone())
-                .with_taskbar_icon(icon),
-        )
+    let suffix = if independent { " · 새 창" } else { "" };
+    let window = WindowBuilder::new()
+        .with_title(format!(
+            "SDIR {} · {PLATFORM_NAME}{suffix}",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .with_inner_size(LogicalSize::new(size.0, size.1))
+        .with_min_inner_size(LogicalSize::new(980., 580.));
+    #[cfg(windows)]
+    let window = {
+        use dioxus::desktop::tao::{
+            platform::windows::{IconExtWindows, WindowBuilderExtWindows},
+            window::Icon,
+        };
+        let icon = Icon::from_resource(101, None).ok();
+        window
+            .with_window_icon(icon.clone())
+            .with_taskbar_icon(icon)
+    };
+    let config = Config::new()
+        .with_window(window)
         .with_menu(None)
         .with_data_directory(settings::data_dir().join("webview"));
     // Remote inspection is enabled only for explicitly requested local development runs.
-    if let Ok(port) = std::env::var("SDIR_DEBUG_PORT") {
-        if port.parse::<u16>().is_ok() {
-            config = config.with_windows_browser_args(format!("--remote-debugging-port={port}"));
+    #[cfg(windows)]
+    let config = match std::env::var("SDIR_DEBUG_PORT") {
+        Ok(port) if port.parse::<u16>().is_ok() => {
+            config.with_windows_browser_args(format!("--remote-debugging-port={port}"))
         }
-    }
+        _ => config,
+    };
     config
 }
 
@@ -616,6 +661,18 @@ fn new_window(path: NativePath) {
     let dom = VirtualDom::new(app).with_root_context(IndependentWindow(path));
     dioxus::desktop::window().new_window(dom, window_config(None, true));
 }
+#[cfg(target_os = "macos")]
+fn close_macos_window(model: Signal<AppModel>) {
+    let window = dioxus::desktop::window();
+    if try_consume_context::<IndependentWindow>().is_some() {
+        window.close();
+        return;
+    }
+    let writer = consume_context::<Arc<settings::SettingsWriter>>();
+    let bridge = consume_context::<Arc<Bridge>>();
+    session_close::save_then_close(model, &writer, &window, &bridge);
+}
+
 fn active_pane(model: Signal<AppModel>) -> usize {
     model.read().active
 }
@@ -910,7 +967,11 @@ fn copy(mut model: Signal<AppModel>, bridge: &Bridge, cut: bool) {
         Err(e) => model.write().notice = e,
     }
 }
-fn paste(mut model: Signal<AppModel>, bridge: &Bridge) {
+fn paste(model: Signal<AppModel>, bridge: &Bridge) {
+    paste_with_intent(model, bridge, false);
+}
+
+fn paste_with_intent(mut model: Signal<AppModel>, bridge: &Bridge, move_files: bool) {
     if model.read().job.is_some() {
         model.write().notice = "진행 중인 파일 작업이 끝난 뒤 다시 시도하세요.".into();
         return;
@@ -928,7 +989,7 @@ fn paste(mut model: Signal<AppModel>, bridge: &Bridge) {
             },
         )
     };
-    model.write().pastes.insert(id, context);
+    model.write().pastes.insert(id, (context, move_files));
     if let Err(e) = bridge.job(Request::ClipboardGet { id }) {
         let mut s = model.write();
         s.pastes.remove(&id);
@@ -1062,6 +1123,7 @@ fn reset_volume_session(s: &mut AppModel, id: u64, live: bool) {
     s.index = None;
     s.index_starting = true;
     s.search_live = live;
+    s.spotlight = false;
     s.index_dirty = false;
     s.result = None;
     s.search_error = None;
@@ -1070,6 +1132,20 @@ fn reset_volume_session(s: &mut AppModel, id: u64, live: bool) {
     s.query_loading = false;
     s.query_due = None;
     s.query_id += 1;
+}
+
+#[cfg(target_os = "macos")]
+fn start_spotlight(mut model: Signal<AppModel>, bridge: &Bridge) {
+    let id = {
+        let mut state = model.write();
+        let open = state.search_open;
+        let id = state.id();
+        reset_volume_session(&mut state, id, false);
+        state.spotlight = true;
+        state.search_open = open;
+        id
+    };
+    bridge.search.replace(Request::IndexSpotlight { id });
 }
 
 fn start_index(mut model: Signal<AppModel>, bridge: &Bridge) {
@@ -1652,6 +1728,7 @@ fn open_workspace(mut model: Signal<AppModel>, bridge: &Bridge, index: usize) {
         }
         s.panes = panes;
         s.layout = settings::valid_layout(workspace.layout);
+        s.pane_arrangement = workspace.pane_arrangement.layout(s.layout).arrangement;
         s.active = workspace.active_pane.min(s.layout - 1);
         s.search_target = s.search_target.filter(|&pane| pane < s.layout);
         s.pane_names = (0..4)
@@ -1762,9 +1839,16 @@ fn pane_shortcut(
     if event.is_composing() {
         return false;
     }
-    let control = event.modifiers().ctrl();
+    let control = command_modifier(event.modifiers());
     let key = event.key();
     let alt = event.modifiers().alt();
+    #[cfg(target_os = "macos")]
+    if control && matches!(&key, Key::Character(c) if c.eq_ignore_ascii_case("q")) {
+        event.prevent_default();
+        event.stop_propagation();
+        close_macos_window(model);
+        return true;
+    }
     if key == Key::F11 {
         event.prevent_default();
         event.stop_propagation();
@@ -1797,7 +1881,9 @@ fn pane_shortcut(
     }
 
     let char_key = |name: &str| matches!(&key,Key::Character(c) if c.eq_ignore_ascii_case(name));
-    if alt && matches!(key, Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp) {
+    if (alt || (cfg!(target_os = "macos") && control && key == Key::ArrowUp))
+        && matches!(key, Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp)
+    {
         event.prevent_default();
         event.stop_propagation();
         if key == Key::ArrowUp {
@@ -1822,7 +1908,15 @@ fn pane_shortcut(
         s.inspector = (s.inspector != Some(mode)).then_some(mode);
         return true;
     }
-    if alt && key == Key::Enter {
+    if cfg!(target_os = "macos") && control && !alt && char_key("i") {
+        event.prevent_default();
+        event.stop_propagation();
+        let mut state = model.write();
+        state.inspector =
+            (state.inspector != Some(Inspector::Details)).then_some(Inspector::Details);
+        return true;
+    }
+    if cfg!(windows) && alt && key == Key::Enter {
         event.prevent_default();
         event.stop_propagation();
         let (folder, paths) = {
@@ -1929,7 +2023,10 @@ fn pane_shortcut(
         if close_window {
             event.prevent_default();
             event.stop_propagation();
+            #[cfg(windows)]
             lifecycle::request_close(&dioxus::desktop::window());
+            #[cfg(target_os = "macos")]
+            close_macos_window(model);
             return true;
         }
         Some(TabCommand::Close(tab))
@@ -2235,7 +2332,7 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
     if pane_shortcut(&event, model, pane, bridge) {
         return;
     }
-    let ctrl = event.modifiers().ctrl();
+    let ctrl = command_modifier(event.modifiers());
     let shift = event.modifiers().shift();
     let key = event.key();
     let cursor_key = matches!(
@@ -2250,6 +2347,11 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
             | Key::PageUp
     );
     let space = matches!(&key, Key::Character(text) if text == " ");
+    if cfg!(target_os = "macos") && ctrl && event.modifiers().alt() && event.code() == Code::KeyV {
+        event.prevent_default();
+        paste_with_intent(model, bridge, true);
+        return;
+    }
     if ctrl && !cursor_key && !space {
         if let Key::Character(ref k) = key {
             match k.to_lowercase().as_str() {
@@ -2263,7 +2365,7 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
                         .map(|&i| t.entries[i].path.clone())
                         .collect();
                 }
-                "d" => {
+                "d" if cfg!(windows) => {
                     event.prevent_default();
                     dialog(model, "recycle");
                 }
@@ -2307,7 +2409,14 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
         }
         return;
     }
-    if event.modifiers().alt() || event.modifiers().meta() {
+    let mac_open = cfg!(target_os = "macos") && ctrl && key == Key::ArrowDown;
+    let mac_trash = cfg!(target_os = "macos") && ctrl && key == Key::Backspace;
+    if event.modifiers().alt()
+        || (event.modifiers().meta()
+            && !mac_open
+            && !mac_trash
+            && !(cfg!(target_os = "macos") && (cursor_key || space)))
+    {
         return;
     }
     let position = match &key {
@@ -2338,31 +2447,36 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
             let geometry = p.geometry(compact);
             let page = ((geometry.viewport_height / geometry.row_height).floor() as usize).max(1)
                 * geometry.columns;
-            let tab = s.panes[pane].tab_mut();
-            let next = match key {
-                Key::Home => 0,
-                Key::End => tab.visible.len().saturating_sub(1),
-                Key::ArrowDown => tab.cursor_position().map_or(0, |i| {
-                    (i + geometry.columns).min(tab.visible.len().saturating_sub(1))
-                }),
-                Key::ArrowUp => tab
-                    .cursor_position()
-                    .map_or(0, |i| i.saturating_sub(geometry.columns)),
-                Key::ArrowRight => tab
-                    .cursor_position()
-                    .map_or(0, |i| (i + 1).min(tab.visible.len().saturating_sub(1))),
-                Key::ArrowLeft => tab.cursor_position().map_or(0, |i| i.saturating_sub(1)),
-                Key::PageDown => tab
-                    .cursor_position()
-                    .unwrap_or(0)
-                    .saturating_add(page)
-                    .min(tab.visible.len().saturating_sub(1)),
-                _ => tab.cursor_position().unwrap_or(0).saturating_sub(page),
-            };
-            if ctrl && !shift {
-                tab.move_cursor(next)
+            if mac_open {
+                // Finder opens the selected item with Command–Down.
+                None
             } else {
-                tab.select_position(next, shift)
+                let tab = s.panes[pane].tab_mut();
+                let next = match key {
+                    Key::Home => 0,
+                    Key::End => tab.visible.len().saturating_sub(1),
+                    Key::ArrowDown => tab.cursor_position().map_or(0, |i| {
+                        (i + geometry.columns).min(tab.visible.len().saturating_sub(1))
+                    }),
+                    Key::ArrowUp => tab
+                        .cursor_position()
+                        .map_or(0, |i| i.saturating_sub(geometry.columns)),
+                    Key::ArrowRight => tab
+                        .cursor_position()
+                        .map_or(0, |i| (i + 1).min(tab.visible.len().saturating_sub(1))),
+                    Key::ArrowLeft => tab.cursor_position().map_or(0, |i| i.saturating_sub(1)),
+                    Key::PageDown => tab
+                        .cursor_position()
+                        .unwrap_or(0)
+                        .saturating_add(page)
+                        .min(tab.visible.len().saturating_sub(1)),
+                    _ => tab.cursor_position().unwrap_or(0).saturating_sub(page),
+                };
+                if ctrl && !shift {
+                    tab.move_cursor(next)
+                } else {
+                    tab.select_position(next, shift)
+                }
             }
         }
         _ => None,
@@ -2374,7 +2488,12 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
         return;
     }
     match key {
-        Key::Enter => {
+        Key::Enter if cfg!(target_os = "macos") && !ctrl => {
+            event.prevent_default();
+            start_inline_rename(model);
+        }
+        Key::Enter | Key::ArrowDown if key == Key::Enter || mac_open => {
+            event.prevent_default();
             let selected = model.read().selected();
             if let Some(path) = selected.first().cloned() {
                 let is_dir = model.read().panes[pane]
@@ -2401,7 +2520,11 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
                 start_inline_rename(model);
             }
         }
-        Key::Backspace => history_navigation(model, bridge, pane, false),
+        Key::Backspace if mac_trash => {
+            event.prevent_default();
+            dialog(model, "recycle");
+        }
+        Key::Backspace if cfg!(windows) => history_navigation(model, bridge, pane, false),
         _ => {}
     }
 }
@@ -2418,6 +2541,7 @@ fn app() -> Element {
         let mut settings = settings::load();
         if let Some(IndependentWindow(path)) = independent {
             settings.layout = 1;
+            settings.pane_arrangement = PaneArrangement::Standard;
             settings.active_pane = 0;
             settings.active_tabs.clear();
             settings.tab_states.clear();
@@ -2432,46 +2556,52 @@ fn app() -> Element {
     use_hook(|| {
         let _ = document::eval(include_str!("editing.js"));
         let _ = document::eval(include_str!("search_focus.js"));
+        let _ = document::eval(include_str!("sidebar_resize.js"));
         let _ = document::eval(include_str!("mouse.js"));
         let _ = document::eval(include_str!("scroll.js"));
     });
     let locations = use_hook(platform::navigation_locations);
     let bridge = use_hook(|| Arc::new(Bridge::new()));
     let settings_writer = use_hook(|| Arc::new(settings::SettingsWriter::new()));
+    use_context_provider(|| settings_writer.clone());
     let close_window = dioxus::desktop::use_window();
     let close_writer = settings_writer.clone();
     let close_bridge = bridge.clone();
-    let tray = use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None)));
-    let tray_for_close = tray.clone();
     let window_for_activation = close_window.clone();
-    use_effect(move || {
-        if primary && model.read().close_to_tray {
-            if tray.borrow().is_none() {
-                match lifecycle::make_tray() {
-                    Ok(icon) => *tray.borrow_mut() = Some(icon),
-                    Err(error) => {
-                        let mut state = model.write();
-                        state.close_to_tray = false;
-                        state.notice = format!("트레이 아이콘을 만들지 못했습니다. {error}");
-                        state.save_due = Some(Instant::now());
+    #[cfg(windows)]
+    let tray_for_close = {
+        let tray = use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None)));
+        let tray_for_close = tray.clone();
+        use_effect(move || {
+            if primary && model.read().close_to_tray {
+                if tray.borrow().is_none() {
+                    match lifecycle::make_tray() {
+                        Ok(icon) => *tray.borrow_mut() = Some(icon),
+                        Err(error) => {
+                            let mut state = model.write();
+                            state.close_to_tray = false;
+                            state.notice = format!("트레이 아이콘을 만들지 못했습니다. {error}");
+                            state.save_due = Some(Instant::now());
+                        }
                     }
                 }
+            } else {
+                tray.borrow_mut().take();
             }
-        } else {
-            tray.borrow_mut().take();
-        }
-    });
-    let tray_window = close_window.clone();
-    let tray_writer = settings_writer.clone();
-    let tray_bridge = bridge.clone();
-    // Native menu items share the menubar event receiver in the pinned desktop runtime.
-    dioxus::desktop::use_muda_event_handler(move |event| match event.id.as_ref() {
-        lifecycle::OPEN_ID if primary => lifecycle::show_window(&tray_window),
-        lifecycle::EXIT_ID if primary => {
-            lifecycle::save_then_close(model, &tray_writer, &tray_window, &tray_bridge)
-        }
-        _ => {}
-    });
+        });
+        let tray_window = close_window.clone();
+        let tray_writer = settings_writer.clone();
+        let tray_bridge = bridge.clone();
+        // Native menu items share the menubar event receiver in the pinned desktop runtime.
+        dioxus::desktop::use_muda_event_handler(move |event| match event.id.as_ref() {
+            lifecycle::OPEN_ID if primary => lifecycle::show_window(&tray_window),
+            lifecycle::EXIT_ID if primary => {
+                session_close::save_then_close(model, &tray_writer, &tray_window, &tray_bridge)
+            }
+            _ => {}
+        });
+        tray_for_close
+    };
     let placement_window = close_window.clone();
     use_hook(move || {
         let saved = model.read().window.clone();
@@ -2488,7 +2618,8 @@ fn app() -> Element {
     let placement_changed = placement_dirty.clone();
 
     dioxus::desktop::use_wry_event_handler(move |event, _| {
-        use dioxus::desktop::{WindowCloseBehaviour, WindowEvent, tao::event::Event};
+        use dioxus::desktop::{WindowEvent, tao::event::Event};
+        #[cfg(windows)]
         if let Event::WindowEvent {
             window_id,
             event: WindowEvent::Focused(_) | WindowEvent::Resized(_),
@@ -2529,14 +2660,15 @@ fn app() -> Element {
             if *window_id != close_window.id() || !primary {
                 return;
             }
+            #[cfg(windows)]
             if model.read().close_to_tray
                 && tray_for_close.borrow().is_some()
                 && !model.read().closing
             {
-                close_window.set_close_behavior(WindowCloseBehaviour::WindowHides);
+                close_window.set_close_behavior(dioxus::desktop::WindowCloseBehaviour::WindowHides);
                 return;
             }
-            lifecycle::save_then_close(model, &close_writer, &close_window, &close_bridge);
+            session_close::save_then_close(model, &close_writer, &close_window, &close_bridge);
         }
     });
     use_context_provider(|| bridge.clone());
@@ -2551,13 +2683,17 @@ fn app() -> Element {
             for p in 0..layout {
                 load(model, &bridge, p);
             }
+            #[cfg(target_os = "macos")]
+            start_spotlight(model, &bridge);
             let resume = {
                 let state = model.read();
                 state
                     .resume_live_index
                     .then_some(state.search_preferences.memory_mib)
             };
-            if let Some(memory) = resume {
+            if cfg!(windows)
+                && let Some(memory) = resume
+            {
                 start_volume_index(model, &bridge, memory, true);
             }
             let mut next_thumbnail_check = Instant::now();
@@ -2584,6 +2720,7 @@ fn app() -> Element {
                                 continue;
                             }
                             let mut s = model.write();
+                            #[cfg(windows)]
                             if let sdir::utility::Utility::Drag { id, .. } = &action {
                                 if s.external_drag
                                     .as_ref()
@@ -2600,7 +2737,8 @@ fn app() -> Element {
                                         } else if pid
                                             == Some(sdir::utility::SDIR_DRAG_VERIFIED_MOVE)
                                         {
-                                            "외부 대상의 이동 효과와 원본 경로 제거를 확인했습니다.".into()
+                                            "외부 대상의 이동 효과와 원본 경로 제거를 확인했습니다."
+                                                .into()
                                         } else if pid
                                             == Some(sdir::utility::SDIR_DRAG_EXTERNAL_HANDOFF)
                                         {
@@ -2787,6 +2925,9 @@ fn app() -> Element {
                                     "window.__sdirScrollSelection?.({pane},{position},{scroll},{{generation:'{generation}',path:{path}}});"
                                 ));
                             }
+                        }
+                        WorkerEvent::FileAppearances { id, items } => {
+                            finish_appearances(model, id, items)
                         }
                         WorkerEvent::Thumbnails { id, images } => {
                             finish_thumbnails(model, id, images)
@@ -3102,7 +3243,7 @@ fn app() -> Element {
                                             s.journal.remove(0);
                                         }
                                     }
-                                    s.index_dirty = s.index.is_some();
+                                    s.index_dirty = s.index.is_some() && !s.spotlight;
                                     s.job_context.take()
                                 };
                                 if let Some(context) = context {
@@ -3245,16 +3386,23 @@ fn app() -> Element {
                             sequence,
                         } => {
                             let context = model.write().pastes.remove(&id);
-                            if let Some(context) = context {
+                            if let Some((context, move_files)) = context {
                                 match result {
                                     Ok((sources, cut)) if !sources.is_empty() => {
-                                        {
+                                        let cut = {
                                             let mut s = model.write();
+                                            let cut = move_files
+                                                || (cut
+                                                    && (cfg!(windows)
+                                                        || (s.clipboard_cut
+                                                            && s.clipboard_sequence
+                                                                == Some(sequence))));
                                             s.clipboard_marked =
                                                 Arc::new(sources.iter().cloned().collect());
                                             s.clipboard_cut = cut;
                                             s.clipboard_sequence = Some(sequence);
-                                        }
+                                            cut
+                                        };
                                         let destination = context.target.path.clone();
                                         let action = if cut {
                                             FileAction::Move {
@@ -3280,6 +3428,10 @@ fn app() -> Element {
                         WorkerEvent::Opened { path } => model.write().remember_open(path),
                         WorkerEvent::Failure { lane, id, message } => {
                             if scoped_failure(model, id, &message) {
+                                continue;
+                            }
+                            if lane == 14 {
+                                finish_appearances(model, id, Vec::new());
                                 continue;
                             }
                             if lane == 13 {
@@ -3347,6 +3499,7 @@ fn app() -> Element {
                 if Instant::now() >= next_thumbnail_check {
                     next_thumbnail_check = Instant::now() + Duration::from_millis(250);
                     thumbnail_tick(model, &bridge);
+                    appearance_tick(model, &bridge);
                 }
                 for pane in 0..4 {
                     if pane >= model.read().layout {
@@ -3432,11 +3585,22 @@ fn app() -> Element {
     });
     let s = model.read();
     let layout = s.layout;
+    let pane_layout = s.pane_arrangement.layout(layout);
     let active = s.active;
     let active_context = format!("{} · {}", s.pane_names[active], s.path().display());
     let selected = s.selected().len();
     let job = s.job.is_some();
     let action_bar_visible = s.action_bar_visible;
+    let sidebar_visible = s.sidebar_visible;
+    let mut sidebar_style = format!("--sidebar-max-width:{SIDEBAR_MAX_WIDTH}px");
+    if let Some(width) = s.sidebar_width {
+        sidebar_style.push_str(&format!(";--sidebar-width:{width}px"));
+    }
+    let sidebar_label = if sidebar_visible {
+        "사이드바 접기"
+    } else {
+        "사이드바 펼치기"
+    };
     let job_status = s.job_status.clone();
     let can_undo = !s.undo.is_empty();
     let can_redo = !s.redo.is_empty();
@@ -3462,13 +3626,12 @@ fn app() -> Element {
     let search_select_all = s.search_preferences.select_on_focus.to_string();
     let row = row_height(s.compact);
     drop(s);
-    let root_bridge = bridge.clone();
     let keyboard_bridge = bridge.clone();
     let mouse_bridge = bridge.clone();
     rsx! {
         style { "{STYLE}" }
-        div { class:"app","data-memory-mode":memory_mode,"data-utility-pid":utility_pid,"data-search-select-all":search_select_all,tabindex:-1,"data-theme":theme,onmouseup:move|e:MouseEvent|mouse_history(e,model,&mouse_bridge,active_pane(model)),onmousedown:move |_|model.write().interaction+=1,oninput:move |_|model.write().interaction+=1,style:"--row-height:{row}px",onkeydown:move|e:KeyboardEvent|{
-            model.write().interaction+=1;if e.is_composing(){return;}let control=e.modifiers().ctrl();
+        div { class:"app","data-memory-mode":memory_mode,"data-utility-pid":utility_pid,"data-search-select-all":search_select_all,tabindex:-1,"data-theme":theme,"data-os":PLATFORM_NAME,onmouseup:move|e:MouseEvent|mouse_history(e,model,&mouse_bridge,active_pane(model)),onmousedown:move |_|model.write().interaction+=1,oninput:move |_|model.write().interaction+=1,style:"--row-height:{row}px",onkeydown:move|e:KeyboardEvent|{
+            model.write().interaction+=1;if e.is_composing(){return;}let control=command_modifier(e.modifiers());
             let modal_open=model.read().modal_open();
             if modal_open{if e.key()==Key::Escape{dismiss_modal(model,&keyboard_bridge);}return;}
             if control&&matches!(e.key(),Key::Character(ref c) if ["a","c","x","v","i","z","y","d"].iter().any(|k|c.eq_ignore_ascii_case(k))){list_key(e,model,&keyboard_bridge,active_pane(model));return;}
@@ -3484,24 +3647,44 @@ fn app() -> Element {
                 }}
             }
             header { class:"app-header",
-                div { class:"brand",span{class:"brand-icon","S"}strong{"SDIR"} }
-                div {class:"header-divider"}
-                div {class:"header-title","나의 파일 작업공간"}
-                div {class:"header-spacer"}
                 button{class:"action-bar-toggle",title:"파일 작업 도구 모음 표시 전환","aria-expanded":action_bar_visible,
                     "aria-controls":"file-action-bar",onclick:move |_|{
                         let mut state = model.write();
                         state.action_bar_visible = !state.action_bar_visible;
                         state.dirty();
                     },"작업 도구"}
+                if action_bar_visible {
+                div {class:"action-bar",id:"file-action-bar",
+                    button{class:"history-undo",title:"파일 작업 실행 취소 · Ctrl+Z","aria-label":"파일 작업 실행 취소",disabled:job||!can_undo,onclick:{let b=bridge.clone();move |_|history_action(model,&b,false)},"↶"}
+                    button{class:"history-redo",title:"파일 작업 다시 실행 · Ctrl+Y","aria-label":"파일 작업 다시 실행",disabled:job||!can_redo,onclick:{let b=bridge.clone();move |_|history_action(model,&b,true)},"↷"}
+                    button{title:"새 폴더","aria-label":"새 폴더",disabled:job,onclick:move |_|dialog(model,"new"),Icon{kind:"plus"}span{"새 폴더"}}
+                    span{class:"action-divider"}
+                    button{title:"복사","aria-label":"복사",disabled:selected==0||job,onclick:{let b=bridge.clone();move |_|copy(model,&b,false)},Icon{kind:"copy"}span{"복사"}}
+                    button{title:"잘라내기","aria-label":"잘라내기",disabled:selected==0||job,onclick:{let b=bridge.clone();move |_|copy(model,&b,true)},Icon{kind:"cut"}span{"잘라내기"}}
+                    button{title:"붙여넣기","aria-label":"붙여넣기",disabled:job,onclick:{let b=bridge.clone();move |_|paste(model,&b)},Icon{kind:"paste"}span{"붙여넣기"}}
+                    button{title:"이름 변경","aria-label":"이름 변경",disabled:selected!=1||job,onclick:move |_|start_inline_rename(model),Icon{kind:"rename"}span{"이름 변경"}}
+                    button{class:"batch-toggle",disabled:selected==0||selected>500||job,onclick:move |_|open_batch(model),"일괄 이름"}
+                    button{title:"휴지통","aria-label":"휴지통",class:"delete-action",disabled:selected==0||job,onclick:move |_|dialog(model,"recycle"),Icon{kind:"trash"}span{"휴지통"}}
+                    if layout>1{button{class:"transfer-action",disabled:selected==0||job,title:"복사할 패널과 탭의 폴더 선택","aria-label":"복사 대상 선택",onclick:move |_|open_copy_destination(model),Icon{kind:"arrow"}span{"복사 대상 선택"}}}
+                }
+                }
+                div {class:"header-spacer"}
                 button{class:"journal-toggle",onclick:move |_|model.write().journal_open=true,"작업 기록"}
                 button{class:"workspace-toggle",title:"작업공간 저장·전환",onclick:move |_|model.write().workspaces_open=true,"작업공간"}
                 button{class:"settings-toggle",title:"설정",onclick:move |_|model.write().preferences_open=true,Icon{kind:"settings"}span{"설정"}}
-                button {class:if search_open{"search-toggle active"}else{"search-toggle"},title:"통합 검색 · Ctrl+Shift+F",onclick:move |_|{let mut s=model.write();s.search_open=!s.search_open;if !s.search_open{s.search_expanded=false;}s.search_focus=if s.search_open&&s.search_preferences.focus_on_open{Some(s.interaction)}else{None};},Icon{kind:"search"}span{"통합 검색"}kbd{"Ctrl Shift F"}}
-                div {class:"layout-switch",for count in [1usize,2,4]{ { let b=root_bridge.clone(); rsx! { button{class:if layout==count{"chosen"}else{""},title:"{count}분할",onclick:move |_|{let previous=model.read().layout;{let mut s=model.write();s.layout=count;s.active=s.active.min(count-1);s.search_target=s.search_target.filter(|&pane|pane<count);s.dirty();}for p in previous..count{let saved=model.read().panes[p].tab().snapshot();model.write().panes[p].tab_mut().resume_from(&saved);load(model,&b,p);}},"{count}"} } } }}
+                button {class:if search_open{"search-toggle active"}else{"search-toggle"},title:"통합 검색 · Ctrl+Shift+F",onclick:move |_|{let mut s=model.write();s.search_open=!s.search_open;if !s.search_open{s.search_expanded=false;}s.search_focus=if s.search_open&&s.search_preferences.focus_on_open{Some(s.interaction)}else{None};},Icon{kind:"search"}span{"통합 검색"}kbd{if cfg!(windows) {"Ctrl Shift F"} else {"⌘ ⇧ F"}}}
+                LayoutSwitcher { model }
             }
             div {class:"body",
-                aside {class:"sidebar",
+                aside {id:"navigation-sidebar",class:if sidebar_visible {"sidebar"} else {"sidebar collapsed"},style:sidebar_style,"aria-label":"폴더 탐색",
+                    button{class:"sidebar-toggle",r#type:"button",title:sidebar_label,"aria-label":sidebar_label,
+                        "aria-expanded":sidebar_visible,"aria-controls":"navigation-sidebar-content",
+                        onclick:move |_|{
+                            let mut state = model.write();
+                            state.sidebar_visible = !state.sidebar_visible;
+                            state.dirty();
+                        },Icon{kind:if sidebar_visible {"sidebar-collapse"} else {"sidebar-expand"}}}
+                    div{id:"navigation-sidebar-content",class:"sidebar-content",hidden:!sidebar_visible,
                     div {class:"section-label","빠른 이동"}
                     button {class:"side-link",onclick:{let b=bridge.clone();move |_|navigate(model,&b,active_pane(model),settings::home())},Icon{kind:"home"}span{"홈"}}
                     for (name,path) in locations.iter(){
@@ -3509,36 +3692,37 @@ fn app() -> Element {
                     }
                     DirectoryTree { model }
                     RecentLocations{model}
-                    details{class:"sidebar-section network-drive-controls",
-                        summary{"네트워크 드라이브"}
+                    if cfg!(windows) { details{class:"sidebar-section network-drive-controls",
+                        summary{title:"네트워크 드라이브","네트워크 드라이브"}
                         for (disconnect,label) in [(false,"연결"),(true,"연결 끊기")] {
                             button{class:"side-link",onclick:move |_|model.write().network_dialog=Some(disconnect),"{label}"}
                         }
+                    }
                     }
                     div {class:"sidebar-section",div {class:"section-label",span{"즐겨찾기"}button{class:"small-add",title:"현재 폴더 추가",onclick:move |_|{let path=model.read().path();let mut s=model.write();if !s.favorites.contains(&path){s.favorites.push(path);s.dirty();}},"+"}}
                         if favorites.is_empty(){p{class:"side-hint","자주 쓰는 폴더를\n추가해 보세요."}}
                         for (i,path) in favorites.iter().enumerate(){ { let p=path.clone();let name=path.name();let full=path.display(); rsx! { div{class:"favorite-row",button{class:"side-link",title:"{full}",onclick:{let b=bridge.clone();move |_|navigate(model,&b,active_pane(model),p.clone())},Icon{kind:"star"}span{"{name}"}}button{class:"remove-favorite",title:"즐겨찾기에서 제거",onclick:move |_|{model.write().favorites.remove(i);model.write().dirty();},"×"}} } } }
                     }
-                    div {class:"sidebar-bottom",label{class:"hidden-option",input{r#type:"checkbox",checked:show_hidden,onchange:{let b=bridge.clone();move|e:FormEvent|set_hidden(model,&b,e.checked())}}span{"숨김 파일 표시"}}p{"SDIR 0.1 · Windows"}}
+                    div {class:"sidebar-bottom",label{class:"hidden-option",input{r#type:"checkbox",checked:show_hidden,onchange:{let b=bridge.clone();move|e:FormEvent|set_hidden(model,&b,e.checked())}}span{"숨김 파일 표시"}}p{"SDIR "{env!("CARGO_PKG_VERSION")}" · {PLATFORM_NAME}"}}
+                    }
+                }
+                if sidebar_visible {
+                    div {class:"sidebar-resizer",role:"separator",tabindex:0,"aria-orientation":"vertical",
+                        "aria-label":"사이드바 너비","aria-controls":"navigation-sidebar",
+                        title:"드래그 또는 좌우 방향키로 사이드바 너비 조절",
+                        onmounted:move |_|{let _ = document::eval("window.sdirSyncSidebarWidth?.()");},
+                        input {class:"sidebar-width-commit",r#type:"hidden",oninput:move |event:FormEvent| {
+                            event.stop_propagation();
+                            if let Ok(width) = event.value().parse::<u16>() {
+                                let mut state = model.write();
+                                state.sidebar_width = Some(width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH));
+                                state.dirty();
+                            }
+                        }}
+                    }
                 }
                 main {class:"workspace","data-action-bar":if action_bar_visible{"open"}else{"closed"},
-                    if action_bar_visible {
-                    div {class:"action-bar",id:"file-action-bar",
-                        button{class:"history-undo",title:"파일 작업 실행 취소 · Ctrl+Z","aria-label":"파일 작업 실행 취소",disabled:job||!can_undo,onclick:{let b=bridge.clone();move |_|history_action(model,&b,false)},"↶"}
-                        button{class:"history-redo",title:"파일 작업 다시 실행 · Ctrl+Y","aria-label":"파일 작업 다시 실행",disabled:job||!can_redo,onclick:{let b=bridge.clone();move |_|history_action(model,&b,true)},"↷"}
-                        button{disabled:job,onclick:move |_|dialog(model,"new"),Icon{kind:"plus"}span{"새 폴더"}}
-                        span{class:"action-divider"}
-                        button{disabled:selected==0||job,onclick:{let b=bridge.clone();move |_|copy(model,&b,false)},Icon{kind:"copy"}span{"복사"}}
-                        button{disabled:selected==0||job,onclick:{let b=bridge.clone();move |_|copy(model,&b,true)},Icon{kind:"cut"}span{"잘라내기"}}
-                        button{disabled:job,onclick:{let b=bridge.clone();move |_|paste(model,&b)},Icon{kind:"paste"}span{"붙여넣기"}}
-                        button{disabled:selected!=1||job,onclick:move |_|start_inline_rename(model),Icon{kind:"rename"}span{"이름 변경"}}
-                        button{class:"batch-toggle",disabled:selected==0||selected>500||job,onclick:move |_|open_batch(model),"일괄 이름"}
-                        button{class:"delete-action",disabled:selected==0||job,onclick:move |_|dialog(model,"recycle"),Icon{kind:"trash"}span{"휴지통"}}
-                        div{class:"header-spacer"}
-                        if layout>1{button{class:"transfer-action",disabled:selected==0||job,title:"복사할 패널과 탭의 폴더 선택",onclick:move |_|open_copy_destination(model),Icon{kind:"arrow"}span{"복사 대상 선택"}}}
-                    }
-                    }
-                    div {class:format!("panes layout-{layout}"),for pane_id in 0..layout{PaneView{key:"pane-{pane_id}",pane_id,model}}}
+                    div {class:format!("panes layout-{layout}"),style:grid_style(pane_layout),"data-grid-rows":pane_layout.rows.len(),for pane_id in 0..layout{PaneView{key:"pane-{pane_id}",pane_id,model}}}
                 }
                 if let Some(mode) = inspector { FileInspector {model,mode} }
                 if search_open{SearchPanel{model}}
@@ -3591,7 +3775,7 @@ fn app() -> Element {
                 div{class:"modal-backdrop",div{class:"modal",role:"dialog","aria-modal":"true",
                     h2{match &kind{Dialog::NewFolder=>"새 폴더 만들기",Dialog::Recycle(_)=>"휴지통으로 이동",Dialog::Delete(_)=>"영구 삭제"}}
                     if let Dialog::Delete(ref paths)=kind{p{"선택한 {paths.len()}개 항목을 영구 삭제합니다. 휴지통으로 이동하지 않으며 이 작업은 실행 취소할 수 없습니다."}}
-                    else if let Dialog::Recycle(ref paths)=kind{p{"선택한 {paths.len()}개 항목을 휴지통으로 이동합니다. 위치에 따라 Windows가 영구 삭제 여부를 별도로 확인할 수 있습니다."}}
+                    else if let Dialog::Recycle(ref paths)=kind{p{"선택한 {paths.len()}개 항목을 휴지통으로 이동합니다." if cfg!(windows) {" 위치에 따라 Windows가 영구 삭제 여부를 별도로 확인할 수 있습니다."}}}
                     else{input{class:"dialog-input",autofocus:true,value:"{modal_name}",oninput:move|e|model.write().dialog_name=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();if e.key()==Key::Enter&&!e.is_composing(){confirm(model,&b);}if e.key()==Key::Escape{model.write().dialog=None;}}}}}
                     div{class:"modal-actions",button{onclick:move |_|model.write().dialog=None,"취소"}button{class:"primary",disabled:job,onclick:{let b=bridge.clone();move |_|confirm(model,&b)},"확인"}}
                 }}
@@ -3661,6 +3845,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
     });
     let generation = p.generation;
     let filter = tab.filter.clone();
+    let filter_revision = tab.filter_revision();
     let error = tab.error.clone();
     let count = tab.visible.len();
     let total = tab.entries.len();
@@ -3687,7 +3872,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
         .cloned()
         .collect();
     rsx! {
-        article{onmouseup:{let b=bridge.clone();move|e:MouseEvent|mouse_history(e,model,&b,pane_id)},class:if active{"pane focused"}else{"pane"},"data-pane":pane_id,"data-auto-watch":if watch_ready{"ready"}else{"waiting"},role:"region","aria-current":if active{"true"}else{"false"},"aria-label":format!("패널 {} · {}",pane_id+1,name),"data-view":view,"data-small-icons":small_icons,"data-custom-columns":custom_columns,style:"--tile-height:{tile_height}px;{detail_style}--file-icon-size:{icon_pixels}px",onclick:move |_|activate_pane(model,pane_id),onfocusin:move |_|activate_pane(model,pane_id),onkeydown:move|e:KeyboardEvent|{if e.modifiers().ctrl()||e.modifiers().alt()||matches!(e.key(),Key::F3|Key::F4|Key::F6|Key::F11)||matches!(e.key(),Key::Character(ref c) if !c.trim().is_empty()){list_key(e,model,&pane_keys,pane_id);}},
+        article{onmouseup:{let b=bridge.clone();move|e:MouseEvent|mouse_history(e,model,&b,pane_id)},class:if active{"pane focused"}else{"pane"},"data-pane":pane_id,"data-auto-watch":if watch_ready{"ready"}else{"waiting"},role:"region","aria-current":if active{"true"}else{"false"},"aria-label":format!("패널 {} · {}",pane_id+1,name),"data-view":view,"data-small-icons":small_icons,"data-custom-columns":custom_columns,style:"--tile-height:{tile_height}px;{detail_style}--file-icon-size:{icon_pixels}px",onclick:move |_|activate_pane(model,pane_id),onfocusin:move |_|activate_pane(model,pane_id),onkeydown:move|e:KeyboardEvent|{if command_modifier(e.modifiers())||e.modifiers().alt()||matches!(e.key(),Key::F3|Key::F4|Key::F6|Key::F11)||matches!(e.key(),Key::Character(ref c) if !c.trim().is_empty()){list_key(e,model,&pane_keys,pane_id);}},
             div{class:"group-header",
                 span{class:"group-number","{pane_id+1}"}
                 if editing_name{
@@ -3755,7 +3940,50 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                 }
                 button{class:"icon-button",title:if p.loading{"읽기 취소"}else{"새로고침 · F5"},onclick:{let b=bridge.clone();move |_|{if model.read().panes[pane_id].loading{b.panes[pane_id].cancel();let mut s=model.write();let id=s.refreshes[pane_id].take().map(|r|r.id);let p=&mut s.panes[pane_id];p.loading=false;p.generation=p.generation.max(id.unwrap_or(0))+1;s.notice="폴더 읽기를 취소했습니다.".into();}else{load(model,&b,pane_id);}}},if p.loading{"×"}else{"↻"}}
             }
-            div{class:"pane-filter",Icon{kind:"search"}input{id:"pane-query-{pane_id}",placeholder:"현재 목록 필터 · Ctrl+E",title:"이 패널의 현재 폴더에서 이름 검색",value:"{filter}",oninput:move|e|{let mut s=model.write();s.panes[pane_id].tab_mut().set_filter(e.value());s.dirty();},onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();model.write().interaction+=1;if e.is_composing(){return;}if pane_shortcut(&e,model,pane_id,&b){return;}if e.key()==Key::Escape{model.write().panes[pane_id].tab_mut().set_filter(String::new());release_edit_focus(pane_id);focus_list_after_render(model,pane_id);}if e.key()==Key::Enter{release_edit_focus(pane_id);focus_list_after_render(model,pane_id);}}}}if !filter.is_empty(){button{class:"clear-pane-search",title:"패널 검색 지우기",onclick:move |_|{model.write().panes[pane_id].tab_mut().set_filter(String::new());focus_list_after_render(model, pane_id);},"×"}}span{class:"pane-label","패널 {pane_id+1}"}}
+            div{class:"pane-filter",Icon{kind:"search"}
+                {rsx!{input{key:"filter-{filter_revision}",id:"pane-query-{pane_id}",placeholder:"현재 목록 필터 · Ctrl+E",
+                    title:"이 패널의 현재 폴더에서 이름 검색",initial_value:"{filter}",spellcheck:false,
+                    onchange:move|event:FormEvent|{
+                        event.stop_propagation();
+                        let value=event.value();
+                        let mut state=model.write();
+                        let tab=state.panes[pane_id].tab_mut();
+                        if tab.filter_revision()==filter_revision && tab.filter!=value {
+                            tab.set_filter(value);
+                            state.dirty();
+                        }
+                    },
+                    onkeydown:{let bridge=bridge.clone();move|event:KeyboardEvent|{
+                        event.stop_propagation();
+                        if event.is_composing(){return;}
+                        model.write().interaction+=1;
+                        if pane_shortcut(&event,model,pane_id,&bridge){return;}
+                        match event.key(){
+                            Key::Escape=>{
+                                release_edit_focus(pane_id);
+                                let mut state=model.write();
+                                state.panes[pane_id].tab_mut().clear_filter();
+                                state.dirty();
+                                drop(state);
+                                focus_list_after_render(model,pane_id);
+                            }
+                            Key::Enter=>{
+                                release_edit_focus(pane_id);
+                                focus_list_after_render(model,pane_id);
+                            }
+                            _=>{}
+                        }
+                    }}
+                }}}
+                if !filter.is_empty(){button{class:"clear-pane-search",title:"패널 검색 지우기",onclick:move |_|{
+                    let mut state=model.write();
+                    state.panes[pane_id].tab_mut().clear_filter();
+                    state.dirty();
+                    drop(state);
+                    focus_list_after_render(model,pane_id);
+                },"×"}}
+                span{class:"pane-label","패널 {pane_id+1}"}
+            }
             input { class:"pane-marquee-input", r#type:"hidden",
                 oninput:move |e:FormEvent| {
                     e.stop_propagation();
@@ -3811,7 +4039,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
             {rsx! {div{key:"list-{pane_id}-{generation}-{filter}-{compact}-{view}-{icon_size}-{reveal_revision}",class:"list-scroll",tabindex:0,role:"listbox","aria-label":"{name} 파일 목록","aria-multiselectable":"true","aria-activedescendant":focused_row,"data-grouping":grouping,"data-drag-generation":generation,"data-drag-selection-count":selected.len(),"data-drag-folder":"{p.tab().path.display()}",oncontextmenu:{let b=bridge.clone();move|e:MouseEvent|{e.prevent_default();e.stop_propagation();open_context(model,&b,pane_id,None,e.client_coordinates().x,e.client_coordinates().y,false);}},"data-columns":columns,onmounted:move |_|{
                     let (scroll,focus,startup)={let s=model.read();(s.panes[pane_id].tab().scroll,s.pending_focus==Some((pane_id,s.interaction))&&s.active==pane_id&&!s.modal_open(),s.interaction==0||s.pending_focus_guarded)};
                     let _=document::eval(&format!("{{const e=document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll');if(e){{e.scrollTop={scroll};window.__sdirViewObservers??={{}};window.__sdirViewObservers[{pane_id}]?.disconnect();window.__sdirScrollRequests?.[{pane_id}]?.disconnect();const observer=new ResizeObserver(()=>e.dispatchEvent(new Event('scroll')));window.__sdirViewObservers[{pane_id}]=observer;observer.observe(e);}}}}"));
-                    if focus{if startup{let _=document::eval(&format!("if(!document.activeElement?.matches('input,textarea,select,button'))document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll')?.focus({{preventScroll:true}});"));}else{let _=document::eval(&format!("if(!document.activeElement?.matches('input,textarea')&&!document.querySelector('.modal-backdrop,.context-dismiss'))document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll')?.focus({{preventScroll:true}});"));}}
+                    if focus{if startup{let _=document::eval(&format!("if(!document.activeElement?.matches('input,textarea,select,button,.sidebar-resizer'))document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll')?.focus({{preventScroll:true}});"));}else{let _=document::eval(&format!("if(!document.activeElement?.matches('input,textarea,.sidebar-resizer')&&!document.querySelector('.modal-backdrop,.context-dismiss'))document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll')?.focus({{preventScroll:true}});"));}}
                 },onclick:move |_| {
                     let mut state = model.write();
                     state.active = pane_id;
@@ -3822,7 +4050,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                     drop(state);
                     focus_list(pane_id);
                 },onkeydown:move|e|list_key(e,model,&keys,pane_id),onscroll:move|e:ScrollEvent|{let value=e.scroll_top();let left=e.scroll_left();let _=document::eval(&format!("{{let h=document.querySelector('[data-pane=\"{pane_id}\"] .list-header');if(h)h.style.setProperty('--detail-scroll-left','{left}px');}}"));let width=e.client_width() as f64;let height=e.client_height() as f64;let change={let s=model.read();let p=&s.panes[pane_id];(value-p.tab().scroll).abs()>=1.||(width-p.viewport_width).abs()>=1.||(height-p.viewport_height).abs()>=1.};if change&&width>0.&&height>0.{let requested={let mut s=model.write();let compact=s.compact;let requested=s.panes[pane_id].update_viewport(width,height,value,compact);s.dirty();requested};if let Some((position,scroll))=requested{let _=document::eval(&format!("window.__sdirScrollSelection?.({pane_id},{position},{scroll});"));}}},
-                ondragover:move|e:DragEvent|e.prevent_default(),ondrop:move|e:DragEvent|{let destination=model.read().panes[pane_id].tab().path.clone();drop_from_windows(model,&click_bridge,pane_id,destination,e);},
+                ondragover:move|e:DragEvent|e.prevent_default(),ondrop:move|e:DragEvent|{let destination=model.read().panes[pane_id].tab().path.clone();drop_external_files(model,&click_bridge,pane_id,destination,e);},
                 if total==0&&!p.loading{div{class:"empty-folder",Icon{kind:"folder"}strong{if error.is_some(){"폴더를 열지 못했습니다"}else{"폴더가 비어 있습니다"}}p{if error.is_some(){"클라우드·네트워크 드라이브의 연결과 접근 권한을 확인하세요. F5로 다시 시도할 수 있습니다."}else{"파일을 여기에 끌어다 놓아 복사할 수 있습니다."}}}}
                 if p.loading&&total==0{div{class:"loading-folder",span{class:"spinner"}span{"폴더를 읽고 있습니다"}}}
                 if total>0&&count==0{div{class:"empty-folder",strong{"일치하는 항목이 없습니다"}p{"필터를 바꿔 보세요."}}}
@@ -3833,6 +4061,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                         let thumbnail=if p.view == ViewMode::Icons {
                             model.read().thumbnails.get(&ThumbnailKey::from(&entry)).and_then(Clone::clone)
                         } else {None};
+                        let appearance = if entry.is_dir {None} else {model.read().file_appearance.for_entry(&entry)};
                         let display_name=if show_extensions||entry.is_dir {entry.name.as_str()} else {
                             std::path::Path::new(&entry.name).file_stem().and_then(|name|name.to_str()).unwrap_or(&entry.name)
                         };let path=entry.path.clone();let open=entry.path.clone();let chosen=selected.contains(&entry.path);let clipboard=if marked.contains(&entry.path){if cut{"clipboard-cut"}else{"clipboard-copy"}}else{""};
@@ -3844,16 +4073,16 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                             ""
                         };
                         let class = format!("file-row {state_class} {clipboard}");
-                        let kind=if entry.is_dir{"폴더".to_string()}else{entry.path.to_path().extension().map(|s|format!("{} 파일",s.to_string_lossy().to_uppercase())).unwrap_or_else(||"파일".into())};let bytes=readable_size(entry.bytes);let modified=entry.modified.and_then(|s|chrono::DateTime::from_timestamp(s as i64,0)).map(|t|t.with_timezone(&chrono::Local).format("%Y.%m.%d %H:%M").to_string()).unwrap_or_else(||"—".into());let is_dir=entry.is_dir;let cloud=entry.cloud.label();
+                        let kind=if entry.is_dir{"폴더".to_string()}else if let Some(item)=appearance.as_ref().filter(|item| !item.type_name.is_empty()){item.type_name.clone()}else{entry.path.to_path().extension().map(|s|format!("{} 파일",s.to_string_lossy().to_uppercase())).unwrap_or_else(||"파일".into())};let bytes=readable_size(entry.bytes);let modified=entry.modified.and_then(|s|chrono::DateTime::from_timestamp(s as i64,0)).map(|t|t.with_timezone(&chrono::Local).format("%Y.%m.%d %H:%M").to_string()).unwrap_or_else(||"—".into());let is_dir=entry.is_dir;let cloud=entry.cloud.label();
                          rsx! { div{key:"row-{position}",id:"pane-{pane_id}-file-{position}","data-row-index":position,draggable:false,"data-drag-key":"{entry.path.display()}","data-drop-directory":if is_dir{"true"}else{"false"},
-                        ondrop:{let b=bridge.clone();let destination=path.clone();move|event:DragEvent|{if is_dir{drop_from_windows(model,&b,pane_id,destination.clone(),event);}}},
+                        ondrop:{let b=bridge.clone();let destination=path.clone();move|event:DragEvent|{if is_dir{drop_external_files(model,&b,pane_id,destination.clone(),event);}}},
                         oncontextmenu:{let p=path.clone();let b=bridge.clone();move|e:MouseEvent|{e.prevent_default();e.stop_propagation();open_context(model,&b,pane_id,Some(p.clone()),e.client_coordinates().x,e.client_coordinates().y,false);}},class,role:"option","aria-selected":chosen,onclick:move|e:MouseEvent| {
                             e.stop_propagation();
                             let mut state = model.write();
                             state.active = pane_id;
                             state.interaction += 1;
                             state.pending_focus = None;
-                            state.panes[pane_id].select(path.clone(), e.modifiers().ctrl(), e.modifiers().shift());
+                            state.panes[pane_id].select(path.clone(), command_modifier(e.modifiers()), e.modifiers().shift());
                             state.dirty();
                             drop(state);
                             focus_list(pane_id);
@@ -3878,7 +4107,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                             if let Some(url) = thumbnail.as_ref() {
                                 img{class:"file-thumbnail",src:"{url}",alt:"","aria-hidden":"true",draggable:false}
                             } else {
-                                Icon{kind:if is_dir{"folder"}else{"file"}}
+                                {file_icon(is_dir, appearance.as_deref(), p.view == ViewMode::Icons)}
                             }
                             if let Some(edit)=inline_rename.as_ref().filter(|edit|edit.source==entry.path) {
                                 {inline_rename_editor(model,bridge.clone(),edit,is_dir)}
@@ -3892,8 +4121,13 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                 }}
             }
             }}
-            div{class:"pane-status",span{class:"watch-state",title:watch_error.clone().unwrap_or_else(||"현재 폴더의 외부 변경을 자동 반영합니다".into()),if watch_error.is_some(){"갱신 중단"}else if watch_ready{"자동 갱신"}else{"연결 중"}}if p.loading{span{class:"mini-spinner"}span{"읽는 중 · {total}개"}}else{span{"{count} / {total}개 항목"}}if !matches!(p.view, ViewMode::Icons | ViewMode::Tiles) {
-                label{class:"pane-group-items",span{"분류 방법"}select{class:"group-items-select","aria-label":"항목 분류 방법",value:grouping,
+            div{class:"pane-status",
+                span{class:"watch-state",title:watch_error.clone().unwrap_or_else(||if watch_ready{"현재 폴더의 외부 변경을 자동 반영합니다".into()}else{"폴더 변경 감시에 연결 중입니다".into()}),
+                    if watch_error.is_some(){"갱신 중단"}else if watch_ready{"자동 갱신"}else{"연결 중"}}
+                if p.loading{span{class:"mini-spinner"}span{class:"pane-item-count",title:"읽는 중 · {total}개","읽는 중 · {total}개"}}
+                else{span{class:"pane-item-count",title:"{count} / {total}개 항목","{count} / {total}개 항목"}}
+                if !matches!(p.view, ViewMode::Icons | ViewMode::Tiles) {
+                label{class:"pane-group-items",title:"항목 분류 방법",span{"분류 방법"}select{class:"group-items-select","aria-label":"항목 분류 방법",value:grouping,
                     onchange:move |e:FormEvent| {
                         let group = match e.value().as_str() {
                             "modified" => GroupBy::Modified,
@@ -3933,23 +4167,37 @@ fn RecentLocations(model: Signal<AppModel>) -> Element {
         .collect::<Vec<_>>();
     let mut frequent = state.folder_visits.clone();
     frequent.sort_by_key(|entry| std::cmp::Reverse(entry.count));
-    rsx! { details{class:"sidebar-section recent-locations",
-        summary{"최근 항목"}
+    rsx! { details {class:"sidebar-section recent-locations",
+        summary {"최근 항목"}
         if !frequent.is_empty() {
-            div{class:"section-label","자주 쓰는 폴더"}
-            for entry in frequent.into_iter().take(6) {
-                { let full=entry.path.display();let name=entry.path.name();let b=bridge.clone();
-                    rsx!{button{key:"directory-{full}",class:"side-link recent-folder",title:"{full}",
-                        onclick:move |_|navigate(model,&b,active_pane(model),entry.path.clone()),"{name}"}}
+            details {class:"recent-group recent-folder-group",open:true,
+                summary {title:"자주 연 폴더","폴더"}
+                div {class:"recent-group-items",
+                    for entry in frequent.into_iter().take(6) { {
+                        let full = entry.path.display();
+                        let name = entry.path.name();
+                        let bridge = bridge.clone();
+                        rsx! { button {key:"directory-{full}",class:"side-link recent-folder",title:"{full}",
+                            onclick:move |_|navigate(model,&bridge,active_pane(model),entry.path.clone()),
+                            Icon {kind:"folder"} span {"{name}"}
+                        }}
+                    } }
                 }
             }
         }
         if !recent.is_empty() {
-            div{class:"section-label","최근 파일"}
-            for path in recent {
-                { let full=path.display();let name=path.name();let b=bridge.clone();
-                    rsx!{button{key:"file-{full}",class:"side-link recent-file",title:"{full}",
-                        onclick:move |_|{let _=b.job(Request::Open{path:path.clone()});},"{name}"}}
+            details {class:"recent-group recent-file-group",open:true,
+                summary {"파일"}
+                div {class:"recent-group-items",
+                    for path in recent { {
+                        let full = path.display();
+                        let name = path.name();
+                        let bridge = bridge.clone();
+                        rsx! { button {key:"file-{full}",class:"side-link recent-file",title:"{full}",
+                            onclick:move |_|{let _=bridge.job(Request::Open{path:path.clone()});},
+                            Icon {kind:"file"} span {"{name}"}
+                        }}
+                    } }
                 }
             }
         }
@@ -3989,7 +4237,7 @@ fn Workspaces(mut model: Signal<AppModel>) -> Element {
                     if workspaces.is_empty(){p{"저장한 작업공간이 없습니다."}}
                     for (i,workspace) in workspaces.iter().enumerate(){
                         div{class:"saved-workspace","data-workspace":i,
-                            button{class:"open-workspace",disabled:busy,title:"저장한 배치 불러오기",onclick:{let b=bridge.clone();move |_|open_workspace(model,&b,i)},strong{"{workspace.name}"}span{"{workspace.layout}분할 · 불러오기"}}
+                            button{class:"open-workspace",disabled:busy,title:"저장한 배치 불러오기",onclick:{let b=bridge.clone();move |_|open_workspace(model,&b,i)},strong{"{workspace.name}"}span{"{workspace.layout}분할 · {workspace.pane_arrangement.layout(workspace.layout).name}"}}
                             button{class:"delete-workspace",title:"작업공간 기록 삭제",onclick:move |_|{let mut s=model.write();s.workspaces.remove(i);s.dirty();},"삭제"}
                         }
                     }
@@ -4008,6 +4256,9 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
     use_future(move || {
         let mut inventory_result = inventory_result;
         async move {
+            if !cfg!(windows) {
+                return;
+            }
             let result = tokio::task::spawn_blocking(sdir::live_search::mounted_inventory)
                 .await
                 .map_err(|error| error.to_string())
@@ -4033,6 +4284,7 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
         .map(|status| status.root.display())
         .unwrap_or_else(|| s.path().display());
     let index_dirty = s.index_dirty;
+    let spotlight = s.spotlight;
     let index_error = s.index_error.clone();
     let live_status = s
         .index
@@ -4053,6 +4305,7 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
             div{class:"preferences-heading",h2{"사용자 설정"}button{class:"icon-button",title:"설정 닫기",onclick:move |_|model.write().preferences_open=false,"×"}}
             if !independent {
             p{class:"preference-note","변경한 설정은 바로 적용하고 자동 저장합니다."}
+            if cfg!(windows) {
             div{class:"preference-section",h3{"창과 시작"}
                 label{class:"preference-option",span{"X로 닫을 때 트레이에 유지"}
                     input{class:"preferences-close-to-tray",r#type:"checkbox",checked:close_to_tray,
@@ -4070,6 +4323,7 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
                             }
                         }}
                 }
+            }
             }
             }
             div{class:"preference-section",h3{"화면 테마"}
@@ -4096,13 +4350,15 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
             div{class:"preference-section",h3{"통합 검색"}
                 div{class:"search-index-strip",
                     div{class:"search-index-status",div{class:"index-root",title:"{index_root}","색인 범위: {index_root}"}
-                        if let Some(ref index)=index_status{p{class:"index-count",if index.complete{if search_live{"실시간 추적"}else if index_dirty{"다시 색인 필요"}else{"색인 완료"}}else{"색인 중"} " · {index.entries}개"}}
+                        if spotlight {p{class:"index-count","macOS Spotlight 색인 사용"}}
+                        else if let Some(ref index)=index_status{p{class:"index-count",if index.complete{if search_live{"실시간 추적"}else if index_dirty{"다시 색인 필요"}else{"색인 완료"}}else{"색인 중"} " · {index.entries}개"}}
                         else if index_starting{p{class:"index-count","색인을 시작하고 있습니다…"}}
                         else{p{class:"index-count","색인 없음"}}
                     }
                     div{class:"index-actions",button{class:"primary",onclick:{let b=bridge.clone();move |_|start_index(model,&b)},if index_status.is_some(){"현재 폴더로 다시 색인"}else{"현재 폴더 색인"}}
-                        button{class:"volume-index-start",disabled:independent,onclick:{let b=bridge.clone();move |_|start_volume_index(model,&b,memory_mib,false)},"전체 드라이브 실시간 검색"}
-                        if search_live||index_starting||index_status.as_ref().is_some_and(|status|!status.complete){button{class:"index-stop",onclick:{let b=bridge.clone();move |_|{b.search.cancel();let mut s=model.write();s.index_id+=1;s.query_id+=1;s.index=None;s.index_starting=false;s.search_live=false;s.resume_live_index=false;s.save_due=Some(Instant::now());s.config_generation=0;s.host_pid=None;s.config_pending=None;s.pending_rebuild=None;s.query_loading=false;s.query_due=None;s.result=None;s.index_error=Some("색인을 취소했습니다.".into());}},"중지"}}
+                        if cfg!(windows) {button{class:"volume-index-start",disabled:independent,onclick:{let b=bridge.clone();move |_|start_volume_index(model,&b,memory_mib,false)},"전체 드라이브 실시간 검색"}}
+                        {macos_search_button(model, bridge.clone(), spotlight)}
+                        if search_live||index_starting||index_status.as_ref().is_some_and(|status|!status.complete){button{class:"index-stop",onclick:{let b=bridge.clone();move |_|{b.search.cancel();let mut s=model.write();s.index_id+=1;s.query_id+=1;s.index=None;s.index_starting=false;s.search_live=false;s.spotlight=false;s.resume_live_index=false;s.save_due=Some(Instant::now());s.config_generation=0;s.host_pid=None;s.config_pending=None;s.pending_rebuild=None;s.query_loading=false;s.query_due=None;s.result=None;s.index_error=Some("색인을 취소했습니다.".into());}},"중지"}}
                     }
                     if let Some(error)=index_error.as_ref(){p{class:"search-error index-error","{error}"}}
                     if index_status.as_ref().is_some_and(|index|index.limited){p{class:"index-warning","색인 상한에 도달했습니다."}}
@@ -4110,10 +4366,12 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
                 label{class:"preference-option",span{"입력 즉시 검색"}input{class:"preferences-search-instant",r#type:"checkbox",checked:search.instant,onchange:move|e:FormEvent|{let mut s=model.write();let mut value=s.search_preferences.clone();value.instant=e.checked();s.set_search_preferences(value);}}}
                 label{class:"preference-option",span{"검색창에 초점이 들어오면 전체 선택"}input{class:"preferences-search-select",r#type:"checkbox",checked:search.select_on_focus,onchange:move|e:FormEvent|{let mut s=model.write();let mut value=s.search_preferences.clone();value.select_on_focus=e.checked();s.set_search_preferences(value);}}}
                 label{class:"preference-option",span{"검색 패널을 열 때 검색창으로 이동"}input{class:"preferences-search-focus",r#type:"checkbox",checked:search.focus_on_open,onchange:move|e:FormEvent|{let mut s=model.write();let mut value=s.search_preferences.clone();value.focus_on_open=e.checked();s.set_search_preferences(value);}}}
+                if cfg!(windows) {
                 label{class:"preference-option",span{"전체 검색 색인 메모리 상한"}select{class:"preferences-search-memory density-select","aria-label":"전체 검색 색인 메모리 상한",value:search.memory_mib.to_string(),onchange:move|e:FormEvent|{if let Ok(n)=e.value().parse::<u16>(){let mut s=model.write();let mut value=s.search_preferences.clone();value.memory_mib=n;s.set_search_preferences(value);}},option{value:"256","256 MiB"}option{value:"512","512 MiB"}option{value:"1024","1 GiB"}option{value:"2048","2 GiB"}}}
                 p{class:"preference-note","입력 즉시 검색을 끄면 Enter 또는 검색 버튼으로 실행합니다. Ctrl+Shift+F는 항상 검색창으로 이동합니다. 메모리 상한은 검색을 다시 시작할 때 적용합니다."}
+                }
                 button{class:"search-preferences-reset",onclick:move |_|model.write().set_search_preferences(Default::default()),"검색 설정 초기화"}
-                details{class:"drive-index-settings",
+                if cfg!(windows) { details{class:"drive-index-settings",
                     summary{"드라이브 색인"}
                     p{class:"preference-note","드라이브 정책은 저장 버튼을 눌러 적용합니다. 실시간 색인 중에는 검색 프로세스의 확인을 받은 뒤 적용합니다. 경로 범위는 색인된 드라이브 안에서 검색 결과를 필터링합니다."}
                     div{class:"drive-index-auto",
@@ -4195,15 +4453,27 @@ fn Preferences(mut model: Signal<AppModel>) -> Element {
                     else{p{class:"preference-note","드라이브 목록을 불러오는 중…"}}
                 }
             }
+            }
             div{class:"preference-section",h3{"패널 그룹"}p{class:"preference-note","각 패널 맨 위의 이름을 눌러 업무용·제안용·개발용처럼 지정하세요. 그룹 안에 여러 폴더 탭을 둘 수 있습니다."}}
             div{class:"modal-actions",button{class:"primary",onclick:move |_|model.write().preferences_open=false,"닫기"}}
         }}
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_search_button(model: Signal<AppModel>, bridge: Arc<Bridge>, spotlight: bool) -> Element {
+    rsx! { button { class: "spotlight-start", disabled: spotlight, onclick: move |_| start_spotlight(model, &bridge), "Spotlight 검색" } }
+}
+
+#[cfg(windows)]
+fn macos_search_button(_: Signal<AppModel>, _: Arc<Bridge>, _: bool) -> Element {
+    VNode::empty()
+}
+
 #[component]
 fn SearchPanel(mut model: Signal<AppModel>) -> Element {
     let initial_query = use_hook(move || model.peek().query.clone());
+    let spotlight = model.read().spotlight;
     let bridge = use_context::<Arc<Bridge>>();
     let s = model.read();
     let index_host = s
@@ -4232,7 +4502,7 @@ fn SearchPanel(mut model: Signal<AppModel>) -> Element {
             if !expanded{
                 div{class:"search-resizer",role:"separator","aria-label":"검색창 너비 조절","aria-orientation":"vertical",tabindex:"0"}
             }
-            div{class:"search-heading",Icon{kind:"search"}h2{"내장 파일 검색"}
+            div{class:"search-heading",Icon{kind:"search"}h2{if spotlight {"Spotlight 파일 검색"} else {"내장 파일 검색"}}
                 button{class:"search-expand",title:"{expand_label}","aria-label":"{expand_label}","aria-pressed":expanded,
                     onclick:move |_|{let mut s=model.write();s.search_expanded=!s.search_expanded;},if expanded{"축소"}else{"확대"}}
                 button{class:"icon-button",title:"검색 닫기","aria-label":"검색 닫기",onclick:move |_|{let mut s=model.write();s.search_open=false;s.search_expanded=false;},"×"}
@@ -4260,7 +4530,7 @@ fn SearchPanel(mut model: Signal<AppModel>) -> Element {
             if query_loading{div{class:"query-wait",span{class:"mini-spinner"}span{"검색 중"}}}
             if let Some(ref results)=result{div{class:"results-summary",strong{"{results.total}개 결과"}span{"{results.elapsed_ms:.1}ms"}}
                 if !results.complete{p{class:"partial-results","일부 범위의 검색 결과입니다."}}
-                div{class:"search-results",for hit in results.hits.iter(){ { let hit=hit.clone();let path=hit.path.clone();let name=hit.name.clone();let full=path.display();let is_dir=hit.is_dir; rsx! { button{class:"search-result",title:"{full}",onclick:{let b=bridge.clone();move |_|reveal_hit(model,&b,hit.clone())},Icon{kind:if is_dir{"folder"}else{"file"}}div{strong{"{name}"}span{"{full}"}}} } } }
+                div{class:"search-results",for hit in results.hits.iter(){ { let hit=hit.clone();let path=hit.path.clone();let name=hit.name.clone();let full=path.display();let is_dir=hit.is_dir;let appearance=if is_dir{None}else{model.read().file_appearance.for_type(&name)}; rsx! { button{class:"search-result",title:"{full}",onclick:{let b=bridge.clone();move |_|reveal_hit(model,&b,hit.clone())},{file_icon(is_dir, appearance.as_deref(), false)}div{strong{"{name}"}span{"{full}"}}} } } }
                 }
                 if results.total>200{p{class:"snapshot-note","처음 200개 결과를 표시합니다. 검색어를 더 입력해 범위를 줄이세요."}}
             }
@@ -4274,6 +4544,8 @@ fn Icon(kind: String) -> Element {
         "settings" => {
             "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8M9 3h6l1 4 4 1v8l-4 1-1 4H9l-1-4-4-1V8l4-1z"
         }
+        "sidebar-collapse" => "M3 5h18v14H3zM9 5v14M16 9l-3 3 3 3",
+        "sidebar-expand" => "M3 5h18v14H3zM9 5v14M13 9l3 3-3 3",
         "folder" => "M3 5h6l2 2h10v12H3z",
         "home" => "M3 11l9-8 9 8M5 10v11h5v-7h4v7h5V10",
         "search" => "M20 20l-5-5M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0",
@@ -4350,7 +4622,7 @@ fn DirectoryTree(mut model: Signal<AppModel>) -> Element {
     rsx! {
         div{class:"sidebar-section tree-section",
             div{class:"section-label",span{"폴더 트리"}button{class:"tree-refresh",title:"폴더 트리 새로고침",onclick:{let b=bridge.clone();move |_|{b.tree.cancel();model.write().tree.reset();model.write().tree_seen=None;model.write().dirty();scroll.set(0.);let _=document::eval("document.querySelector('.drive-tree')?.scrollTo(0,0)");}},"↻"}}
-            label{class:"tree-follow",input{r#type:"checkbox",checked:follow,onchange:move|e:FormEvent|{let mut s=model.write();s.tree_follow=e.checked();s.tree_seen=None;s.tree_tasks.clear();s.dirty();}}span{"현재 위치 따라가기"}}
+            label{class:"tree-follow",input{r#type:"checkbox",checked:follow,onchange:move|e:FormEvent|{let mut s=model.write();s.tree_follow=e.checked();s.tree_seen=None;s.tree_tasks.clear();s.dirty();}}span{title:"현재 위치 따라가기","현재 위치 따라가기"}}
             button{class:"tree-computer", "aria-expanded":open,onclick:{let b=bridge.clone();move |_|{let mut s=model.write();s.tree.open=!s.tree.open;s.dirty();if !s.tree.open{b.tree.cancel();s.tree.reset();s.tree_tasks.clear();}else{s.tree_seen=None;}}},span{if open{"⌄"}else{"›"}}Icon{kind:"drive"}span{"내 PC"}}
             if open {
                 div{class:"drive-tree",style:"height:min({height}px,clamp(112px,30vh,340px))",role:"tree","aria-label":"드라이브와 폴더",tabindex:0,"data-focused-path":"{focused_path}","aria-activedescendant":"{active_descendant}","aria-busy":tree_busy,onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{let (path,expanded)={let s=model.read();let p=sdir::tree::tree_key(s.tree_cursor.clone().unwrap_or_else(||s.path()));let expanded=s.tree.nodes.get(&p).is_some_and(|n|n.expanded);(p,expanded)};tree_key(e,model,&b,path,expanded);}},onscroll:move|e:ScrollEvent|scroll.set(e.scroll_top()),
@@ -4400,17 +4672,7 @@ fn CopyDestinationDialog(mut model: Signal<AppModel>) -> Element {
         .unwrap_or_default();
     let choices: Vec<_> = (0..s.layout)
         .filter(|&p| p != dialog.origin.pane)
-        .map(|p| {
-            let position = if s.layout == 2 {
-                ["왼쪽", "오른쪽"][p]
-            } else {
-                ["왼쪽 위", "오른쪽 위", "왼쪽 아래", "오른쪽 아래"][p]
-            };
-            (
-                p,
-                format!("패널 {} · {} · {}", p + 1, s.pane_names[p], position),
-            )
-        })
+        .map(|p| (p, format!("패널 {} · {}", p + 1, s.pane_names[p])))
         .collect();
     let tabs: Vec<_> = dialog
         .destination

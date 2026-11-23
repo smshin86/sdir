@@ -1,4 +1,5 @@
 use crate::model::{NativePath, Pane, Tab, TabState, ViewMode};
+use crate::pane_arrangement::PaneArrangement;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
@@ -7,6 +8,7 @@ use std::{fs, path::PathBuf};
 pub struct Settings {
     pub version: u32,
     pub layout: usize,
+    pub pane_arrangement: PaneArrangement,
     pub panes: Vec<Vec<NativePath>>,
     pub favorites: Vec<NativePath>,
     pub recent_files: Vec<NativePath>,
@@ -19,6 +21,8 @@ pub struct Settings {
     pub theme: Theme,
     pub compact: bool,
     pub action_bar_visible: bool,
+    pub sidebar_visible: bool,
+    pub sidebar_width: Option<u16>,
     pub search_preferences: crate::preferences::SearchPreferences,
     pub ntfs_indexing: crate::index_policy::NtfsIndexingSettings,
     pub resume_live_index: bool,
@@ -55,6 +59,7 @@ pub struct WindowPlacement {
 pub struct Workspace {
     pub name: String,
     pub layout: usize,
+    pub pane_arrangement: PaneArrangement,
     pub panes: Vec<Vec<NativePath>>,
     pub pane_names: Vec<String>,
     pub active_tabs: Vec<usize>,
@@ -73,11 +78,7 @@ pub fn workspace_name(value: &str) -> String {
         .collect()
 }
 pub fn valid_layout(layout: usize) -> usize {
-    if [1, 2, 4].contains(&layout) {
-        layout
-    } else {
-        2
-    }
+    if (1..=4).contains(&layout) { layout } else { 2 }
 }
 impl Workspace {
     pub fn restore_panes(&self, home: &NativePath) -> Vec<Pane> {
@@ -119,6 +120,7 @@ impl Settings {
         Workspace {
             name,
             layout: self.layout,
+            pane_arrangement: self.pane_arrangement,
             panes: self.panes.clone(),
             pane_names: self.pane_names.clone(),
             active_tabs: self.active_tabs.clone(),
@@ -165,6 +167,7 @@ impl Default for Settings {
         Self {
             version: 1,
             layout: 2,
+            pane_arrangement: PaneArrangement::default(),
             panes: vec![],
             favorites: vec![],
             recent_files: vec![],
@@ -177,6 +180,8 @@ impl Default for Settings {
             theme: Theme::System,
             compact: true,
             action_bar_visible: true,
+            sidebar_visible: true,
+            sidebar_width: None,
             search_preferences: Default::default(),
             ntfs_indexing: Default::default(),
             resume_live_index: false,
@@ -196,6 +201,12 @@ impl Default for Settings {
         }
     }
 }
+#[cfg(target_os = "macos")]
+fn legacy_data_dir() -> PathBuf {
+    home().to_path().join("Library/Application Support/SDIR")
+}
+
+#[cfg(not(target_os = "macos"))]
 fn legacy_data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_DATA_HOME"))
@@ -262,7 +273,7 @@ pub fn home() -> NativePath {
         std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("C:\\")),
+            .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" })),
     )
 }
 

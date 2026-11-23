@@ -126,7 +126,13 @@ fn identity(path: &Path) -> Result<Option<(u32, u64)>, String> {
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
     )))
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn identity(path: &Path) -> Result<Option<(u32, u64)>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    Ok(Some((metadata.dev() as u32, metadata.ino())))
+}
+#[cfg(not(any(windows, target_os = "macos")))]
 fn identity(_path: &Path) -> Result<Option<(u32, u64)>, String> {
     Ok(None)
 }

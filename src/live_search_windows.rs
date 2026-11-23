@@ -1,11 +1,12 @@
 use super::*;
+#[path = "live_search_windows/access.rs"]
+mod access;
+use access::{RequesterAccess, VolumeAccess};
 #[path = "live_search_windows/resume.rs"]
 mod resume;
-use resume::ResumeStore;
-use std::sync::Arc;
 use crate::{
     index_policy::RelativePathRoot,
-    search::{IndexStatus, query_index_with_exclusion},
+    search::{IndexStatus, QueryScope, query_index_with_access},
 };
 use ::windows::{
     Win32::{
@@ -29,6 +30,8 @@ use goz_core::{
     usn::walk_journal_buffer,
 };
 use goz_winfs::{JournalInfo, JournalQuery, VolumeHandle};
+use resume::ResumeStore;
+use std::sync::Arc;
 use std::{
     collections::BTreeSet,
     fs::File,
@@ -1256,7 +1259,9 @@ pub(super) fn proxy(
         Err(error) if !service_only => return Err(error),
         outcome => {
             let message = match outcome {
-                Err(error) => format!("색인 서비스를 사용할 수 없어 자동 복원을 대기합니다. {error}"),
+                Err(error) => {
+                    format!("색인 서비스를 사용할 수 없어 자동 복원을 대기합니다. {error}")
+                }
                 Ok(_) => "색인 서비스가 설치되지 않아 자동 복원을 대기합니다.".into(),
             };
             emit(&Event::ConfigAck {
@@ -1275,7 +1280,7 @@ pub(super) fn proxy(
     let parent_created_filetime = crate::live_search::service::current_process_created_filetime()?;
     let pipe_id = guid_text(unsafe { CoCreateGuid() }.map_err(|e| e.to_string())?);
     let name = if service_mode {
-        format!(r"\\.\pipe\SDIR-index-v1-{pipe_id}")
+        crate::live_search::service::service_pipe_name(&pipe_id)
     } else {
         format!(r"\\.\pipe\SDIR-search-{{{pipe_id}}}")
     };
@@ -1940,7 +1945,7 @@ pub(super) fn service_host(
     {
         return Err("서비스 pipe GUID가 올바르지 않습니다.".into());
     }
-    let name = format!(r"\\.\pipe\SDIR-index-v1-{pipe_id}");
+    let name = crate::live_search::service::service_pipe_name(pipe_id);
     run_host(
         &name,
         parent_pid,
@@ -2246,6 +2251,7 @@ const MAX_PAGE_RECORDS: usize = 256;
 const MAX_VOLUME_ENTRIES: usize = 5_000_000;
 const MAX_ACTIVE_GUIDS: usize = crate::index_policy::MAX_VOLUME_POLICIES;
 const MAX_QUERY_HITS_PER_VOLUME: usize = 200;
+const LIVE_SEARCH_BUDGET: Duration = Duration::from_secs(1);
 const MAX_QUERY_PATH_CANDIDATES: usize = MAX_ACTIVE_GUIDS * MAX_QUERY_HITS_PER_VOLUME;
 
 fn query_candidate_capacity(volume_count: usize) -> Result<usize, String> {
@@ -2623,6 +2629,7 @@ impl Volume {
         text: &str,
         settings: &crate::index_policy::NtfsIndexingSettings,
         windows_components: Option<&(crate::index_policy::VolumeGuid, RelativePathRoot)>,
+        requester: &RequesterAccess,
         budget: &Budget<'_>,
     ) -> Result<crate::search::SearchResult, String> {
         self.stop.before_native()?;
@@ -2643,15 +2650,25 @@ impl Volume {
         let excluded = windows_components
             .filter(|(guid, _)| guid == &self.guid && !settings.show_windows_components())
             .map(|(_, root)| root);
-        let mut result = query_index_with_exclusion(
-            index,
-            &self.root,
-            text,
-            self.state == Phase::Live,
-            scope,
-            excluded,
-            budget,
-        )?;
+        if !result_mount_matches_for_host(&self.stop, &self.guid, mount)? {
+            return Err("검색 결과의 드라이브 연결이 바뀌었습니다.".into());
+        }
+        let mut result = requester.with_permissions(|| {
+            let mut access = VolumeAccess::open(&self.guid, self.serial);
+            query_index_with_access(
+                index,
+                &self.root,
+                text,
+                self.state == Phase::Live,
+                QueryScope { scope, excluded },
+                budget,
+                Some(&mut |path, frn, is_dir| {
+                    access
+                        .as_mut()
+                        .is_some_and(|access| access.allows(path, frn, is_dir))
+                }),
+            )
+        })??;
         self.stop.before_native()?;
         for hit in &mut result.hits {
             hit.volume_guid = Some(self.guid.clone());
@@ -2744,7 +2761,11 @@ impl Volume {
                     for batch in bounded_batches(&files) {
                         self.stop.before_native()?;
                         let exceeded = {
-                            let index = self.index.as_mut().and_then(Arc::get_mut).expect("scheduled index is unshared");
+                            let index = self
+                                .index
+                                .as_mut()
+                                .and_then(Arc::get_mut)
+                                .expect("scheduled index is unshared");
                             for file in batch {
                                 index.insert_layout(file);
                             }
@@ -2786,7 +2807,11 @@ impl Volume {
                         JournalQuery::NotActive => {}
                     }
                     let exceeded = {
-                        let index = self.index.as_mut().and_then(Arc::get_mut).expect("scheduled index is unshared");
+                        let index = self
+                            .index
+                            .as_mut()
+                            .and_then(Arc::get_mut)
+                            .expect("scheduled index is unshared");
                         let allocated = index.memory().total().allocated;
                         if has_optimize_headroom(allocated, other_bytes, index_budget) {
                             index.optimize_storage();
@@ -2835,7 +2860,11 @@ impl Volume {
                     self.journal = Some(eof_journal);
                     self.high_water = Some(eof_journal.next_usn);
                     let exceeded = {
-                        let index = self.index.as_mut().and_then(Arc::get_mut).expect("scheduled index is unshared");
+                        let index = self
+                            .index
+                            .as_mut()
+                            .and_then(Arc::get_mut)
+                            .expect("scheduled index is unshared");
                         let allocated = index.memory().total().allocated;
                         if has_optimize_headroom(allocated, other_bytes, index_budget) {
                             index.optimize_storage();
@@ -2917,7 +2946,11 @@ impl Volume {
         for batch in bounded_batches(&page.records) {
             self.stop.before_native()?;
             let exceeded = {
-                let index = self.index.as_mut().and_then(Arc::get_mut).expect("scheduled index is unshared");
+                let index = self
+                    .index
+                    .as_mut()
+                    .and_then(Arc::get_mut)
+                    .expect("scheduled index is unshared");
                 if volume_resources_exceeded(index, other_bytes, index_budget) {
                     true
                 } else {
@@ -3426,6 +3459,7 @@ fn run(
     mut output: impl FnMut(&Event) -> Result<(), String>,
 ) -> Result<(), String> {
     stop.attach_current_thread()?;
+    let requester = RequesterAccess::from_process(parent.process.0)?;
     if service_mode {
         settings = service_safe_settings(settings);
     }
@@ -3777,12 +3811,21 @@ fn run(
         }
         if let Some(resume) = &mut resume_store {
             dirty |= resume.poll(&mut volumes, generation);
-            let bytes = volumes.iter().fold(resume.detached_bytes(&volumes), |sum, volume| {
-                sum.saturating_add(volume.allocated_bytes())
-            });
-            dirty |= resume.schedule(&mut volumes, &settings, generation, index_budget.saturating_sub(bytes));
+            let bytes = volumes
+                .iter()
+                .fold(resume.detached_bytes(&volumes), |sum, volume| {
+                    sum.saturating_add(volume.allocated_bytes())
+                });
+            dirty |= resume.schedule(
+                &mut volumes,
+                &settings,
+                generation,
+                index_budget.saturating_sub(bytes),
+            );
         }
-        let detached = resume_store.as_ref().map_or(0, |io| io.detached_bytes(&volumes));
+        let detached = resume_store
+            .as_ref()
+            .map_or(0, |io| io.detached_bytes(&volumes));
         let cache_loading = resume_store.as_ref().is_some_and(ResumeStore::loading);
         let mut bytes = volumes.iter().fold(detached, |sum, volume| {
             sum.saturating_add(volume.allocated_bytes())
@@ -3790,7 +3833,11 @@ fn run(
         let states = volumes
             .iter()
             .map(|volume| {
-                if volume.index.as_ref().is_some_and(|index| Arc::strong_count(index) > 1) {
+                if volume
+                    .index
+                    .as_ref()
+                    .is_some_and(|index| Arc::strong_count(index) > 1)
+                {
                     // An immutable snapshot is saving on the I/O worker. It still serves queries.
                     Phase::Snapshot
                 } else {
@@ -3798,7 +3845,10 @@ fn run(
                 }
             })
             .collect::<Vec<_>>();
-        if let Some(index) = (!cache_loading).then(|| next_fair_volume(&states, next_volume)).flatten() {
+        if let Some(index) = (!cache_loading)
+            .then(|| next_fair_volume(&states, next_volume))
+            .flatten()
+        {
             next_volume = (index + 1) % volumes.len();
             let own_bytes = volumes[index].allocated_bytes();
             let other_bytes = bytes.saturating_sub(own_bytes);
@@ -3832,7 +3882,9 @@ fn run(
                     }
                 }
             }
-            let detached = resume_store.as_ref().map_or(0, |io| io.detached_bytes(&volumes));
+            let detached = resume_store
+                .as_ref()
+                .map_or(0, |io| io.detached_bytes(&volumes));
             bytes = volumes.iter().fold(detached, |sum, volume| {
                 sum.saturating_add(volume.allocated_bytes())
             });
@@ -3923,7 +3975,7 @@ fn run(
         if let Some((query_session, query_generation, query_id, text)) = &query {
             if queried_revision != revision && query_clock.elapsed() >= Duration::from_millis(250) {
                 let cancel = &stop.requested;
-                let budget = Budget::until(Instant::now() + Duration::from_millis(250), cancel);
+                let budget = Budget::until(Instant::now() + LIVE_SEARCH_BUDGET, cancel);
                 let results = if let Some(error) = &inventory_error {
                     Err(format!("전체 볼륨 검색을 사용할 수 없습니다. {error}"))
                 } else if let Err(error) = Volume::query_scope_conflict(text, &settings, &volumes) {
@@ -3945,6 +3997,7 @@ fn run(
                         Ok(_) => {
                             let mut parts = Vec::with_capacity(queryable);
                             let mut failure = None;
+                            let mut complete = complete;
                             for volume in volumes.iter().filter(|volume| {
                                 volume.mount.is_some()
                                     && matches!(
@@ -3954,16 +4007,14 @@ fn run(
                                     && can_publish_query(&volume.state, volume.index.is_some())
                             }) {
                                 if budget.check() {
-                                    failure = Some(
-                                        "검색 시간이 초과됐습니다. 검색 범위를 줄여 주세요."
-                                            .to_string(),
-                                    );
+                                    complete = false;
                                     break;
                                 }
                                 match volume.query(
                                     text,
                                     &settings,
                                     windows_components.as_ref(),
+                                    &requester,
                                     &budget,
                                 ) {
                                     Ok(part) => parts.push(part),
@@ -3976,11 +4027,15 @@ fn run(
                             if let Some(error) = failure {
                                 Err(error)
                             } else {
-                                super::merge_with_budget(parts, complete, &budget).map(Box::new)
+                                super::merge_results(parts, complete).map(Box::new)
                             }
                         }
                     }
                 };
+                if stop.is_requested() {
+                    returned.normal = true;
+                    return Ok(());
+                }
                 output(&Event::VolumeSearch {
                     session: *query_session,
                     generation: *query_generation,

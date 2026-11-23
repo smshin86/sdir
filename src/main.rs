@@ -1,6 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-#[cfg(all(windows, feature = "desktop"))]
+#[cfg(all(any(windows, target_os = "macos"), feature = "desktop"))]
 mod ui;
 
 fn main() {
@@ -22,12 +22,12 @@ fn main() {
         }
         return;
     }
-    #[cfg(all(windows, feature = "desktop"))]
+    #[cfg(all(any(windows, target_os = "macos"), feature = "desktop"))]
     {
         ui::launch();
     }
-    #[cfg(not(all(windows, feature = "desktop")))]
+    #[cfg(not(all(any(windows, target_os = "macos"), feature = "desktop")))]
     {
-        eprintln!("SDIR 데스크톱: Windows에서 cargo run --features desktop");
+        eprintln!("SDIR 데스크톱: Windows 또는 macOS에서 cargo run --features desktop");
     }
 }

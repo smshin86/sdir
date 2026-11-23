@@ -695,17 +695,10 @@ pub(super) fn rejected_command(
 fn journal_current(expected: u64, cursor: i64, actual: u64, first: i64, lowest: i64) -> bool {
     expected == actual && cursor >= first.max(lowest)
 }
-#[cfg(test)]
-fn merge(parts: impl IntoIterator<Item = SearchResult>, complete: bool) -> SearchResult {
-    merge_with_budget(parts, complete, &goz_core::query::Budget::unlimited())
-        .expect("unlimited query merge")
-}
-
 #[cfg(any(windows, test))]
-fn merge_with_budget(
+fn merge_results(
     parts: impl IntoIterator<Item = SearchResult>,
     complete: bool,
-    budget: &goz_core::query::Budget<'_>,
 ) -> Result<SearchResult, String> {
     const MAX_MERGED_HITS: usize = crate::index_policy::MAX_VOLUME_POLICIES * 200;
     let mut result = SearchResult {
@@ -715,9 +708,6 @@ fn merge_with_budget(
         complete,
     };
     for part in parts {
-        if budget.check() {
-            return Err("검색 시간이 초과됐습니다. 검색 범위를 줄여 주세요.".into());
-        }
         if result.hits.len().saturating_add(part.hits.len()) > MAX_MERGED_HITS {
             return Err("검색 결과 작업공간이 너무 큽니다. 검색 범위를 줄여 주세요.".into());
         }
@@ -727,22 +717,11 @@ fn merge_with_budget(
             .ok_or_else(|| "검색 결과 수가 허용 범위를 넘었습니다.".to_string())?;
         result.elapsed_ms += part.elapsed_ms;
         result.complete &= part.complete;
-        for hit in part.hits {
-            if budget.check() {
-                return Err("검색 시간이 초과됐습니다. 검색 범위를 줄여 주세요.".into());
-            }
-            result.hits.push(hit);
-        }
-    }
-    if budget.check() {
-        return Err("검색 시간이 초과됐습니다. 검색 범위를 줄여 주세요.".into());
+        result.hits.extend(part.hits);
     }
     result
         .hits
         .sort_by_cached_key(|hit| (hit.name.to_lowercase(), hit.path.clone()));
-    if budget.check() {
-        return Err("검색 시간이 초과됐습니다. 검색 범위를 줄여 주세요.".into());
-    }
     result.hits.truncate(200);
     Ok(result)
 }
@@ -1027,14 +1006,14 @@ mod tests {
             elapsed_ms: 2.,
             complete: true,
         };
-        let r = merge([part("C:", 150), part("D:", 150)], true);
+        let r = merge_results([part("C:", 150), part("D:", 150)], true).unwrap();
         assert_eq!(r.total, 2000);
         assert_eq!(r.hits.len(), 200);
         assert_eq!(r.elapsed_ms, 4.);
         assert!(r.complete);
         assert!(r.hits.iter().any(|h| h.path.display().starts_with("C:")));
         assert!(r.hits.iter().any(|h| h.path.display().starts_with("D:")));
-        assert!(!merge([part("C:", 1)], false).complete);
+        assert!(!merge_results([part("C:", 1)], false).unwrap().complete);
     }
 }
 

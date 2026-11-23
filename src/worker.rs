@@ -19,6 +19,10 @@ use std::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    FileAppearances {
+        id: u64,
+        keys: Vec<crate::file_appearance::FileAppearanceKey>,
+    },
     Thumbnails {
         id: u64,
         paths: Vec<NativePath>,
@@ -54,6 +58,10 @@ pub enum Request {
     Index {
         id: u64,
         root: NativePath,
+    },
+    #[cfg(target_os = "macos")]
+    IndexSpotlight {
+        id: u64,
     },
     IndexVolumes {
         id: u64,
@@ -108,6 +116,10 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    FileAppearances {
+        id: u64,
+        items: Vec<Option<crate::file_appearance::FileAppearance>>,
+    },
     Thumbnails {
         id: u64,
         images: Vec<Option<String>>,
@@ -263,6 +275,10 @@ pub fn worker_main(search: bool) -> Result<(), String> {
         parent_lifetime();
     }
     match request {
+        Request::FileAppearances { id, keys } => output(&Event::FileAppearances {
+            id,
+            items: crate::file_appearance::load(&keys),
+        }),
         Request::Thumbnails { id, paths } => output(&Event::Thumbnails {
             id,
             images: paths
@@ -362,6 +378,8 @@ fn search_main() -> Result<(), String> {
         let _ = tx.send(Request::ProxyInputClosed);
     });
     let mut index: Option<FolderIndex> = None;
+    #[cfg(target_os = "macos")]
+    let mut spotlight = false;
     let mut index_id = 0;
     let mut last_status = Instant::now();
     let mut query: Option<(u64, String)> = None;
@@ -404,7 +422,31 @@ fn search_main() -> Result<(), String> {
                     }
                     return Ok(());
                 }
+                #[cfg(target_os = "macos")]
+                Request::IndexSpotlight { id } => {
+                    index = None;
+                    spotlight = true;
+                    query = None;
+                    output(&Event::Index {
+                        index_id: id,
+                        status: IndexStatus {
+                            root: NativePath::new("/"),
+                            entries: 0,
+                            skipped: 0,
+                            complete: true,
+                            limited: false,
+                            allocated_bytes: 0,
+                            live: false,
+                            host_pid: None,
+                            volumes: vec![],
+                        },
+                    });
+                }
                 Request::Index { id, root } => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        spotlight = false;
+                    }
                     index_id = id;
                     query = None;
                     match FolderIndex::new(root) {
@@ -432,6 +474,13 @@ fn search_main() -> Result<(), String> {
                 }
                 _ => {}
             }
+        }
+        #[cfg(target_os = "macos")]
+        if spotlight && let Some((id, text)) = query.take() {
+            output(&Event::Search {
+                id,
+                result: crate::macos_spotlight::query(&text),
+            });
         }
         if let Some(i) = index.as_mut() {
             let was_complete = i.status().complete;
@@ -486,6 +535,10 @@ fn is_query_request(request: &Request) -> bool {
 
 fn request_failure(request: Request, message: String) -> Event {
     match request {
+        Request::FileAppearances { id, .. } => Event::FileAppearances {
+            id,
+            items: Vec::new(),
+        },
         Request::Thumbnails { id, .. } => Event::Thumbnails {
             id,
             images: Vec::new(),
@@ -534,6 +587,12 @@ fn request_failure(request: Request, message: String) -> Event {
             host_pid: None,
             accepted: false,
             message: Some(message),
+        },
+        #[cfg(target_os = "macos")]
+        Request::IndexSpotlight { id } => Event::Failure {
+            lane: 4,
+            id,
+            message,
         },
         Request::Index { id, .. } | Request::IndexVolumes { id, .. } => Event::Failure {
             lane: 4,
@@ -640,6 +699,7 @@ pub struct Bridge {
     pub preview: Slot,
     pub file_preview: Slot,
     pub thumbnails: Slot,
+    pub file_appearance: Slot,
     pub folder_search: Slot,
     pub events: Receiver<Event>,
     jobs: Sender<Request>,
@@ -655,6 +715,7 @@ impl Bridge {
         let preview = Slot::new(10, tx.clone(), false);
         let file_preview = Slot::new(11, tx.clone(), false);
         let thumbnails = Slot::new(13, tx.clone(), false);
+        let file_appearance = Slot::new(14, tx.clone(), false);
         let folder_search = Slot::new(12, tx.clone(), true);
         let watches = (0..4)
             .map(|i| Slot::new(6 + i, tx.clone(), false))
@@ -703,6 +764,7 @@ impl Bridge {
             preview,
             file_preview,
             thumbnails,
+            file_appearance,
             folder_search,
             events: rx,
             jobs,
@@ -962,6 +1024,8 @@ fn event_forwarder(events: Sender<Event>) -> Sender<Event> {
 
 fn worker_request_id(request: &Request) -> u64 {
     match request {
+        #[cfg(target_os = "macos")]
+        Request::IndexSpotlight { id } => *id,
         Request::List { id, .. }
         | Request::Index { id, .. }
         | Request::IndexVolumes { id, .. }
@@ -970,6 +1034,7 @@ fn worker_request_id(request: &Request) -> u64 {
         | Request::Watch { id, .. }
         | Request::ReadPreview { id, .. }
         | Request::Thumbnails { id, .. }
+        | Request::FileAppearances { id, .. }
         | Request::Query { id, .. } => *id,
         Request::Configure { session, .. }
         | Request::Rebuild { session, .. }
