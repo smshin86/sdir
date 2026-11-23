@@ -1,0 +1,30 @@
+name: macOS GUI verification
+
+on:
+  push:
+    branches: [macos-apple-silicon-verify]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  journeys:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: SDIR-macos-arm64
+          path: delivered
+          run-id: '45150220162'
+          github-token: ${{ github.token }}
+      - run: xcrun swiftc -swift-version 5 scripts/verify-macos-ui.swift -o /tmp/sdir-verify-ui
+      - run: python3 scripts/verify-macos-ui.py delivered/SDIR-macos-arm64-0.6.1.dmg /tmp/sdir-verify-ui gui-verification/journeys.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: SDIR-macos-GUI-verification
+          path: gui-verification/
