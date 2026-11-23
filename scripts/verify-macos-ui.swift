@@ -159,7 +159,52 @@ func click(_ rect: CGRect) {
     mouse(.leftMouseUp, point)
 }
 
-func testIME(_ app: NSRunningApplication, _ ax: AXUIElement) throws {
+func typeKoreanSample() {
+    let koreanKeys: [CGKeyCode] = [5, 40, 1, 15, 46, 3]
+    for code in koreanKeys { key(code) }
+    key(49)
+    key(51)
+    key(20)
+}
+
+func textEditControl(folder: URL, source: TISInputSource, sourceID: String) throws -> String {
+    let fixture = folder.appendingPathComponent("SDIR Korean IME Control.txt")
+    try "12".write(to: fixture, atomically: true, encoding: .utf8)
+    let opener = Process()
+    opener.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    opener.arguments = ["-n", "-a", "/System/Applications/TextEdit.app", fixture.path]
+    try opener.run()
+    guard waitFor(6, { opener.isRunning ? nil : opener.terminationStatus }) == 0 else {
+        throw IMEUnavailable("Could not launch the TextEdit control document")
+    }
+    guard let editor = waitFor(8, {
+        NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.TextEdit").first { app in
+            let root = AXUIElementCreateApplication(app.processIdentifier)
+            return window(root).map { hasText($0, "SDIR Korean IME Control") } ?? false
+        }
+    }), activate(editor) else { throw IMEUnavailable("The TextEdit control document did not become active") }
+    let ax = AXUIElementCreateApplication(editor.processIdentifier)
+    guard let field = waitFor(5, {
+        window(ax).flatMap { root in
+            searchAX(root, matches: { role($0) == "AXTextArea" && attribute($0, kAXValueAttribute) as? String == "12" })
+        }
+    }), let fieldFrame = frame(field) else { throw IMEUnavailable("Could not identify the TextEdit control field") }
+    click(fieldFrame)
+    key(124, flags: [.maskCommand])
+    key(123)
+    TISSelectInputSource(source)
+    guard waitFor(4, { currentSourceID() == sourceID && attribute(field, kAXFocusedAttribute) as? Bool == true ? true : nil }) == true else {
+        throw IMEUnavailable("The TextEdit control could not confirm both focus and Korean input selection")
+    }
+    typeKoreanSample()
+    guard let output = waitFor(6, {
+        let value = (attribute(field, kAXValueAttribute) as? String)?.precomposedStringWithCanonicalMapping
+        return value?.hasPrefix("1") == true && value?.hasSuffix("32") == true ? value : nil
+    }) else { throw IMEUnavailable("The TextEdit control produced no comparable physical-key result") }
+    return output
+}
+
+func testIME(_ app: NSRunningApplication, _ ax: AXUIElement, _ controlFolder: URL) throws {
     guard activate(app) else { throw JourneyFailure("Could not make SDIR the foreground application") }
     guard let toggle = waitFor(12, {
         window(ax).flatMap { appWindow in
@@ -228,16 +273,22 @@ func testIME(_ app: NSRunningApplication, _ ax: AXUIElement) throws {
     guard waitFor(5, { currentSourceID() == koreanID ? true : nil }) == true else {
         throw IMEUnavailable("Runner did not switch to Korean 2-set via TIS or Control-Space (select status \(selected), current ID \(currentSourceID()))")
     }
-    let koreanKeys: [CGKeyCode] = [5, 40, 1, 15, 46, 3]
-    for code in koreanKeys { key(code) }
-    key(49)
-    key(51)
-    key(20)
+    typeKoreanSample()
     let expected = "1한글32"
     guard waitFor(6, {
         (attribute(field, kAXValueAttribute) as? String)?.precomposedStringWithCanonicalMapping == expected ? true : nil
     }) == true else {
-        throw JourneyFailure("Physical Korean keys did not commit at the expected cursor position; input is \(attribute(field, kAXValueAttribute) as? String ?? "unavailable")")
+        let sdirValue = attribute(field, kAXValueAttribute) as? String ?? "unavailable"
+        let control: String
+        do {
+            control = try textEditControl(folder: controlFolder, source: selectable, sourceID: koreanID)
+        } catch {
+            throw IMEUnavailable("SDIR held \(sdirValue); TextEdit comparison incomplete: \(error)")
+        }
+        if control == expected {
+            throw JourneyFailure("TextEdit committed \(control) with the same physical keys; SDIR held \(sdirValue)")
+        }
+        throw IMEUnavailable("The same keys under Korean selection yielded \(sdirValue) in SDIR and \(control) in TextEdit; the runner did not produce the Korean control result")
     }
     emit("korean_ime", "passed", "Korean 2-set physical keys committed 1한글32 in the Spotlight field, preserving insertion position")
 }
@@ -315,7 +366,7 @@ guard trusted && post else {
 }
 
 let ax = AXUIElementCreateApplication(pid)
-do { try testIME(app, ax) }
+do { try testIME(app, ax, destination.deletingLastPathComponent()) }
 catch let reason as IMEUnavailable { emit("korean_ime", "blocked", reason.description) }
 catch { emit("korean_ime", "failed", String(describing: error)) }
 do { try testFinderDrop(app, ax, source, destination) } catch { emit("finder_drop", "failed", String(describing: error)) }
