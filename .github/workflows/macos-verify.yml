@@ -1,9 +1,8 @@
-name: macOS GUI verification
+name: macOS 0.6.2 rename verification
 
 on:
   push:
-    branches: [macos-apple-silicon-verify]
-  workflow_dispatch:
+    branches: [macos-0.6.2-verify]
 
 permissions:
   contents: read
@@ -19,10 +18,9 @@ jobs:
         with:
           name: SDIR-macos-arm64
           path: delivered
-          run-id: '45150220162'
+          run-id: '45313788473'
           github-token: ${{ github.token }}
-      - run: xcrun swiftc -swift-version 5 scripts/verify-macos-ui.swift -o /tmp/sdir-verify-ui
-      - run: python3 scripts/verify-macos-ui.py delivered/SDIR-macos-arm64-0.6.1.dmg /tmp/sdir-verify-ui gui-verification/journeys.json
+      - run: python3 scripts/verify-macos-rename.py delivered/SDIR-macos-arm64-0.6.2.dmg gui-verification/journeys.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
