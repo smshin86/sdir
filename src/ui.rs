@@ -1362,10 +1362,10 @@ fn VolumeScopeEditor(
             }
             if let Some(active_draft)=active_draft.as_ref(){
                 div{class:"volume-scope-editor",
-                    label{span{"포함할 상대 경로 · 한 줄에 하나"}textarea{class:"volume-scope-include","aria-label":"포함할 상대 경로",value:"{active_draft.include_text}",disabled,
-                        oninput:move|event:FormEvent|{if let Some(value)=draft.write().as_mut(){value.include_text=event.value();value.error=None;}}}}
-                    label{span{"제외할 상대 경로 · 한 줄에 하나"}textarea{class:"volume-scope-exclude","aria-label":"제외할 상대 경로",value:"{active_draft.exclude_text}",disabled,
-                        oninput:move|event:FormEvent|{if let Some(value)=draft.write().as_mut(){value.exclude_text=event.value();value.error=None;}}}}
+                    label{span{"포함할 상대 경로 · 한 줄에 하나"}textarea{class:"volume-scope-include","data-ime-commit":"true","aria-label":"포함할 상대 경로",value:"{active_draft.include_text}",disabled,
+                        onchange:move|event:FormEvent|{if let Some(value)=draft.write().as_mut(){value.include_text=event.value();value.error=None;}}}}
+                    label{span{"제외할 상대 경로 · 한 줄에 하나"}textarea{class:"volume-scope-exclude","data-ime-commit":"true","aria-label":"제외할 상대 경로",value:"{active_draft.exclude_text}",disabled,
+                        onchange:move|event:FormEvent|{if let Some(value)=draft.write().as_mut(){value.exclude_text=event.value();value.error=None;}}}}
                     p{class:"preference-note","비워 두면 포함 제한이 없습니다. 제외 경로는 포함 경로보다 우선합니다."}
                     if let Some(error)=active_draft.error.as_ref(){p{class:"volume-scope-error","{error}"}}
                     div{class:"volume-scope-actions",
@@ -1630,6 +1630,7 @@ fn inline_rename_editor(
     rsx! {
         input {
             key: "{id}", id: "inline-rename-{id}", class: "inline-rename-input",
+            "data-ime-commit": "true",
             "aria-label": "파일 또는 폴더 이름", spellcheck: false, initial_value: "{name}",
             readonly: submitting,
             onmounted: move |_| {
@@ -3840,7 +3841,13 @@ fn app() -> Element {
                     h2{match &kind{Dialog::NewFolder=>"새 폴더 만들기",Dialog::Recycle(_)=>"휴지통으로 이동",Dialog::Delete(_)=>"영구 삭제"}}
                     if let Dialog::Delete(ref paths)=kind{p{"선택한 {paths.len()}개 항목을 영구 삭제합니다. 휴지통으로 이동하지 않으며 이 작업은 실행 취소할 수 없습니다."}}
                     else if let Dialog::Recycle(ref paths)=kind{p{"선택한 {paths.len()}개 항목을 휴지통으로 이동합니다." if cfg!(windows) {" 위치에 따라 Windows가 영구 삭제 여부를 별도로 확인할 수 있습니다."}}}
-                    else{input{class:"dialog-input",autofocus:true,value:"{modal_name}",oninput:move|e|model.write().dialog_name=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();if e.key()==Key::Enter&&!e.is_composing(){confirm(model,&b);}if e.key()==Key::Escape{model.write().dialog=None;}}}}}
+                    else{input{class:"dialog-input new-folder-input","data-ime-commit":"true","aria-label":"새 폴더 이름",value:"{modal_name}",
+                        onmounted:move |_|{
+                            if matches!(model.read().dialog,Some(Dialog::NewFolder)){
+                                let _=document::eval("{const e=document.querySelector('.new-folder-input'),a=document.activeElement;if(e&&(a===e||a===document.body||a?.matches('.app,.list-scroll,button[aria-label=\"새 폴더\"]'))){e.focus({preventScroll:true});e.select();}}");
+                            }
+                        },
+                        onchange:move|e|model.write().dialog_name=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();if e.key()==Key::Enter&&!e.is_composing(){confirm(model,&b);}if e.key()==Key::Escape{model.write().dialog=None;}}}}}
                     div{class:"modal-actions",button{onclick:move |_|model.write().dialog=None,"취소"}button{class:"primary",disabled:job,onclick:{let b=bridge.clone();move |_|confirm(model,&b)},"확인"}}
                 }}
             }
@@ -3940,7 +3947,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
             div{class:"group-header",
                 span{class:"group-number","{pane_id+1}"}
                 if editing_name{
-                    input{class:"group-name-input","aria-label":"그룹 이름",initial_value:"{initial_name}",maxlength:64,
+                    input{class:"group-name-input","data-ime-commit":"true","aria-label":"그룹 이름",initial_value:"{initial_name}",maxlength:64,
                         onmounted:move |_|{
                             let request=rename_focus.write().take();
                             let state=model.read();
@@ -3979,7 +3986,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                 button{class:"icon-button",title:"뒤로",disabled:tab.back.is_empty(),onclick:{let b=bridge.clone();move |_|{history_navigation(model,&b,pane_id,false)}},"‹"}
                 button{class:"icon-button",title:"앞으로",disabled:tab.forward.is_empty(),onclick:{let b=bridge.clone();move |_|{history_navigation(model,&b,pane_id,true)}},"›"}
                 button{class:"icon-button",title:"상위 폴더",onclick:{let b=bridge.clone();move |_|{let parent=model.read().panes[pane_id].tab().path.parent();if let Some(path)=parent{navigate(model,&b,pane_id,path);}}},"↑"}
-                div{class:"address-input-wrap",button{class:"path-menu-toggle",title:"상위 경로 바로 이동","aria-expanded":menu_open,onclick:move |_|path_menu.set(!menu_open),Icon{kind:"folder"}}input{id:"address-{pane_id}",class:"address-input",value:"{p.address}",spellcheck:false,oninput:move|e|model.write().panes[pane_id].address=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();model.write().interaction+=1;if pane_shortcut(&e,model,pane_id,&b){return;}if e.key()==Key::Enter&&!e.is_composing(){let value=model.read().panes[pane_id].address.clone();navigate(model,&b,pane_id,NativePath::new(value));}}}}
+                div{class:"address-input-wrap",button{class:"path-menu-toggle",title:"상위 경로 바로 이동","aria-expanded":menu_open,onclick:move |_|path_menu.set(!menu_open),Icon{kind:"folder"}}input{id:"address-{pane_id}",class:"address-input","data-ime-commit":"true",value:"{p.address}",spellcheck:false,onchange:move|e|model.write().panes[pane_id].address=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();model.write().interaction+=1;if pane_shortcut(&e,model,pane_id,&b){return;}if e.key()==Key::Enter&&!e.is_composing(){let value=model.read().panes[pane_id].address.clone();navigate(model,&b,pane_id,NativePath::new(value));}}}}
                     if history_open {
                         div {class:"path-menu-dismiss", onclick:move |e:MouseEvent|{e.stop_propagation();model.write().address_history=None;}}
                         div {class:"path-menu address-history", role:"menu", "aria-label":"주소 기록",
@@ -4005,7 +4012,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                 button{class:"icon-button",title:if p.loading{"읽기 취소"}else{"새로고침 · F5"},onclick:{let b=bridge.clone();move |_|{if model.read().panes[pane_id].loading{b.panes[pane_id].cancel();let mut s=model.write();let id=s.refreshes[pane_id].take().map(|r|r.id);let p=&mut s.panes[pane_id];p.loading=false;p.generation=p.generation.max(id.unwrap_or(0))+1;s.notice="폴더 읽기를 취소했습니다.".into();}else{load(model,&b,pane_id);}}},if p.loading{"×"}else{"↻"}}
             }
             div{class:"pane-filter",Icon{kind:"search"}
-                {rsx!{input{key:"filter-{filter_revision}",id:"pane-query-{pane_id}",placeholder:"현재 목록 필터 · Ctrl+E",
+                {rsx!{input{key:"filter-{filter_revision}",id:"pane-query-{pane_id}",placeholder:"현재 목록 필터 · Ctrl+E","data-ime-commit":"true",
                     title:"이 패널의 현재 폴더에서 이름 검색",initial_value:"{filter}",spellcheck:false,
                     onchange:move|event:FormEvent|{
                         event.stop_propagation();
@@ -4293,7 +4300,7 @@ fn Workspaces(mut model: Signal<AppModel>) -> Element {
                 div{class:"preferences-heading",h2{"작업공간"}button{class:"icon-button",title:"작업공간 닫기",onclick:move |_|model.write().workspaces_open=false,"×"}}
                 p{"분할·그룹 이름·탭 경로와 선택 위치를 함께 저장합니다. 현재 배치가 필요하면 전환 전에 저장해 주세요."}
                 div{class:"workspace-save-row",
-                    input{class:"dialog-input workspace-name","aria-label":"작업공간 이름",placeholder:"예: 업무용 · 개발용",maxlength:64,value:"{name}",oninput:move|e|name.set(e.value())}
+                    input{class:"dialog-input workspace-name","data-ime-commit":"true","aria-label":"작업공간 이름",placeholder:"예: 업무용 · 개발용",maxlength:64,value:"{name}",onchange:move|e|name.set(e.value())}
                     button{class:"primary workspace-save",disabled,onclick:move |_|{
                         let title = settings::workspace_name(&name.read());
                         if title.is_empty(){return;}
@@ -4579,7 +4586,7 @@ fn SearchPanel(mut model: Signal<AppModel>) -> Element {
                     onclick:move |_|{let mut s=model.write();s.search_expanded=!s.search_expanded;},if expanded{"축소"}else{"확대"}}
                 button{class:"icon-button",title:"검색 닫기","aria-label":"검색 닫기",onclick:move |_|{let mut s=model.write();s.search_open=false;s.search_expanded=false;},"×"}
             }
-            div{class:"search-input-wrap",Icon{kind:"search"}input{id:"global-query",onmounted:move |_|{let focus={let s=model.read();s.search_focus==Some(s.interaction)&&s.search_open&&!s.modal_open()};if focus{model.write().search_focus=None;let _=document::eval("window.sdirFocusSearch?.()");}},onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();if e.is_composing(){return;}if pane_shortcut(&e,model,active_pane(model),&b){return;}if e.key()==Key::Enter{model.write().submit_query();}}},placeholder:if instant{"파일명, ext:pdf, *.txt"}else{"입력 후 Enter로 검색"},initial_value:"{initial_query}",spellcheck:false,onchange:move|e|{let value=e.value();if model.peek().query!=value{model.write().edit_query(value);}}}button{class:"search-submit",title:"검색 실행 (Enter)",onclick:move |_|model.write().submit_query(),"검색"}}
+            div{class:"search-input-wrap",Icon{kind:"search"}input{id:"global-query","data-ime-commit":"true",onmounted:move |_|{let focus={let s=model.read();s.search_focus==Some(s.interaction)&&s.search_open&&!s.modal_open()};if focus{model.write().search_focus=None;let _=document::eval("window.sdirFocusSearch?.()");}},onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();if e.is_composing(){return;}if pane_shortcut(&e,model,active_pane(model),&b){return;}if e.key()==Key::Enter{model.write().submit_query();}}},placeholder:if instant{"파일명, ext:pdf, *.txt"}else{"입력 후 Enter로 검색"},initial_value:"{initial_query}",spellcheck:false,onchange:move|e|{let value=e.value();if model.peek().query!=value{model.write().edit_query(value);}}}button{class:"search-submit",title:"검색 실행 (Enter)",onclick:move |_|model.write().submit_query(),"검색"}}
             if pane_names.len()>1{
                 label{class:"search-target",span{"결과를 열 패널"}
                     select{class:"search-target-select",value:"{target}",onchange:move|e:FormEvent|{

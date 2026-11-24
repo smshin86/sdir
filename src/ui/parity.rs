@@ -275,14 +275,14 @@ pub(super) fn FolderSearchDialog(mut model: Signal<AppModel>) -> Element {
             div{class:"inspector-header",h2{"하위 폴더 검색"}button{class:"icon-button",
                 "aria-label":"하위 폴더 검색 닫기",onclick:move |_|close_folder_search(model,&cancel),"×"}}
             p{class:"folder-search-root",title:"{root}","{root}"}
-            input{class:"folder-search-input",r#type:"search","aria-label":"파일 또는 폴더 이름",
+            input{class:"folder-search-input","data-ime-commit":"true",r#type:"search","aria-label":"파일 또는 폴더 이름",
                 placeholder:"파일 또는 폴더 이름",spellcheck:false,initial_value:"{text}",
                 onmounted:move |_| {
                     if model.read().folder_search.as_ref().is_some_and(|s| s.index_id==index_id) {
                         let _=document::eval("document.querySelector('.folder-search-input')?.focus()");
                     }
                 },
-                oninput:move |event:FormEvent| {
+                onchange:move |event:FormEvent| {
                     let mut s = model.write();
                     let id = s.id();
                     if let Some(search) = s.folder_search.as_mut().filter(|search| search.index_id==index_id) {
@@ -476,16 +476,16 @@ pub(super) fn NetworkDriveDialog(mut model: Signal<AppModel>, disconnect: bool) 
                     close_network_dialog(model,disconnect);
                 }
             },
-                label{span{"드라이브 문자"}input{class:"network-drive-letter",placeholder:"Z:",maxlength:2,
+                label{span{"드라이브 문자"}input{class:"network-drive-letter","data-ime-commit":"true",placeholder:"Z:",maxlength:2,
                     onmounted:move |_| {
                         if model.read().network_dialog == Some(disconnect) {
                             let _ = document::eval("document.querySelector('.network-drive-dialog .network-drive-letter')?.focus({preventScroll:true});");
                         }
                     },
-                    oninput:move|e:FormEvent|drive.set(e.value())}}
+                    onchange:move|e:FormEvent|drive.set(e.value())}}
                 if !disconnect {
-                    label{span{"공유 폴더 경로"}input{class:"network-drive-path",placeholder:r"\\서버\공유",maxlength:2048,
-                        oninput:move|e:FormEvent|path.set(e.value())}}
+                    label{span{"공유 폴더 경로"}input{class:"network-drive-path","data-ime-commit":"true",placeholder:r"\\서버\공유",maxlength:2048,
+                        onchange:move|e:FormEvent|path.set(e.value())}}
                     label{class:"network-remember",input{r#type:"checkbox",checked:*remember.read(),
                         onchange:move|e:FormEvent|remember.set(e.checked())}span{"로그인할 때 다시 연결"}}
                 }

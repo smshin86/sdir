@@ -814,7 +814,7 @@ pub(super) fn BatchRenameDialog(mut model: Signal<AppModel>) -> Element {
     h2{"이름 일괄 변경 · {b.paths.len()}개"}p{"확장자는 유지됩니다. 바뀔 이름을 미리 확인한 뒤 적용하세요. 충돌이 있으면 실행하지 않습니다."}
     if let Some(common) = common {
         label{class:"batch-fields",span{"공통 이름"},
-            input{class:"batch-field batch-common-name",maxlength:200,initial_value:"{common}",
+            input{class:"batch-field batch-common-name","data-ime-commit":"true",maxlength:200,initial_value:"{common}",
                 onmounted:move |_|{let _=document::eval("document.querySelector('.batch-common-name')?.focus();");},
                 onchange:move |e:FormEvent|change_pattern(model,5,e.value()),
                 onkeydown:move |e:KeyboardEvent| {
@@ -826,7 +826,7 @@ pub(super) fn BatchRenameDialog(mut model: Signal<AppModel>) -> Element {
             }
         }
     } else {
-    div{class:"batch-fields",for (i,label) in ["찾을 글자","바꿀 글자","앞에 추가","뒤에 추가","시작 번호 (선택)"].iter().enumerate(){label{span{"{label}"}input{class:"batch-field","data-field":i,value:"{values[i]}",maxlength:200,oninput:move|e:FormEvent|change_pattern(model,i,e.value())}}}}
+    div{class:"batch-fields",for (i,label) in ["찾을 글자","바꿀 글자","앞에 추가","뒤에 추가","시작 번호 (선택)"].iter().enumerate(){label{span{"{label}"}input{class:"batch-field","data-ime-commit":"true","data-field":i,value:"{values[i]}",maxlength:200,onchange:move|e:FormEvent|change_pattern(model,i,e.value())}}}}
     }
     div{class:"batch-preview",match b.result{Some(Ok(pairs))=>rsx!{for pair in pairs{div{class:"rename-preview",span{"{pair.source.name()}"}span{"→"}strong{"{pair.name}"}}}},Some(Err(e))=>rsx!{p{class:"batch-error","{e}"}},None=>rsx!{p{"미리보기 확인 중…"}}}}
     div{class:"modal-actions",button{class:"batch-cancel",onclick:move |_|close_batch(model,&cancel),"취소"}button{class:"primary batch-apply",disabled:!ready,onclick:move |_|{let pairs=model.read().batch.as_ref().and_then(|b|b.result.as_ref()).and_then(|r|r.as_ref().ok()).cloned();if let Some(pairs)=pairs{let pairs=pairs.into_iter().filter(|p|p.source.name()!=p.name).collect();model.write().batch=None;submit(model,&apply,FileAction::BatchRename{pairs});}},"적용"}}

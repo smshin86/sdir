@@ -2,7 +2,7 @@ name: macOS Apple Silicon
 
 on:
   push:
-    branches: [macos-apple-silicon, macos-0.6.2]
+    branches: [macos-apple-silicon, macos-0.6.2, macos-0.6.3]
   workflow_dispatch:
 
 permissions:

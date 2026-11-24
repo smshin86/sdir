@@ -4,7 +4,7 @@ if (!window.__sdirTextUndoInstalled) {
   const edits = new WeakMap();
   const replaying = new WeakSet();
   const textInput = target => target instanceof HTMLTextAreaElement ||
-    (target instanceof HTMLInputElement && !['checkbox', 'radio', 'button', 'submit'].includes(target.type));
+    (target instanceof HTMLInputElement && ['text', 'search', 'url', 'tel', 'password'].includes(target.type));
   const stateFor = input => {
     let state = edits.get(input);
     if (!state || state.current !== input.value) {
@@ -13,8 +13,8 @@ if (!window.__sdirTextUndoInstalled) {
     }
     return state;
   };
-  const imeInput = input => textInput(input) && input.matches('#global-query, .group-name-input, .inline-rename-input, .batch-common-name, .folder-search-input, .pane-filter input');
-  const paneFilter = input => input instanceof HTMLInputElement && input.matches('.pane-filter input');
+  // Marked fields send their draft to Rust once the browser commits it.
+  const imeInput = input => textInput(input) && input.hasAttribute('data-ime-commit');
   const composing = new WeakMap();
   const recordInput = input => {
     let state = edits.get(input);
@@ -46,7 +46,7 @@ if (!window.__sdirTextUndoInstalled) {
       composing.delete(input);
       if (!input.isConnected) return;
       // Cancelling a composition that replaced selected text can leave that selection deleted.
-      if (cancelled && paneFilter(input) && input.value !== draft.value) {
+      if (cancelled && input.value !== draft.value) {
         input.value = draft.value;
         input.setSelectionRange(draft.start, draft.end);
       }
@@ -62,19 +62,16 @@ if (!window.__sdirTextUndoInstalled) {
     if (imeInput(input) && (event.isComposing || composing.has(input))) return;
     recordInput(input);
   }, true);
+  document.addEventListener('change', event => {
+    if (composing.has(event.target)) event.stopPropagation();
+  }, true);
   document.addEventListener('keydown', event => {
     const target = event.target;
-    if (paneFilter(target) &&
-      (event.isComposing || composing.has(target) || event.keyCode === 229)) {
+    if (imeInput(target) && (event.isComposing || composing.has(target) || event.keyCode === 229)) {
+      // Let the native IME handle the key without invoking an SDIR shortcut.
       event.stopPropagation();
       return;
     }
-    if (target instanceof HTMLInputElement && target.matches('.inline-rename-input') &&
-      (event.isComposing || composing.has(target) || event.keyCode === 229)) {
-      event.stopPropagation();
-      return;
-    }
-    if (imeInput(event.target) && (composing.has(event.target) || event.keyCode === 229)) return;
     const mac = target.closest('.app')?.dataset.os === 'macOS';
     const command = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
     if (event.isComposing || !command || event.altKey ||
