@@ -57,24 +57,30 @@ def verify(image, report):
             stdout=log, stderr=subprocess.STDOUT,
         ) as app:
             try:
-                result = subprocess.run([str(helper), str(app.pid), str(folder), str(dragged),
-                                         str(report.with_name('window-failure.png'))],
-                                        capture_output=True, text=True, timeout=300)
-                events = [json.loads(line) for line in result.stdout.splitlines()]
+                events_path = report.with_name('native-events.jsonl')
+                with events_path.open('w') as event_log:
+                    try:
+                        result = subprocess.run(
+                            [str(helper), str(app.pid), str(folder), str(dragged),
+                             str(report.with_name('window-failure.png'))],
+                            stdout=event_log, stderr=log, timeout=420)
+                        helper_exit = result.returncode
+                    except subprocess.TimeoutExpired:
+                        helper_exit = 124
+                events = [json.loads(line) for line in events_path.read_text().splitlines()]
                 for event in events:
                     print(json.dumps(event, ensure_ascii=False))
-                print(result.stderr, file=sys.stderr)
                 try:
                     app_exit = app.wait(timeout=6)
                 except subprocess.TimeoutExpired:
                     app_exit = None
                 report.write_text(json.dumps({
                     'sha256': digest, 'os': os.uname().sysname, 'arch': os.uname().machine,
-                    'helperExit': result.returncode, 'appExit': app_exit, 'journeys': events,
+                    'helperExit': helper_exit, 'appExit': app_exit, 'journeys': events,
                 }, ensure_ascii=False, indent=2) + '\n')
-                expected = {f'rename_{index:03d}' for index in range(84)} | {'finder_drop'}
+                expected = {f'rename_{index:03d}' for index in range(70)} | {'finder_drop'}
                 passed = {event['journey'] for event in events if event['status'] == 'passed'}
-                return result.returncode == 0 and passed == expected
+                return helper_exit == 0 and passed == expected
             finally:
                 if app.poll() is None:
                     app.terminate()

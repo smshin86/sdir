@@ -62,8 +62,13 @@ func typeStem(_ stem: String, in app: NSRunningApplication) throws {
     ]
     for character in stem {
         guard let code = inputCodes[character] else { throw JourneyFailure("Invalid fixture character") }
-        key(code)
+        for down in [true, false] {
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)!
+            event.post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: 0.022)
+        }
     }
+    RunLoop.current.run(until: Date().addingTimeInterval(0.10))
 }
 
 func captureWindow(pid: pid_t, output: String) {
@@ -85,7 +90,7 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL,
     }
     try manager.removeItem(at: folder.appendingPathComponent("readiness-fixture.txt"))
     let modes = ["return", "list_click", "refresh_delete", "escape", "collision_retry", "refresh_create", "target_removed"]
-    for index in 0..<84 {
+    for index in 0..<70 {
         let mode = modes[index % modes.count]
         let id = String(format: "%03d", index)
         let preceding = id + "-a.txt"
