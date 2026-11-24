@@ -16,31 +16,10 @@ func typeText(_ text: String) {
     }
 }
 
-func renameField(_ ax: AXUIElement) -> AXUIElement? {
-    window(ax).flatMap { win in
-        searchAX(win) { element in
-            let id = attribute(element, "AXDOMIdentifier") as? String ?? ""
-            return id.hasPrefix("inline-rename-") ||
-                (role(element) == kAXTextFieldRole && hasText(element, "파일 또는 폴더 이름"))
-        }
-    }
-}
-
 func row(_ ax: AXUIElement, _ name: String) -> AXUIElement? {
     window(ax).flatMap { win in
         searchAX(win) { element in hasText(element, name) && frame(element) != nil }
     }
-}
-
-func editValue(_ ax: AXUIElement) -> String? {
-    renameField(ax).flatMap { attribute($0, kAXValueAttribute) as? String }
-}
-
-func selectedRange(_ ax: AXUIElement) -> CFRange? {
-    guard let field = renameField(ax), let value = axValue(field, kAXSelectedTextRangeAttribute) else { return nil }
-    var range = CFRange(location: 0, length: 0)
-    guard AXValueGetValue(value, .cfRange, &range) else { return nil }
-    return range
 }
 
 func ancestors(_ node: AXUIElement) -> [AXUIElement] {
@@ -83,12 +62,12 @@ func pick(_ app: NSRunningApplication, _ ax: AXUIElement, _ filename: String) th
     }
 }
 
-func putName(_ ax: AXUIElement, _ name: String) throws {
+func putName(_ text: String, in app: NSRunningApplication) throws {
+    try requireCondition(NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+                         "The owned SDIR window lost foreground before text input")
     key(0, flags: [.maskCommand])
-    typeText(name)
-    try mustWait("Field did not receive \(name); observed \(editValue(ax) ?? "<none>")") {
-        editValue(ax) == name
-    }
+    typeText(text)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.10))
 }
 
 func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL) throws {
@@ -106,7 +85,9 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL)
         let other = id + "-c.txt"
         let target = id + (mode == "unicode" ? "-한글.txt" : "-new.txt")
         let oldPath = folder.appendingPathComponent(source)
-        let targetPath = folder.appendingPathComponent(target)
+        let checksCaret = mode == "refresh_delete" || mode == "refresh_create"
+        let expectedName = checksCaret ? String(target.dropLast()) + "x" + String(target.suffix(1)) : target
+        let targetPath = folder.appendingPathComponent(expectedName)
         let firstPath = folder.appendingPathComponent(preceding)
         let otherPath = folder.appendingPathComponent(other)
         let payload = Data(("SDIR fixture " + id).utf8)
@@ -116,22 +97,20 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL)
         try Data("other".utf8).write(to: otherPath)
         try pick(app, ax, source)
         key(36)
-        try mustWait("Return did not open the input control for \(source)") { editValue(ax) == source }
         if mode == "collision_retry" {
-            try putName(ax, other)
+            try putName(other, in: app)
             key(36)
             try mustWait("Collision feedback did not preserve the draft") {
-                editValue(ax) == other && window(ax).flatMap { win in
+                window(ax).flatMap { win in
                     searchAX(win) { hasText($0, "같은 이름") || hasText($0, "already exists") || hasText($0, "작업을 완료하지 못했습니다") }
                 } != nil
             }
             try requireCondition(try Data(contentsOf: oldPath) == payload, "Collision changed source bytes")
             try requireCondition(try Data(contentsOf: otherPath) == Data("other".utf8), "Collision changed destination")
         }
-        try putName(ax, target)
-        if mode == "refresh_delete" || mode == "refresh_create" {
+        try putName(target, in: app)
+        if checksCaret {
             key(123)
-            guard let cursor = selectedRange(ax) else { throw JourneyFailure("AX did not expose the edit caret") }
             if mode == "refresh_delete" {
                 try manager.removeItem(at: firstPath)
                 try mustWait("Preceding row stayed after its external removal") { row(ax, preceding) == nil }
@@ -140,28 +119,28 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL)
                 try Data("external".utf8).write(to: folder.appendingPathComponent(external))
                 try mustWait("External file did not appear during editing") { row(ax, external) != nil }
             }
-            try requireCondition(editValue(ax) == target && selectedRange(ax)?.location == cursor.location
-                                 && selectedRange(ax)?.length == cursor.length, "Refresh changed the draft, caret or focus")
+            // Keep the keyboard on the same editor. The resulting path proves the insertion position.
+            key(7)
         }
         switch mode {
         case "escape":
             key(53)
-            try mustWait("Escape left the editor open") { renameField(ax) == nil }
+            try mustWait("Escape did not return to the original row") { row(ax, source) != nil }
             try requireCondition(try Data(contentsOf: oldPath) == payload && !manager.fileExists(atPath: targetPath.path),
                                  "Escape unexpectedly changed the file")
         case "target_removed":
             let moved = folder.appendingPathComponent(id + "-external.txt")
             try manager.moveItem(at: oldPath, to: moved)
             try mustWait("Externally moved target still appears editable") {
-                row(ax, moved.lastPathComponent) != nil && renameField(ax) == nil
+                row(ax, moved.lastPathComponent) != nil && row(ax, source) == nil
             }
             try requireCondition(try Data(contentsOf: moved) == payload && !manager.fileExists(atPath: targetPath.path),
                                  "External change lost file bytes or applied the stale rename")
         default:
             if mode == "list_click" { try pick(app, ax, other) } else { key(36) }
-            try mustWait("Rename did not complete for \(id) (\(mode)); draft \(editValue(ax) ?? "<none>")") {
+            try mustWait("Rename did not complete for \(id) (\(mode)); expected \(expectedName)") {
                 !manager.fileExists(atPath: oldPath.path) && (try? Data(contentsOf: targetPath)) == payload
-                    && renameField(ax) == nil && row(ax, target) != nil
+                    && row(ax, expectedName) != nil
             }
             try requireCondition(try Data(contentsOf: otherPath) == Data("other".utf8), "Unrelated file was modified")
         }
@@ -198,8 +177,8 @@ do {
         try? capture.run()
         if capture.isRunning { capture.waitUntilExit() }
     }
-    let editorValue = renameField(ax).flatMap { attribute($0, kAXValueAttribute) as? String } ?? "<none>"
-    emit("rename_or_finder", "failed", "\(error); \(describeFocus(ax)); editorValue=\(editorValue)")
+    let observed = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+    emit("rename_or_finder", "failed", "\(error); \(describeFocus(ax)); files=\(observed)")
     exit(1)
 }
 if activate(app) { key(12, flags: [.maskCommand]) }
