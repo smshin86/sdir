@@ -1362,9 +1362,9 @@ fn VolumeScopeEditor(
             }
             if let Some(active_draft)=active_draft.as_ref(){
                 div{class:"volume-scope-editor",
-                    label{span{"포함할 상대 경로 · 한 줄에 하나"}textarea{class:"volume-scope-include","data-ime-commit":"true","aria-label":"포함할 상대 경로",value:"{active_draft.include_text}",disabled,
+                    label{span{"포함할 상대 경로 · 한 줄에 하나"}textarea{class:"volume-scope-include","data-ime-commit":"true","aria-label":"포함할 상대 경로",initial_value:"{active_draft.include_text}",disabled,
                         onchange:move|event:FormEvent|{if let Some(value)=draft.write().as_mut(){value.include_text=event.value();value.error=None;}}}}
-                    label{span{"제외할 상대 경로 · 한 줄에 하나"}textarea{class:"volume-scope-exclude","data-ime-commit":"true","aria-label":"제외할 상대 경로",value:"{active_draft.exclude_text}",disabled,
+                    label{span{"제외할 상대 경로 · 한 줄에 하나"}textarea{class:"volume-scope-exclude","data-ime-commit":"true","aria-label":"제외할 상대 경로",initial_value:"{active_draft.exclude_text}",disabled,
                         onchange:move|event:FormEvent|{if let Some(value)=draft.write().as_mut(){value.exclude_text=event.value();value.error=None;}}}}
                     p{class:"preference-note","비워 두면 포함 제한이 없습니다. 제외 경로는 포함 경로보다 우선합니다."}
                     if let Some(error)=active_draft.error.as_ref(){p{class:"volume-scope-error","{error}"}}
@@ -2555,7 +2555,16 @@ fn list_key(event: KeyboardEvent, mut model: Signal<AppModel>, bridge: &Bridge, 
         }
         Key::Delete => {
             event.prevent_default();
-            dialog(model, if shift { "delete" } else { "recycle" });
+            if cfg!(windows) && !shift {
+                let sources = model.read().selected();
+                if sources.is_empty() {
+                    model.write().notice = "작업할 항목을 선택하세요.".into();
+                } else {
+                    submit(model, bridge, FileAction::Recycle { sources });
+                }
+            } else {
+                dialog(model, if shift { "delete" } else { "recycle" });
+            }
         }
         Key::F2 => {
             event.prevent_default();
@@ -3838,17 +3847,35 @@ fn app() -> Element {
             if workspaces_open{Workspaces{model}}
             if let Some(kind)=modal{
                 div{class:"modal-backdrop",div{class:"modal",role:"dialog","aria-modal":"true",
+                    onkeydown:move |event: KeyboardEvent| {
+                        event.stop_propagation();
+                        if event.key()==Key::Escape && !event.is_composing() {
+                            event.prevent_default();
+                            model.write().dialog=None;
+                            focus_list(active_pane(model));
+                        }
+                    },
                     h2{match &kind{Dialog::NewFolder=>"새 폴더 만들기",Dialog::Recycle(_)=>"휴지통으로 이동",Dialog::Delete(_)=>"영구 삭제"}}
                     if let Dialog::Delete(ref paths)=kind{p{"선택한 {paths.len()}개 항목을 영구 삭제합니다. 휴지통으로 이동하지 않으며 이 작업은 실행 취소할 수 없습니다."}}
                     else if let Dialog::Recycle(ref paths)=kind{p{"선택한 {paths.len()}개 항목을 휴지통으로 이동합니다." if cfg!(windows) {" 위치에 따라 Windows가 영구 삭제 여부를 별도로 확인할 수 있습니다."}}}
-                    else{input{class:"dialog-input new-folder-input","data-ime-commit":"true","aria-label":"새 폴더 이름",value:"{modal_name}",
+                    else{input{class:"dialog-input new-folder-input","data-ime-commit":"true","aria-label":"새 폴더 이름",initial_value:"{modal_name}",
                         onmounted:move |_|{
                             if matches!(model.read().dialog,Some(Dialog::NewFolder)){
                                 let _=document::eval("{const e=document.querySelector('.new-folder-input'),a=document.activeElement;if(e&&(a===e||a===document.body||a?.matches('.app,.list-scroll,button[aria-label=\"새 폴더\"]'))){e.focus({preventScroll:true});e.select();}}");
                             }
                         },
                         onchange:move|e|model.write().dialog_name=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();if e.key()==Key::Enter&&!e.is_composing(){confirm(model,&b);}if e.key()==Key::Escape{model.write().dialog=None;}}}}}
-                    div{class:"modal-actions",button{onclick:move |_|model.write().dialog=None,"취소"}button{class:"primary",disabled:job,onclick:{let b=bridge.clone();move |_|confirm(model,&b)},"확인"}}
+                    div{class:"modal-actions",
+                        button{onclick:move |_|model.write().dialog=None,"취소"}
+                        button{class:"primary dialog-confirm",disabled:job,
+                            onmounted:move |_| {
+                                if matches!(model.read().dialog,Some(Dialog::Recycle(_) | Dialog::Delete(_))) {
+                                    let _=document::eval("{const e=document.querySelector('.dialog-confirm');if(e&&!e.disabled&&!e.closest('.modal')?.contains(document.activeElement))e.focus({preventScroll:true});}");
+                                }
+                            },
+                            onclick:{let b=bridge.clone();move |_|confirm(model,&b)},"확인"
+                        }
+                    }
                 }}
             }
         }
@@ -3932,6 +3959,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
         .ancestors()
         .map(NativePath::new)
         .collect();
+    let address_revision = p.generation;
     let menu_open = *path_menu.read();
     let mut seen = BTreeSet::new();
     let history: Vec<_> = std::iter::once(&tab.path)
@@ -4015,7 +4043,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                                 } }
                             }
                         }
-                        input{id:"address-{pane_id}",class:"address-input","aria-label":"주소 입력","data-ime-commit":"true",value:"{p.address}",spellcheck:false,onchange:move|e|model.write().panes[pane_id].address=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();model.write().interaction+=1;if pane_shortcut(&e,model,pane_id,&b){return;}if e.key()==Key::Enter&&!e.is_composing(){let value=model.read().panes[pane_id].address.clone();navigate(model,&b,pane_id,NativePath::new(value));}}}}
+                        {rsx!{input{key:"address-{address_revision}",id:"address-{pane_id}",class:"address-input","aria-label":"주소 입력","data-ime-commit":"true",initial_value:"{p.address}",spellcheck:false,onchange:move|e|model.write().panes[pane_id].address=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();model.write().interaction+=1;if pane_shortcut(&e,model,pane_id,&b){return;}if e.key()==Key::Enter&&!e.is_composing(){let value=model.read().panes[pane_id].address.clone();navigate(model,&b,pane_id,NativePath::new(value));}}}}}}
                     }
                     button{class:"address-edit",title:"주소 편집","aria-label":"주소 편집",onclick:move |_|focus_address(pane_id),Icon{kind:"rename"}}
                     if history_open {
@@ -4331,7 +4359,7 @@ fn Workspaces(mut model: Signal<AppModel>) -> Element {
                 div{class:"preferences-heading",h2{"작업공간"}button{class:"icon-button",title:"작업공간 닫기",onclick:move |_|model.write().workspaces_open=false,"×"}}
                 p{"분할·그룹 이름·탭 경로와 선택 위치를 함께 저장합니다. 현재 배치가 필요하면 전환 전에 저장해 주세요."}
                 div{class:"workspace-save-row",
-                    input{class:"dialog-input workspace-name","data-ime-commit":"true","aria-label":"작업공간 이름",placeholder:"예: 업무용 · 개발용",maxlength:64,value:"{name}",onchange:move|e|name.set(e.value())}
+                    input{class:"dialog-input workspace-name","data-ime-commit":"true","aria-label":"작업공간 이름",placeholder:"예: 업무용 · 개발용",maxlength:64,initial_value:"{name}",onchange:move|e|name.set(e.value())}
                     button{class:"primary workspace-save",disabled,onclick:move |_|{
                         let title = settings::workspace_name(&name.read());
                         if title.is_empty(){return;}
