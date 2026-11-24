@@ -57,7 +57,8 @@ def verify(image, report):
             stdout=log, stderr=subprocess.STDOUT,
         ) as app:
             try:
-                result = subprocess.run([str(helper), str(app.pid), str(folder), str(dragged)],
+                result = subprocess.run([str(helper), str(app.pid), str(folder), str(dragged),
+                                         str(report.with_name('window-failure.png'))],
                                         capture_output=True, text=True, timeout=300)
                 events = [json.loads(line) for line in result.stdout.splitlines()]
                 for event in events:

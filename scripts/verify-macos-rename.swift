@@ -18,15 +18,12 @@ func typeText(_ text: String) {
 
 func renameField(_ ax: AXUIElement) -> AXUIElement? {
     window(ax).flatMap { win in
-        searchAX(win) { hasText($0, "파일 또는 폴더 이름") }
+        searchAX(win) { element in
+            let id = attribute(element, "AXDOMIdentifier") as? String ?? ""
+            return id.hasPrefix("inline-rename-") ||
+                (role(element) == kAXTextFieldRole && hasText(element, "파일 또는 폴더 이름"))
+        }
     }
-}
-
-func focusedRename(_ ax: AXUIElement) -> AXUIElement? {
-    if let field = asElement(attribute(ax, kAXFocusedUIElementAttribute)),
-       role(field) == kAXTextFieldRole, hasText(field, "파일 또는 폴더 이름") { return field }
-    guard let field = renameField(ax), attribute(field, kAXFocusedAttribute) as? Bool == true else { return nil }
-    return field
 }
 
 func row(_ ax: AXUIElement, _ name: String) -> AXUIElement? {
@@ -36,11 +33,11 @@ func row(_ ax: AXUIElement, _ name: String) -> AXUIElement? {
 }
 
 func editValue(_ ax: AXUIElement) -> String? {
-    focusedRename(ax).flatMap { attribute($0, kAXValueAttribute) as? String }
+    renameField(ax).flatMap { attribute($0, kAXValueAttribute) as? String }
 }
 
 func selectedRange(_ ax: AXUIElement) -> CFRange? {
-    guard let field = focusedRename(ax), let value = axValue(field, kAXSelectedTextRangeAttribute) else { return nil }
+    guard let field = renameField(ax), let value = axValue(field, kAXSelectedTextRangeAttribute) else { return nil }
     var range = CFRange(location: 0, length: 0)
     guard AXValueGetValue(value, .cfRange, &range) else { return nil }
     return range
@@ -119,7 +116,7 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL)
         try Data("other".utf8).write(to: otherPath)
         try pick(app, ax, source)
         key(36)
-        try mustWait("Return did not open the focused editor for \(source)") { editValue(ax) == source }
+        try mustWait("Return did not open the input control for \(source)") { editValue(ax) == source }
         if mode == "collision_retry" {
             try putName(ax, other)
             key(36)
@@ -149,14 +146,14 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL)
         switch mode {
         case "escape":
             key(53)
-            try mustWait("Escape left the editor open") { focusedRename(ax) == nil }
+            try mustWait("Escape left the editor open") { renameField(ax) == nil }
             try requireCondition(try Data(contentsOf: oldPath) == payload && !manager.fileExists(atPath: targetPath.path),
                                  "Escape unexpectedly changed the file")
         case "target_removed":
             let moved = folder.appendingPathComponent(id + "-external.txt")
             try manager.moveItem(at: oldPath, to: moved)
             try mustWait("Externally moved target still appears editable") {
-                row(ax, moved.lastPathComponent) != nil && focusedRename(ax) == nil
+                row(ax, moved.lastPathComponent) != nil && renameField(ax) == nil
             }
             try requireCondition(try Data(contentsOf: moved) == payload && !manager.fileExists(atPath: targetPath.path),
                                  "External change lost file bytes or applied the stale rename")
@@ -164,7 +161,7 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL)
             if mode == "list_click" { try pick(app, ax, other) } else { key(36) }
             try mustWait("Rename did not complete for \(id) (\(mode)); draft \(editValue(ax) ?? "<none>")") {
                 !manager.fileExists(atPath: oldPath.path) && (try? Data(contentsOf: targetPath)) == payload
-                    && focusedRename(ax) == nil && row(ax, target) != nil
+                    && renameField(ax) == nil && row(ax, target) != nil
             }
             try requireCondition(try Data(contentsOf: otherPath) == Data("other".utf8), "Unrelated file was modified")
         }
@@ -177,7 +174,7 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL)
 }
 
 let arguments = CommandLine.arguments
-guard arguments.count == 4,
+guard arguments.count == 5,
       let pid = pid_t(arguments[1]),
       waitFor(20, { findWindowServerFrame(pid) }) != nil,
       let app = NSRunningApplication(processIdentifier: pid),
@@ -192,6 +189,15 @@ do {
     try verifyRename(app, ax, folder)
     try testFinderDrop(app, ax, finderSource, folder)
 } catch {
+    if let records = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
+       let id = records.first(where: { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid
+           && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0 })?[kCGWindowNumber as String] as? NSNumber {
+        let capture = Process()
+        capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        capture.arguments = ["-x", "-l", id.stringValue, arguments[4]]
+        try? capture.run()
+        if capture.isRunning { capture.waitUntilExit() }
+    }
     let editorValue = renameField(ax).flatMap { attribute($0, kAXValueAttribute) as? String } ?? "<none>"
     emit("rename_or_finder", "failed", "\(error); \(describeFocus(ax)); editorValue=\(editorValue)")
     exit(1)
