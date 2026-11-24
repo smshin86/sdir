@@ -3873,6 +3873,13 @@ fn app() -> Element {
                                     let _=document::eval("{const e=document.querySelector('.dialog-confirm');if(e&&!e.disabled&&!e.closest('.modal')?.contains(document.activeElement))e.focus({preventScroll:true});}");
                                 }
                             },
+                            onkeydown:{let b=bridge.clone();move |event: KeyboardEvent|{
+                                if event.key() == Key::Enter && !event.is_composing() {
+                                    event.prevent_default();
+                                    event.stop_propagation();
+                                    confirm(model, &b);
+                                }
+                            }},
                             onclick:{let b=bridge.clone();move |_|confirm(model,&b)},"확인"
                         }
                     }
