@@ -282,28 +282,6 @@ func webKitControl(folder: URL, source: TISInputSource, sourceID: String) throws
     return "value=\(value), composition events=\(composition), input events=\(input)"
 }
 
-func retryUsingShortcut(_ app: NSRunningApplication, _ ax: AXUIElement, original: TISInputSource, koreanID: String) throws -> String {
-    guard activate(app), let field = searchField(ax), let rect = frame(field) else { throw JourneyFailure("SDIR search could not be refocused") }
-    TISSelectInputSource(original)
-    guard waitFor(4, { currentSourceID() == inputSourceID(original) ? true : nil }) == true else { throw JourneyFailure("ASCII input source could not be restored") }
-    click(rect)
-    key(0, flags: [.maskCommand])
-    key(51)
-    guard waitFor(3, { (attribute(field, kAXValueAttribute) as? String)?.isEmpty == true ? true : nil }) == true else { throw JourneyFailure("Could not clear the SDIR field by keyboard") }
-    key(18)
-    key(19)
-    key(123)
-    key(49, flags: [.maskControl])
-    guard waitFor(5, { currentSourceID() == koreanID && attribute(field, kAXFocusedAttribute) as? Bool == true ? true : nil }) == true else {
-        throw JourneyFailure("The Control-Space shortcut did not select Korean while SDIR held focus; current=\(currentSourceID())")
-    }
-    typeKoreanSample()
-    return waitFor(5, {
-        let value = (attribute(field, kAXValueAttribute) as? String)?.precomposedStringWithCanonicalMapping
-        return value?.hasPrefix("1") == true && value?.hasSuffix("32") == true ? value : nil
-    }) ?? (attribute(field, kAXValueAttribute) as? String ?? "unavailable")
-}
-
 func testIME(_ app: NSRunningApplication, _ ax: AXUIElement, _ controlFolder: URL) throws {
     guard activate(app) else { throw JourneyFailure("Could not make SDIR the foreground application") }
     guard let toggle = waitFor(12, {
@@ -363,15 +341,28 @@ func testIME(_ app: NSRunningApplication, _ ax: AXUIElement, _ controlFolder: UR
         let parentStatus = parentResult.map { String($0) } ?? "unavailable"
         throw IMEUnavailable("Runner did not register a selectable Korean mode (parent \(parent), parent status \(parentStatus), mode status \(enableResult))")
     }
-    let selected = TISSelectInputSource(selectable)
-    if waitFor(3, { currentSourceID() == koreanID ? true : nil }) != true {
-        guard attribute(field, kAXFocusedAttribute) as? Bool == true else {
-            throw JourneyFailure("The Spotlight field lost focus before the input-source shortcut")
+    let originalID = inputSourceID(original)
+    var switchPath = "TIS fallback"
+    if originalID != koreanID {
+        TISSelectInputSource(original)
+        let originalFocused = waitFor(4, {
+            currentSourceID() == originalID && attribute(field, kAXFocusedAttribute) as? Bool == true ? true : nil
+        }) == true
+        if originalFocused {
+            key(49, flags: [.maskControl])
+            if waitFor(5, { currentSourceID() == koreanID && attribute(field, kAXFocusedAttribute) as? Bool == true ? true : nil }) == true {
+                switchPath = "Control-Space"
+            }
         }
-        key(49, flags: [.maskControl])
     }
-    guard waitFor(5, { currentSourceID() == koreanID ? true : nil }) == true else {
-        throw IMEUnavailable("Runner did not switch to Korean 2-set via TIS or Control-Space (select status \(selected), current ID \(currentSourceID()))")
+    guard (attribute(field, kAXValueAttribute) as? String) == "12" else {
+        throw IMEUnavailable("Control-Space changed the baseline text instead of selecting Korean: \(attribute(field, kAXValueAttribute) as? String ?? "unavailable")")
+    }
+    if switchPath != "Control-Space" {
+        let selected = TISSelectInputSource(selectable)
+        guard waitFor(5, { currentSourceID() == koreanID ? true : nil }) == true else {
+            throw IMEUnavailable("Runner did not switch to Korean 2-set (select status \(selected), current ID \(currentSourceID()))")
+        }
     }
     typeKoreanSample()
     let expected = "1한글32"
@@ -389,19 +380,11 @@ func testIME(_ app: NSRunningApplication, _ ax: AXUIElement, _ controlFolder: UR
             let webKit: String
             do { webKit = try webKitControl(folder: controlFolder, source: selectable, sourceID: koreanID) }
             catch { webKit = "inconclusive: \(error)" }
-            let retry: String
-            do { retry = try retryUsingShortcut(app, ax, original: original, koreanID: koreanID) }
-            catch { retry = "inconclusive: \(error)" }
-            let evidence = "SDIR after TIS=\(sdirValue); TextEdit=\(control); plain WKWebView \(webKit); SDIR after Control-Space=\(retry)"
-            if retry == expected {
-                emit("korean_ime", "passed", evidence)
-                return
-            }
-            throw JourneyFailure(evidence)
+            throw JourneyFailure("SDIR after \(switchPath)=\(sdirValue); TextEdit=\(control); plain WKWebView \(webKit)")
         }
         throw IMEUnavailable("The same keys under Korean selection yielded \(sdirValue) in SDIR and \(control) in TextEdit; the runner did not produce the Korean control result")
     }
-    emit("korean_ime", "passed", "Korean 2-set physical keys committed 1한글32 in the Spotlight field, preserving insertion position")
+    emit("korean_ime", "passed", "Korean 2-set physical keys committed 1한글32 in the Spotlight field after \(switchPath), preserving insertion position")
 }
 
 func mouse(_ type: CGEventType, _ point: CGPoint) {
