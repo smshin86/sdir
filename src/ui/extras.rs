@@ -1436,6 +1436,15 @@ pub(super) fn finish_background(
     if s.panes[pane].generation != r.generation {
         return true;
     }
+    let edit_source = s
+        .inline_rename
+        .as_ref()
+        .filter(|edit| {
+            edit.location.pane == pane
+                && edit.location.generation == r.generation
+                && edit.submitted_job.is_none()
+        })
+        .map(|edit| edit.source.clone());
     let p = &mut s.panes[pane];
     if let Some(e) = error {
         p.finish_preserving_order(
@@ -1467,6 +1476,12 @@ pub(super) fn finish_background(
     t.selection.retain(|p| visible.contains(p));
     t.cursor = t.cursor.take().filter(|p| visible.contains(p));
     t.anchor = t.anchor.take().filter(|p| visible.contains(p));
+    let target_removed =
+        edit_source.is_some_and(|source| !t.entries.iter().any(|entry| entry.path == source));
+    if target_removed {
+        s.inline_rename = None;
+        s.notice = "이름을 바꾸던 항목이 외부에서 이동되었거나 삭제되었습니다.".into();
+    }
 
     s.dirty();
     true

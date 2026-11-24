@@ -87,6 +87,7 @@ struct InlineRename {
     original: String,
     draft: String,
     interaction: u64,
+    submitted_job: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1477,7 +1478,11 @@ fn confirm(model: Signal<AppModel>, bridge: &Bridge) {
 fn start_inline_rename(mut model: Signal<AppModel>) {
     let (pane, position) = {
         let mut state = model.write();
-        if state.modal_open() || state.job.is_some() || state.closing {
+        if state.modal_open() || state.closing {
+            return;
+        }
+        if state.job.is_some() {
+            state.notice = "진행 중인 파일 작업이 끝난 뒤 다시 시도하세요.".into();
             return;
         }
         let pane = state.active;
@@ -1506,6 +1511,7 @@ fn start_inline_rename(mut model: Signal<AppModel>) {
             draft: original.clone(),
             original,
             interaction: state.interaction,
+            submitted_job: None,
         });
         (pane, position)
     };
@@ -1515,7 +1521,11 @@ fn start_inline_rename(mut model: Signal<AppModel>) {
 fn cancel_inline_rename(mut model: Signal<AppModel>, id: u64, return_focus: bool) {
     let pane = {
         let mut state = model.write();
-        let Some(edit) = state.inline_rename.as_ref().filter(|edit| edit.id == id) else {
+        let Some(edit) = state
+            .inline_rename
+            .as_ref()
+            .filter(|edit| edit.id == id && edit.submitted_job.is_none())
+        else {
             return;
         };
         let pane = edit.location.pane;
@@ -1527,20 +1537,24 @@ fn cancel_inline_rename(mut model: Signal<AppModel>, id: u64, return_focus: bool
     }
 }
 
-fn confirm_inline_rename(mut model: Signal<AppModel>, bridge: &Bridge, id: u64) {
+fn confirm_inline_rename(
+    mut model: Signal<AppModel>,
+    bridge: &Bridge,
+    id: u64,
+    return_focus: bool,
+) -> bool {
     let Some(edit) = model
         .read()
         .inline_rename
         .as_ref()
-        .filter(|edit| edit.id == id)
+        .filter(|edit| edit.id == id && edit.submitted_job.is_none())
         .cloned()
     else {
-        return;
+        return true;
     };
     let valid_target = {
         let state = model.read();
         edit.location.matches(&state)
-            && state.active == edit.location.pane
             && !state.modal_open()
             && !state.closing
             && state.panes[edit.location.pane]
@@ -1549,15 +1563,23 @@ fn confirm_inline_rename(mut model: Signal<AppModel>, bridge: &Bridge, id: u64) 
                 .iter()
                 .any(|entry| entry.path == edit.source)
     };
-    if !valid_target || edit.draft == edit.original {
-        cancel_inline_rename(model, id, valid_target);
-        return;
+    if !valid_target {
+        cancel_inline_rename(model, id, false);
+        model.write().notice = "이름을 바꿀 항목이 현재 폴더에 없습니다.".into();
+        return true;
+    }
+    if edit.draft == edit.original {
+        cancel_inline_rename(model, id, return_focus);
+        return true;
     }
     if let Err(error) = sdir::filesystem::validate_name(&edit.draft) {
         model.write().notice = error;
-        return;
+        return false;
     }
-    cancel_inline_rename(model, id, true);
+    if model.read().job.is_some() {
+        model.write().notice = "진행 중인 파일 작업이 끝난 뒤 다시 시도하세요.".into();
+        return false;
+    }
     submit(
         model,
         bridge,
@@ -1566,6 +1588,25 @@ fn confirm_inline_rename(mut model: Signal<AppModel>, bridge: &Bridge, id: u64) 
             name: edit.draft,
         },
     );
+    let mut state = model.write();
+    let job = state.job;
+    if let Some(edit) = state.inline_rename.as_mut().filter(|edit| edit.id == id) {
+        edit.submitted_job = job;
+    }
+    job.is_some()
+}
+
+fn confirm_inline_rename_on_list_click(model: Signal<AppModel>, bridge: &Bridge) -> bool {
+    let id = model.read().inline_rename.as_ref().map(|edit| edit.id);
+    if let Some(id) = id {
+        if !confirm_inline_rename(model, bridge, id, false) {
+            let _ = document::eval(&format!(
+                "document.getElementById('inline-rename-{id}')?.focus({{preventScroll:true}});"
+            ));
+            return false;
+        }
+    }
+    true
 }
 
 fn inline_rename_editor(
@@ -1576,6 +1617,7 @@ fn inline_rename_editor(
 ) -> Element {
     let id = edit.id;
     let name = edit.original.clone();
+    let submitting = edit.submitted_job.is_some();
     let stem = if is_dir {
         name.as_str()
     } else {
@@ -1589,14 +1631,17 @@ fn inline_rename_editor(
         input {
             key: "{id}", id: "inline-rename-{id}", class: "inline-rename-input",
             "aria-label": "파일 또는 폴더 이름", spellcheck: false, initial_value: "{name}",
+            readonly: submitting,
             onmounted: move |_| {
                 let state = model.read();
                 if let Some(current) = state.inline_rename.as_ref().filter(|edit| edit.id == id) {
-                    if current.location.matches(&state) && current.interaction == state.interaction {
-                        let _ = document::eval(&format!(
-                            "{{const e=document.getElementById('inline-rename-{id}');e?.focus({{preventScroll:true}});e?.setSelectionRange(0,{select_end});}}"
-                        ));
-                    }
+                    let focus = current.location.matches(&state)
+                        && state.active == current.location.pane
+                        && current.interaction == state.interaction;
+                    let draft = serde_json::to_string(&current.draft).unwrap();
+                    let _ = document::eval(&format!(
+                        "{{const e=document.getElementById('inline-rename-{id}');if(e){{const draft={draft};if(e.value!==draft)e.value=draft;if({focus}){{e.focus({{preventScroll:true}});e.setSelectionRange(0,{select_end});}}}}}}"
+                    ));
                 }
             },
             onchange: move |event| {
@@ -1605,7 +1650,6 @@ fn inline_rename_editor(
                     edit.draft = event.value();
                 }
             },
-            onblur: move |_| cancel_inline_rename(model, id, false),
             onclick: move |event| event.stop_propagation(),
             ondoubleclick: move |event| event.stop_propagation(),
             oncontextmenu: move |event| event.stop_propagation(),
@@ -1613,7 +1657,7 @@ fn inline_rename_editor(
                 event.stop_propagation();
                 if event.is_composing() { return; }
                 match event.key() {
-                    Key::Enter => { event.prevent_default(); confirm_inline_rename(model, &bridge, id); }
+                    Key::Enter => { event.prevent_default(); confirm_inline_rename(model, &bridge, id, true); }
                     Key::Escape => { event.prevent_default(); cancel_inline_rename(model, id, true); }
                     _ => {}
                 }
@@ -3230,11 +3274,28 @@ fn app() -> Element {
                         }
                         WorkerEvent::Job { id, result } => {
                             if model.read().job == Some(id) {
-                                let context = {
+                                let (context, keep_failed_rename) = {
                                     let mut s = model.write();
+                                    let mut keep_failed_rename = false;
                                     s.job = None;
                                     s.job_status = None;
                                     s.notice = result.message.clone();
+                                    if let Some(edit) = s
+                                        .inline_rename
+                                        .as_mut()
+                                        .filter(|edit| edit.submitted_job == Some(id))
+                                    {
+                                        if result.ok {
+                                            let editor = edit.id;
+                                            let _ = document::eval(&format!(
+                                                "{{const e=document.getElementById('inline-rename-{editor}');if(e&&document.activeElement===e)e.closest('.list-scroll')?.focus({{preventScroll:true}});}}"
+                                            ));
+                                            s.inline_rename = None;
+                                        } else {
+                                            edit.submitted_job = None;
+                                            keep_failed_rename = result.destinations.is_empty();
+                                        }
+                                    }
                                     if let Some(c) = &s.job_context {
                                         let entry =
                                             sdir::journal::Entry::new(c.action.clone(), &result);
@@ -3244,7 +3305,7 @@ fn app() -> Element {
                                         }
                                     }
                                     s.index_dirty = s.index.is_some() && !s.spotlight;
-                                    s.job_context.take()
+                                    (s.job_context.take(), keep_failed_rename)
                                 };
                                 if let Some(context) = context {
                                     {
@@ -3323,7 +3384,10 @@ fn app() -> Element {
                                         let s = model.read();
                                         (0..s.layout)
                                             .filter(|&p| {
-                                                context.folders.contains(&s.panes[p].tab().path)
+                                                !keep_failed_rename
+                                                    && context
+                                                        .folders
+                                                        .contains(&s.panes[p].tab().path)
                                             })
                                             .collect()
                                     };
@@ -4040,7 +4104,8 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                     let (scroll,focus,startup)={let s=model.read();(s.panes[pane_id].tab().scroll,s.pending_focus==Some((pane_id,s.interaction))&&s.active==pane_id&&!s.modal_open(),s.interaction==0||s.pending_focus_guarded)};
                     let _=document::eval(&format!("{{const e=document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll');if(e){{e.scrollTop={scroll};window.__sdirViewObservers??={{}};window.__sdirViewObservers[{pane_id}]?.disconnect();window.__sdirScrollRequests?.[{pane_id}]?.disconnect();const observer=new ResizeObserver(()=>e.dispatchEvent(new Event('scroll')));window.__sdirViewObservers[{pane_id}]=observer;observer.observe(e);}}}}"));
                     if focus{if startup{let _=document::eval(&format!("if(!document.activeElement?.matches('input,textarea,select,button,.sidebar-resizer'))document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll')?.focus({{preventScroll:true}});"));}else{let _=document::eval(&format!("if(!document.activeElement?.matches('input,textarea,.sidebar-resizer')&&!document.querySelector('.modal-backdrop,.context-dismiss'))document.querySelector('[data-pane=\"{pane_id}\"] .list-scroll')?.focus({{preventScroll:true}});"));}}
-                },onclick:move |_| {
+                },onclick:{let b=bridge.clone();move|_:MouseEvent|{
+                    if !confirm_inline_rename_on_list_click(model, &b) { return; }
                     let mut state = model.write();
                     state.active = pane_id;
                     state.interaction += 1;
@@ -4049,13 +4114,13 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                     state.dirty();
                     drop(state);
                     focus_list(pane_id);
-                },onkeydown:move|e|list_key(e,model,&keys,pane_id),onscroll:move|e:ScrollEvent|{let value=e.scroll_top();let left=e.scroll_left();let _=document::eval(&format!("{{let h=document.querySelector('[data-pane=\"{pane_id}\"] .list-header');if(h)h.style.setProperty('--detail-scroll-left','{left}px');}}"));let width=e.client_width() as f64;let height=e.client_height() as f64;let change={let s=model.read();let p=&s.panes[pane_id];(value-p.tab().scroll).abs()>=1.||(width-p.viewport_width).abs()>=1.||(height-p.viewport_height).abs()>=1.};if change&&width>0.&&height>0.{let requested={let mut s=model.write();let compact=s.compact;let requested=s.panes[pane_id].update_viewport(width,height,value,compact);s.dirty();requested};if let Some((position,scroll))=requested{let _=document::eval(&format!("window.__sdirScrollSelection?.({pane_id},{position},{scroll});"));}}},
+                }},onkeydown:move|e|list_key(e,model,&keys,pane_id),onscroll:move|e:ScrollEvent|{let value=e.scroll_top();let left=e.scroll_left();let _=document::eval(&format!("{{let h=document.querySelector('[data-pane=\"{pane_id}\"] .list-header');if(h)h.style.setProperty('--detail-scroll-left','{left}px');}}"));let width=e.client_width() as f64;let height=e.client_height() as f64;let change={let s=model.read();let p=&s.panes[pane_id];(value-p.tab().scroll).abs()>=1.||(width-p.viewport_width).abs()>=1.||(height-p.viewport_height).abs()>=1.};if change&&width>0.&&height>0.{let requested={let mut s=model.write();let compact=s.compact;let requested=s.panes[pane_id].update_viewport(width,height,value,compact);s.dirty();requested};if let Some((position,scroll))=requested{let _=document::eval(&format!("window.__sdirScrollSelection?.({pane_id},{position},{scroll});"));}}},
                 ondragover:move|e:DragEvent|e.prevent_default(),ondrop:move|e:DragEvent|{let destination=model.read().panes[pane_id].tab().path.clone();drop_external_files(model,&click_bridge,pane_id,destination,e);},
                 if total==0&&!p.loading{div{class:"empty-folder",Icon{kind:"folder"}strong{if error.is_some(){"폴더를 열지 못했습니다"}else{"폴더가 비어 있습니다"}}p{if error.is_some(){"클라우드·네트워크 드라이브의 연결과 접근 권한을 확인하세요. F5로 다시 시도할 수 있습니다."}else{"파일을 여기에 끌어다 놓아 복사할 수 있습니다."}}}}
                 if p.loading&&total==0{div{class:"loading-folder",span{class:"spinner"}span{"폴더를 읽고 있습니다"}}}
                 if total>0&&count==0{div{class:"empty-folder",strong{"일치하는 항목이 없습니다"}p{"필터를 바꿔 보세요."}}}
                 div{class:"virtual-space",style:"height:{height}px",div{class:"virtual-rows",style:"transform:translateY({offset}px);--view-columns:{columns}",
-                    for visual_row in start..end{ {
+                    {(start..end).map(|visual_row| {
                         if let Ok(position) = tab.item_at_render_row(visual_row) {
                         let entry=entries[indices[position]].clone();
                         let thumbnail=if p.view == ViewMode::Icons {
@@ -4074,10 +4139,15 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                         };
                         let class = format!("file-row {state_class} {clipboard}");
                         let kind=if entry.is_dir{"폴더".to_string()}else if let Some(item)=appearance.as_ref().filter(|item| !item.type_name.is_empty()){item.type_name.clone()}else{entry.path.to_path().extension().map(|s|format!("{} 파일",s.to_string_lossy().to_uppercase())).unwrap_or_else(||"파일".into())};let bytes=readable_size(entry.bytes);let modified=entry.modified.and_then(|s|chrono::DateTime::from_timestamp(s as i64,0)).map(|t|t.with_timezone(&chrono::Local).format("%Y.%m.%d %H:%M").to_string()).unwrap_or_else(||"—".into());let is_dir=entry.is_dir;let cloud=entry.cloud.label();
-                         rsx! { div{key:"row-{position}",id:"pane-{pane_id}-file-{position}","data-row-index":position,draggable:false,"data-drag-key":"{entry.path.display()}","data-drop-directory":if is_dir{"true"}else{"false"},
+                        let row_key = String::from_utf16(&path.0).map_or_else(
+                            |_| format!("raw:{:?}", path.0),
+                            |path| format!("path:{path}"),
+                        );
+                         rsx! { div{key:"{row_key}",id:"pane-{pane_id}-file-{position}","data-row-index":position,draggable:false,"data-drag-key":"{entry.path.display()}","data-drop-directory":if is_dir{"true"}else{"false"},
                         ondrop:{let b=bridge.clone();let destination=path.clone();move|event:DragEvent|{if is_dir{drop_external_files(model,&b,pane_id,destination.clone(),event);}}},
-                        oncontextmenu:{let p=path.clone();let b=bridge.clone();move|e:MouseEvent|{e.prevent_default();e.stop_propagation();open_context(model,&b,pane_id,Some(p.clone()),e.client_coordinates().x,e.client_coordinates().y,false);}},class,role:"option","aria-selected":chosen,onclick:move|e:MouseEvent| {
+                        oncontextmenu:{let p=path.clone();let b=bridge.clone();move|e:MouseEvent|{e.prevent_default();e.stop_propagation();open_context(model,&b,pane_id,Some(p.clone()),e.client_coordinates().x,e.client_coordinates().y,false);}},class,role:"option","aria-selected":chosen,onclick:{let b=bridge.clone();move |e:MouseEvent| {
                             e.stop_propagation();
+                            if !confirm_inline_rename_on_list_click(model, &b) { return; }
                             let mut state = model.write();
                             state.active = pane_id;
                             state.interaction += 1;
@@ -4086,12 +4156,13 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                             state.dirty();
                             drop(state);
                             focus_list(pane_id);
-                        },ondoubleclick:{let b=bridge.clone();move |_|{if is_dir{navigate(model,&b,pane_id,open.clone());}else{let _=b.job(Request::Open{path:open.clone()});}}},
+                        }},ondoubleclick:{let b=bridge.clone();move |_|{if is_dir{navigate(model,&b,pane_id,open.clone());}else{let _=b.job(Request::Open{path:open.clone()});}}},
                             div{class:"file-name",
                             if selection_checkboxes {
                                 input{class:"file-select-checkbox",r#type:"checkbox","aria-label":"{entry.name} 선택",tabindex:-1,checked:chosen,
-                                    onclick:move |e:MouseEvent| {
+                                    onclick:{let b=bridge.clone();move |e:MouseEvent| {
                                         e.stop_propagation();
+                                        if !confirm_inline_rename_on_list_click(model, &b) { return; }
                                         let mut s = model.write();
                                         s.active = pane_id;
                                         s.interaction += 1;
@@ -4100,7 +4171,7 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                                         s.dirty();
                                         drop(s);
                                         focus_list(pane_id);
-                                    },
+                                    }},
                                     ondoubleclick:move|e:MouseEvent|e.stop_propagation()
                                 }
                             }
@@ -4117,7 +4188,8 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                      } } else {
                         let heading = tab.item_at_render_row(visual_row).unwrap_err();
                         rsx!{div{key:"file-group-{visual_row}",class:"file-group-heading",role:"presentation","{heading}"}}
-                     } } }
+                        }
+                    })}
                 }}
             }
             }}

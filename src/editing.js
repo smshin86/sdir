@@ -69,6 +69,11 @@ if (!window.__sdirTextUndoInstalled) {
       event.stopPropagation();
       return;
     }
+    if (target instanceof HTMLInputElement && target.matches('.inline-rename-input') &&
+      (event.isComposing || composing.has(target) || event.keyCode === 229)) {
+      event.stopPropagation();
+      return;
+    }
     if (imeInput(event.target) && (composing.has(event.target) || event.keyCode === 229)) return;
     const mac = target.closest('.app')?.dataset.os === 'macOS';
     const command = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
