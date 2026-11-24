@@ -64,6 +64,7 @@ func typeStem(_ stem: String, in app: NSRunningApplication) throws {
         guard let code = inputCodes[character] else { throw JourneyFailure("Invalid fixture character") }
         for down in [true, false] {
             let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)!
+            event.flags = []
             event.post(tap: .cghidEventTap)
             Thread.sleep(forTimeInterval: 0.022)
         }
