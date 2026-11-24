@@ -166,3 +166,53 @@ fn panel_worker_observes_an_external_create_rename_and_delete() {
     );
     exercise.unwrap();
 }
+
+#[test]
+fn native_rename_preserves_contents_across_64_macos_workflows() {
+    let fixture = tempfile::tempdir().unwrap();
+    for index in 0..64 {
+        let directory = fixture.path().join(format!("{index:02}"));
+        fs::create_dir(&directory).unwrap();
+        let original = directory.join("old name.txt");
+        let name = match index % 4 {
+            0 => "new name.txt",
+            1 => "업무 새 문서.txt",
+            2 => "résumé (2).txt",
+            _ => "final.2026.txt",
+        };
+        let destination = directory.join(name);
+        let contents = format!("original contents {index}");
+        fs::write(&original, contents.as_bytes()).unwrap();
+        let operation = FileAction::Rename {
+            source: NativePath::new(&original),
+            name: name.into(),
+        };
+        if index % 4 == 0 {
+            fs::write(&destination, b"existing file contents").unwrap();
+            let conflict = run_action(&operation);
+            assert!(!conflict.ok, "collision was accepted for case {index}");
+            assert_eq!(fs::read(&original).unwrap(), contents.as_bytes());
+            assert_eq!(fs::read(&destination).unwrap(), b"existing file contents");
+            fs::remove_file(&destination).unwrap();
+        }
+        let result = run_action(&operation);
+        assert!(result.ok, "case {index}: {}", result.message);
+        assert!(!original.exists());
+        assert_eq!(fs::read(&destination).unwrap(), contents.as_bytes());
+        if index % 2 == 0 {
+            let undo = run_action(&FileAction::History {
+                record: result.undo.expect("undo record for single rename"),
+            });
+            assert!(undo.ok, "case {index}: {}", undo.message);
+            assert!(!destination.exists());
+            assert_eq!(fs::read(&original).unwrap(), contents.as_bytes());
+            let redo = run_action(&FileAction::History {
+                record: undo.undo.expect("redo record for single rename"),
+            });
+            assert!(redo.ok, "case {index}: {}", redo.message);
+            assert!(!original.exists());
+            assert_eq!(fs::read(&destination).unwrap(), contents.as_bytes());
+        }
+        println!("SDIR_MAC_NATIVE_RENAME_PASS {index}");
+    }
+}
