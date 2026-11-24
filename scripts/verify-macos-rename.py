@@ -72,7 +72,7 @@ def verify(image, report):
                     'sha256': digest, 'os': os.uname().sysname, 'arch': os.uname().machine,
                     'helperExit': result.returncode, 'appExit': app_exit, 'journeys': events,
                 }, ensure_ascii=False, indent=2) + '\n')
-                expected = {f'rename_{index:03d}' for index in range(80)} | {'finder_drop'}
+                expected = {f'rename_{index:03d}' for index in range(84)} | {'finder_drop'}
                 passed = {event['journey'] for event in events if event['status'] == 'passed'}
                 return result.returncode == 0 and passed == expected
             finally:

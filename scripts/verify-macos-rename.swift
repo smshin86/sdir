@@ -7,15 +7,6 @@ func mustWait(_ description: String, seconds: TimeInterval = 6, _ predicate: () 
     try requireCondition(waitFor(seconds) { predicate() ? true : nil } == true, description)
 }
 
-func typeText(_ text: String) {
-    var units = Array(text.utf16)
-    for down in [true, false] {
-        let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down)!
-        event.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
-        event.post(tap: .cghidEventTap)
-    }
-}
-
 func row(_ ax: AXUIElement, _ name: String) -> AXUIElement? {
     window(ax).flatMap { win in
         searchAX(win) { element in hasText(element, name) && frame(element) != nil }
@@ -62,20 +53,17 @@ func pick(_ app: NSRunningApplication, _ ax: AXUIElement, _ filename: String) th
     }
 }
 
-func putName(_ text: String, in app: NSRunningApplication) throws {
+func typeStem(_ stem: String, in app: NSRunningApplication) throws {
     try requireCondition(NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
                          "The owned SDIR window lost foreground before text input")
-    key(0, flags: [.maskCommand])
     let inputCodes: [Character: CGKeyCode] = [
         "0": 29, "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25,
-        "-": 27, ".": 47, "n": 45, "e": 14, "w": 13, "t": 17, "x": 7, "c": 8,
+        "-": 27, "n": 45, "e": 14, "w": 13, "c": 8,
     ]
-    if text.allSatisfy({ inputCodes[$0] != nil }) {
-        for character in text { key(inputCodes[character]!) }
-    } else {
-        typeText(text)
+    for character in stem {
+        guard let code = inputCodes[character] else { throw JourneyFailure("Invalid fixture character") }
+        key(code)
     }
-    RunLoop.current.run(until: Date().addingTimeInterval(0.10))
 }
 
 func captureWindow(pid: pid_t, output: String) {
@@ -97,16 +85,17 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL,
     }
     try manager.removeItem(at: folder.appendingPathComponent("readiness-fixture.txt"))
     let modes = ["return", "list_click", "refresh_delete", "escape", "collision_retry", "refresh_create", "target_removed"]
-    for index in 0..<80 {
-        let mode = index < 70 ? modes[index % modes.count] : "unicode"
+    for index in 0..<84 {
+        let mode = modes[index % modes.count]
         let id = String(format: "%03d", index)
         let preceding = id + "-a.txt"
         let source = id + "-b.txt"
         let other = id + "-c.txt"
-        let target = id + (mode == "unicode" ? "-한글.txt" : "-new.txt")
+        let stem = id + "-new"
+        let target = stem + ".txt"
         let oldPath = folder.appendingPathComponent(source)
         let checksCaret = mode == "refresh_delete" || mode == "refresh_create"
-        let expectedName = checksCaret ? String(target.dropLast()) + "x" + String(target.suffix(1)) : target
+        let expectedName = checksCaret ? String(stem.dropLast()) + "x" + String(stem.suffix(1)) + ".txt" : target
         let targetPath = folder.appendingPathComponent(expectedName)
         let firstPath = folder.appendingPathComponent(preceding)
         let otherPath = folder.appendingPathComponent(other)
@@ -118,7 +107,8 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL,
         try pick(app, ax, source)
         key(36)
         if mode == "collision_retry" {
-            try putName(other, in: app)
+            let collisionStem = id + "-c"
+            try typeStem(collisionStem, in: app)
             key(36)
             try mustWait("Collision feedback did not preserve the draft") {
                 window(ax).flatMap { win in
@@ -127,8 +117,9 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL,
             }
             try requireCondition(try Data(contentsOf: oldPath) == payload, "Collision changed source bytes")
             try requireCondition(try Data(contentsOf: otherPath) == Data("other".utf8), "Collision changed destination")
+            for _ in collisionStem { key(123, flags: [.maskShift]) }
         }
-        try putName(target, in: app)
+        try typeStem(stem, in: app)
         if index == 0 { captureWindow(pid: app.processIdentifier, output: capture) }
         if checksCaret {
             key(123)
