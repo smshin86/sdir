@@ -14,7 +14,7 @@ def run(*argv):
 
 def verify(image, report):
     digest = hashlib.sha256(image.read_bytes()).hexdigest()
-    if digest != '9c1b943b0b93857f640d4538bf66f8a6ef4935950db68bdb0775a96b474f48a0':
+    if digest != '85d8bbc5c805db93dc156b86ddd8bc997475165ddc0e5dc23cbcf4a8a59dd236':
         raise RuntimeError(f'Unexpected disk image SHA-256: {digest}')
     source_dir = Path(__file__).parent
     units = runpy.run_path(str(source_dir / 'verify-macos-package.py'))['units']

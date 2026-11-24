@@ -18,7 +18,7 @@ jobs:
         with:
           name: SDIR-macos-arm64
           path: delivered
-          run-id: '45332105291'
+          run-id: '45333144728'
           github-token: ${{ github.token }}
       - run: python3 scripts/verify-macos-rename.py delivered/SDIR-macos-arm64-0.6.3.dmg gui-verification/journeys.json
       - uses: actions/upload-artifact@v4
