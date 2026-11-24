@@ -41,6 +41,7 @@ def verify(image, report):
         profile = root / 'profile'
         for directory in (folder, finder_source, profile):
             directory.mkdir()
+        (folder / 'readiness-fixture.txt').write_bytes(b'SDIR fixture readiness')
         dragged = finder_source / 'SDIR Finder drop.txt'
         dragged.write_bytes(b'0.6.2 macOS Finder drop fixture\n')
         settings = {

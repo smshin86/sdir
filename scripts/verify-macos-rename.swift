@@ -30,12 +30,7 @@ func focusedRename(_ ax: AXUIElement) -> AXUIElement? {
 
 func row(_ ax: AXUIElement, _ name: String) -> AXUIElement? {
     window(ax).flatMap { win in
-        searchAX(win) { element in
-            guard (attribute(element, kAXRoleAttribute) as? String) == kAXStaticTextRole else { return false }
-            return [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].contains { key in
-                (attribute(element, key) as? String) == name
-            } && frame(element) != nil
-        }
+        searchAX(win) { element in hasText(element, name) && frame(element) != nil }
     }
 }
 
@@ -69,6 +64,10 @@ func putName(_ ax: AXUIElement, _ name: String) throws {
 
 func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL) throws {
     let manager = FileManager.default
+    try mustWait("Seed file never appeared in the opened folder", seconds: 14) {
+        row(ax, "readiness-fixture.txt") != nil
+    }
+    try manager.removeItem(at: folder.appendingPathComponent("readiness-fixture.txt"))
     let modes = ["return", "list_click", "refresh_delete", "escape", "collision_retry", "refresh_create", "target_removed", "unicode"]
     for index in 0..<80 {
         let mode = modes[index % modes.count]
