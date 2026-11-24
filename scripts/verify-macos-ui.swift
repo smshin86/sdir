@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Carbon
 import Foundation
+import WebKit
 
 struct JourneyFailure: Error, CustomStringConvertible {
     let description: String
@@ -204,6 +205,105 @@ func textEditControl(folder: URL, source: TISInputSource, sourceID: String) thro
     return output
 }
 
+final class WebKitIMEProbe: NSObject, WKScriptMessageHandler {
+    private let output: URL
+    private var events: [Any] = []
+    init(output: URL) { self.output = output }
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard events.count < 128 else { return }
+        events.append(message.body)
+        if let data = try? JSONSerialization.data(withJSONObject: events) { try? data.write(to: output, options: .atomic) }
+    }
+}
+
+@MainActor func runWebKitProbe(output: URL) {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    let window = NSWindow(contentRect: NSRect(x: 60, y: 80, width: 660, height: 260), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    window.title = "SDIR WebKit IME Control"
+    let probe = WebKitIMEProbe(output: output)
+    let config = WKWebViewConfiguration()
+    config.websiteDataStore = .nonPersistent()
+    config.userContentController.add(probe, name: "imeProbe")
+    let web = WKWebView(frame: window.contentView!.bounds, configuration: config)
+    window.contentView = web
+    window.makeKeyAndOrderFront(nil)
+    app.activate(ignoringOtherApps: true)
+    web.loadHTMLString("""
+        <!doctype html><html lang="ko"><meta charset="utf-8">
+        <style>body{padding:24px}input{font-size:26px;width:420px}</style>
+        <input aria-label="WebKit IME Probe" id="probe" value="12" spellcheck="false">
+        <script>
+        const input = document.querySelector('#probe');
+        for (const type of ['keydown','compositionstart','compositionupdate','compositionend','beforeinput','input']) {
+          input.addEventListener(type, e => window.webkit.messageHandlers.imeProbe.postMessage({type,key:e.key||'',value:input.value,composing:!!e.isComposing}));
+        }
+        </script></html>
+        """, baseURL: nil)
+    withExtendedLifetime((window, probe)) { app.run() }
+}
+
+func webKitControl(folder: URL, source: TISInputSource, sourceID: String) throws -> String {
+    let events = folder.appendingPathComponent("webkit-ime-events.json")
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    process.arguments = ["--webkit-ime-probe", events.path]
+    try process.run()
+    defer {
+        if process.isRunning { process.terminate() }
+        _ = waitFor(3) { process.isRunning ? nil : true }
+    }
+    guard let app = waitFor(8, { NSRunningApplication(processIdentifier: process.processIdentifier) }), activate(app) else {
+        throw JourneyFailure("The isolated WKWebView control did not become active")
+    }
+    let ax = AXUIElementCreateApplication(app.processIdentifier)
+    guard let field = waitFor(9, {
+        window(ax).flatMap { w in searchAX(w, matches: {
+            role($0) == kAXTextFieldRole && attribute($0, kAXValueAttribute) as? String == "12"
+        }) }
+    }), let rect = frame(field) else { throw JourneyFailure("The WKWebView control input did not render") }
+    click(rect)
+    key(124, flags: [.maskCommand])
+    key(123)
+    let selected = TISSelectInputSource(source)
+    guard waitFor(4, { currentSourceID() == sourceID && attribute(field, kAXFocusedAttribute) as? Bool == true ? true : nil }) == true else {
+        throw JourneyFailure("WKWebView control could not confirm input source and field focus (select \(selected))")
+    }
+    typeKoreanSample()
+    let value = waitFor(4, {
+        let value = (attribute(field, kAXValueAttribute) as? String)?.precomposedStringWithCanonicalMapping
+        return value?.hasPrefix("1") == true && value?.hasSuffix("32") == true ? value : nil
+    }) ?? (attribute(field, kAXValueAttribute) as? String ?? "unavailable")
+    let data = (try? Data(contentsOf: events)) ?? Data()
+    let records = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
+    let types = records.compactMap { $0["type"] as? String }
+    let composition = types.filter { $0.hasPrefix("composition") }.count
+    let input = types.filter { $0 == "input" }.count
+    return "value=\(value), composition events=\(composition), input events=\(input)"
+}
+
+func retryUsingShortcut(_ app: NSRunningApplication, _ ax: AXUIElement, original: TISInputSource, koreanID: String) throws -> String {
+    guard activate(app), let field = searchField(ax), let rect = frame(field) else { throw JourneyFailure("SDIR search could not be refocused") }
+    TISSelectInputSource(original)
+    guard waitFor(4, { currentSourceID() == inputSourceID(original) ? true : nil }) == true else { throw JourneyFailure("ASCII input source could not be restored") }
+    click(rect)
+    key(0, flags: [.maskCommand])
+    key(51)
+    guard waitFor(3, { (attribute(field, kAXValueAttribute) as? String)?.isEmpty == true ? true : nil }) == true else { throw JourneyFailure("Could not clear the SDIR field by keyboard") }
+    key(18)
+    key(19)
+    key(123)
+    key(49, flags: [.maskControl])
+    guard waitFor(5, { currentSourceID() == koreanID && attribute(field, kAXFocusedAttribute) as? Bool == true ? true : nil }) == true else {
+        throw JourneyFailure("The Control-Space shortcut did not select Korean while SDIR held focus; current=\(currentSourceID())")
+    }
+    typeKoreanSample()
+    return waitFor(5, {
+        let value = (attribute(field, kAXValueAttribute) as? String)?.precomposedStringWithCanonicalMapping
+        return value?.hasPrefix("1") == true && value?.hasSuffix("32") == true ? value : nil
+    }) ?? (attribute(field, kAXValueAttribute) as? String ?? "unavailable")
+}
+
 func testIME(_ app: NSRunningApplication, _ ax: AXUIElement, _ controlFolder: URL) throws {
     guard activate(app) else { throw JourneyFailure("Could not make SDIR the foreground application") }
     guard let toggle = waitFor(12, {
@@ -286,7 +386,18 @@ func testIME(_ app: NSRunningApplication, _ ax: AXUIElement, _ controlFolder: UR
             throw IMEUnavailable("SDIR held \(sdirValue); TextEdit comparison incomplete: \(error)")
         }
         if control == expected {
-            throw JourneyFailure("TextEdit committed \(control) with the same physical keys; SDIR held \(sdirValue)")
+            let webKit: String
+            do { webKit = try webKitControl(folder: controlFolder, source: selectable, sourceID: koreanID) }
+            catch { webKit = "inconclusive: \(error)" }
+            let retry: String
+            do { retry = try retryUsingShortcut(app, ax, original: original, koreanID: koreanID) }
+            catch { retry = "inconclusive: \(error)" }
+            let evidence = "SDIR after TIS=\(sdirValue); TextEdit=\(control); plain WKWebView \(webKit); SDIR after Control-Space=\(retry)"
+            if retry == expected {
+                emit("korean_ime", "passed", evidence)
+                return
+            }
+            throw JourneyFailure(evidence)
         }
         throw IMEUnavailable("The same keys under Korean selection yielded \(sdirValue) in SDIR and \(control) in TextEdit; the runner did not produce the Korean control result")
     }
@@ -348,6 +459,10 @@ func testFinderDrop(_ app: NSRunningApplication, _ ax: AXUIElement, _ source: UR
 }
 
 let args = CommandLine.arguments
+if args.count == 3 && args[1] == "--webkit-ime-probe" {
+    MainActor.assumeIsolated { runWebKitProbe(output: URL(fileURLWithPath: args[2])) }
+    exit(0)
+}
 let pid = pid_t(args[1])!
 let source = URL(fileURLWithPath: args[2])
 let destination = URL(fileURLWithPath: args[3])
