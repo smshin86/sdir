@@ -14,6 +14,8 @@ def run(*argv):
 
 def verify(image, report):
     digest = hashlib.sha256(image.read_bytes()).hexdigest()
+    if digest != '9c1b943b0b93857f640d4538bf66f8a6ef4935950db68bdb0775a96b474f48a0':
+        raise RuntimeError(f'Unexpected disk image SHA-256: {digest}')
     source_dir = Path(__file__).parent
     units = runpy.run_path(str(source_dir / 'verify-macos-package.py'))['units']
     with tempfile.TemporaryDirectory(prefix='sdir-rename-') as temporary:
@@ -43,7 +45,7 @@ def verify(image, report):
             directory.mkdir()
         (folder / 'readiness-fixture.txt').write_bytes(b'SDIR fixture readiness')
         dragged = finder_source / 'SDIR Finder drop.txt'
-        dragged.write_bytes(b'0.6.2 macOS Finder drop fixture\n')
+        dragged.write_bytes(b'0.6.3 macOS Finder drop fixture\n')
         settings = {
             'version': 1, 'layout': 1, 'panes': [[units(folder)]],
             'sidebar_visible': False, 'action_bar_visible': False,
