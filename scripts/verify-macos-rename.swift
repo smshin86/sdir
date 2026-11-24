@@ -66,19 +66,39 @@ func putName(_ text: String, in app: NSRunningApplication) throws {
     try requireCondition(NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
                          "The owned SDIR window lost foreground before text input")
     key(0, flags: [.maskCommand])
-    typeText(text)
+    let inputCodes: [Character: CGKeyCode] = [
+        "0": 29, "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25,
+        "-": 27, ".": 47, "n": 45, "e": 14, "w": 13, "t": 17, "x": 7, "c": 8,
+    ]
+    if text.allSatisfy({ inputCodes[$0] != nil }) {
+        for character in text { key(inputCodes[character]!) }
+    } else {
+        typeText(text)
+    }
     RunLoop.current.run(until: Date().addingTimeInterval(0.10))
 }
 
-func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL) throws {
+func captureWindow(pid: pid_t, output: String) {
+    if let records = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
+       let id = records.first(where: { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid
+           && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0 })?[kCGWindowNumber as String] as? NSNumber {
+        let capture = Process()
+        capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        capture.arguments = ["-x", "-l", id.stringValue, output]
+        try? capture.run()
+        if capture.isRunning { capture.waitUntilExit() }
+    }
+}
+
+func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL, _ capture: String) throws {
     let manager = FileManager.default
     try mustWait("Seed file never appeared in the opened folder", seconds: 14) {
         row(ax, "readiness-fixture.txt") != nil
     }
     try manager.removeItem(at: folder.appendingPathComponent("readiness-fixture.txt"))
-    let modes = ["return", "list_click", "refresh_delete", "escape", "collision_retry", "refresh_create", "target_removed", "unicode"]
+    let modes = ["return", "list_click", "refresh_delete", "escape", "collision_retry", "refresh_create", "target_removed"]
     for index in 0..<80 {
-        let mode = modes[index % modes.count]
+        let mode = index < 70 ? modes[index % modes.count] : "unicode"
         let id = String(format: "%03d", index)
         let preceding = id + "-a.txt"
         let source = id + "-b.txt"
@@ -109,6 +129,7 @@ func verifyRename(_ app: NSRunningApplication, _ ax: AXUIElement, _ folder: URL)
             try requireCondition(try Data(contentsOf: otherPath) == Data("other".utf8), "Collision changed destination")
         }
         try putName(target, in: app)
+        if index == 0 { captureWindow(pid: app.processIdentifier, output: capture) }
         if checksCaret {
             key(123)
             if mode == "refresh_delete" {
@@ -165,18 +186,11 @@ let ax = AXUIElementCreateApplication(pid)
 let folder = URL(fileURLWithPath: arguments[2])
 let finderSource = URL(fileURLWithPath: arguments[3])
 do {
-    try verifyRename(app, ax, folder)
+    let beforeConfirm = URL(fileURLWithPath: arguments[4]).deletingLastPathComponent().appendingPathComponent("typed-first.png").path
+    try verifyRename(app, ax, folder, beforeConfirm)
     try testFinderDrop(app, ax, finderSource, folder)
 } catch {
-    if let records = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
-       let id = records.first(where: { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid
-           && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0 })?[kCGWindowNumber as String] as? NSNumber {
-        let capture = Process()
-        capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        capture.arguments = ["-x", "-l", id.stringValue, arguments[4]]
-        try? capture.run()
-        if capture.isRunning { capture.waitUntilExit() }
-    }
+    captureWindow(pid: pid, output: arguments[4])
     let observed = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
     emit("rename_or_finder", "failed", "\(error); \(describeFocus(ax)); files=\(observed)")
     exit(1)
