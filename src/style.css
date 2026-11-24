@@ -395,3 +395,52 @@
     .panes[data-grid-rows="3"] :is(.tab,.new-tab,.restore-tab){height:20px}
     .panes[data-grid-rows="3"] .address-bar{padding-block:0}
 }
+
+.address-value {
+    flex: 1;
+    min-width: 0;
+    position: relative;
+}
+.address-value .address-input:not(:focus) { color: transparent; }
+.address-breadcrumbs {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    direction: rtl;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    pointer-events: none;
+}
+.address-value:has(.address-input:focus) .address-breadcrumbs { visibility: hidden; }
+.address-trail {
+    display: flex;
+    flex: 1 0 auto;
+    min-width: max-content;
+    align-items: center;
+    height: 100%;
+    direction: ltr;
+    white-space: nowrap;
+}
+.address-separator { color: var(--muted); padding: 0 2px; }
+.address-crumb {
+    max-width: 15ch;
+    min-width: 3ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 2px 4px;
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 11px;
+    pointer-events: auto;
+}
+.address-crumb[aria-current="location"] { font-weight: 600; }
+.address-crumb:hover, .address-edit:hover { background: var(--hover); }
+.address-edit {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    border-radius: 4px;
+    padding: 2px;
+}

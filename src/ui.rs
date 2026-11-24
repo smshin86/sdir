@@ -3986,7 +3986,38 @@ fn PaneView(pane_id: usize, mut model: Signal<AppModel>) -> Element {
                 button{class:"icon-button",title:"뒤로",disabled:tab.back.is_empty(),onclick:{let b=bridge.clone();move |_|{history_navigation(model,&b,pane_id,false)}},"‹"}
                 button{class:"icon-button",title:"앞으로",disabled:tab.forward.is_empty(),onclick:{let b=bridge.clone();move |_|{history_navigation(model,&b,pane_id,true)}},"›"}
                 button{class:"icon-button",title:"상위 폴더",onclick:{let b=bridge.clone();move |_|{let parent=model.read().panes[pane_id].tab().path.parent();if let Some(path)=parent{navigate(model,&b,pane_id,path);}}},"↑"}
-                div{class:"address-input-wrap",button{class:"path-menu-toggle",title:"상위 경로 바로 이동","aria-expanded":menu_open,onclick:move |_|path_menu.set(!menu_open),Icon{kind:"folder"}}input{id:"address-{pane_id}",class:"address-input","data-ime-commit":"true",value:"{p.address}",spellcheck:false,onchange:move|e|model.write().panes[pane_id].address=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();model.write().interaction+=1;if pane_shortcut(&e,model,pane_id,&b){return;}if e.key()==Key::Enter&&!e.is_composing(){let value=model.read().panes[pane_id].address.clone();navigate(model,&b,pane_id,NativePath::new(value));}}}}
+                div{class:"address-input-wrap",button{class:"path-menu-toggle",title:"상위 경로 바로 이동","aria-expanded":menu_open,onclick:move |_|path_menu.set(!menu_open),Icon{kind:"folder"}}
+                    div{class:"address-value",
+                        nav{class:"address-breadcrumbs","aria-label":"폴더 경로",
+                            div{class:"address-trail",
+                                for (index, ancestor) in ancestors.iter().rev().enumerate() { {
+                                    let location = ancestor.clone();
+                                    let full = location.display();
+                                    let name = location.name();
+                                    let current = location == tab.path;
+                                    rsx! {
+                                        if index != 0 { span{class:"address-separator","aria-hidden":"true","›"} }
+                                        button{class:"address-crumb",title:"{full}","data-path":"{full}",
+                                            "aria-current":if current {"location"} else {"false"},
+                                            onclick:{let b=bridge.clone();move|event:MouseEvent|{
+                                                event.stop_propagation();
+                                                if current {
+                                                    focus_address(pane_id);
+                                                } else {
+                                                    path_menu.set(false);
+                                                    activate_pane(model,pane_id);
+                                                    navigate(model,&b,pane_id,location.clone());
+                                                }
+                                            }},
+                                            "{name}"
+                                        }
+                                    }
+                                } }
+                            }
+                        }
+                        input{id:"address-{pane_id}",class:"address-input","aria-label":"주소 입력","data-ime-commit":"true",value:"{p.address}",spellcheck:false,onchange:move|e|model.write().panes[pane_id].address=e.value(),onkeydown:{let b=bridge.clone();move|e:KeyboardEvent|{e.stop_propagation();model.write().interaction+=1;if pane_shortcut(&e,model,pane_id,&b){return;}if e.key()==Key::Enter&&!e.is_composing(){let value=model.read().panes[pane_id].address.clone();navigate(model,&b,pane_id,NativePath::new(value));}}}}
+                    }
+                    button{class:"address-edit",title:"주소 편집","aria-label":"주소 편집",onclick:move |_|focus_address(pane_id),Icon{kind:"rename"}}
                     if history_open {
                         div {class:"path-menu-dismiss", onclick:move |e:MouseEvent|{e.stop_propagation();model.write().address_history=None;}}
                         div {class:"path-menu address-history", role:"menu", "aria-label":"주소 기록",
